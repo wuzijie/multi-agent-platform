@@ -2,6 +2,7 @@ const { spawn } = require('child_process');
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
+const ModelLogger = require('../utils/model-logger');
 
 const ROOT = path.resolve(__dirname, '..', '..');
 
@@ -204,18 +205,20 @@ class ClaudeAdapter {
       fullPrompt += fileContents;
     }
 
+    // 获取当前使用的模型名称
+    const model = this._getModelOverride() || process.env.ANTHROPIC_MODEL || 'claude-default';
+    ModelLogger.logRequest(this.name, model, fullPrompt);
+
     // 构建 CLI 参数
     const args = [
       '--print',
       '--output-format', 'text',
       '--permission-mode', 'bypassPermissions',
-      // 允许 Claude 访问项目根目录
       '--add-dir', ROOT,
-      // 不加载 hooks / plugins，减少启动延迟
       '--bare',
     ];
 
-    // 超时计算：prompt 越长，给更多时间
+    // 超时计算
     const promptLength = fullPrompt.length;
     const timeoutMs = Math.max(60000, promptLength * 2 + 30000);
 
@@ -223,13 +226,14 @@ class ClaudeAdapter {
       const result = await this._runCli(args, fullPrompt, timeoutMs);
 
       if (result.exit_code === 0) {
+        ModelLogger.logResponse(this.name, model, result.stdout);
         return buildUnifiedOutput(input.task_id, 'success', result.stdout, {
           tokens_used: this._estimateTokens(result.stdout),
           duration_ms: Date.now() - startTime,
         });
       } else {
-        // 提取错误信息
         const errMsg = result.stderr || result.stdout || 'Unknown error';
+        ModelLogger.logResponse(this.name, model, errMsg);
         let errorCode = 'CLI_ERROR';
         if (errMsg.includes('Not logged in')) {
           errorCode = 'AUTH_REQUIRED';
@@ -242,6 +246,7 @@ class ClaudeAdapter {
         });
       }
     } catch (e) {
+      ModelLogger.logResponse(this.name, model, e.message);
       return buildUnifiedOutput(input.task_id, 'failed', '', {
         error: { code: 'EXECUTION_ERROR', message: e.message },
         duration_ms: Date.now() - startTime,

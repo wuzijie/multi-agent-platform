@@ -2,6 +2,7 @@ const { spawn } = require('child_process');
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
+const ModelLogger = require('../utils/model-logger');
 
 const ROOT = path.resolve(__dirname, '..', '..');
 
@@ -209,16 +210,19 @@ class KimiAdapter {
       fullPrompt += fileContents;
     }
 
+    // 获取当前使用的模型名称
+    const model = this._getModel() || process.env.KIMI_MODEL || 'kimi-default';
+    ModelLogger.logRequest(this.name, model, fullPrompt);
+
     // 构建 CLI 参数
     const args = [
-      '-p',  // 非交互模式
+      '-p',
       '--output-format', 'stream-json',
-      '--yolo',  // 自动批准操作
+      '--yolo',
       '--add-dir', ROOT,
     ];
 
-    const model = this._getModel();
-    if (model) {
+    if (model !== 'kimi-default') {
       args.push('--model', model);
     }
 
@@ -229,14 +233,15 @@ class KimiAdapter {
       const result = await this._runCli(args, fullPrompt, timeoutMs);
 
       if (result.exit_code === 0) {
-        // 解析 stream-json 输出，提取最终文本内容
         const content = this._parseStreamJson(result.stdout);
+        ModelLogger.logResponse(this.name, model, content);
         return buildKimiOutput(input.task_id, 'success', content, {
           tokens_used: this._estimateTokens(content),
           duration_ms: Date.now() - startTime,
         });
       } else {
         const errMsg = result.stderr || result.stdout || 'Unknown error';
+        ModelLogger.logResponse(this.name, model, errMsg);
         let errorCode = 'CLI_ERROR';
         if (errMsg.includes('Not logged in') || errMsg.includes('login')) {
           errorCode = 'AUTH_REQUIRED';
@@ -249,6 +254,7 @@ class KimiAdapter {
         });
       }
     } catch (e) {
+      ModelLogger.logResponse(this.name, model, e.message);
       return buildKimiOutput(input.task_id, 'failed', '', {
         error: { code: 'EXECUTION_ERROR', message: e.message },
         duration_ms: Date.now() - startTime,
