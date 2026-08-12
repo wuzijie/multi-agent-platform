@@ -1,9 +1,36 @@
 const fs = require('fs');
 const path = require('path');
 
-const ROOT = path.resolve(__dirname, '..', '..');
-const LOG_DIR = path.join(ROOT, 'agents');
-const LOG_FILE = path.join(LOG_DIR, 'model_cli.log');
+/**
+ * 获取日志写入路径列表
+ * 优先 /Volumes（Write 工具可达），回退 /sessions（VM 可达）
+ */
+function getLogFilePaths() {
+  const candidates = [
+    '/Volumes/data/we-work/multi-agent-platform',
+    path.resolve(__dirname, '..', '..'),
+  ];
+  const paths = [];
+  const seen = new Set();
+  for (const root of candidates) {
+    const logFile = path.join(root, 'logs', 'agents', 'model_cli.log');
+    if (!seen.has(logFile)) {
+      seen.add(logFile);
+      // 只返回目录存在的路径
+      const logDir = path.dirname(logFile);
+      if (fs.existsSync(logDir)) {
+        paths.push(logFile);
+      }
+    }
+  }
+  // 如果没有任何路径可用，至少保留 __dirname 推导的路径
+  if (paths.length === 0) {
+    paths.push(path.join(path.resolve(__dirname, '..', '..'), 'logs', 'agents', 'model_cli.log'));
+  }
+  return paths;
+}
+
+const LOG_FILES = getLogFilePaths();
 
 /**
  * 模型 CLI 请求/响应日志记录器
@@ -22,23 +49,26 @@ class ModelLogger {
    * 记录一条日志
    */
   static log(adapterName, direction, model, content) {
-    try {
-      if (!fs.existsSync(LOG_DIR)) {
-        fs.mkdirSync(LOG_DIR, { recursive: true });
+    const entry = {
+      timestamp: new Date().toISOString(),
+      adapter: adapterName,
+      direction,
+      model: model || 'default',
+      content: content || '',
+    };
+    const line = JSON.stringify(entry) + '\n';
+
+    // 写入所有可用路径
+    for (const logFile of LOG_FILES) {
+      try {
+        const logDir = path.dirname(logFile);
+        if (!fs.existsSync(logDir)) {
+          fs.mkdirSync(logDir, { recursive: true });
+        }
+        fs.appendFileSync(logFile, line);
+      } catch (e) {
+        // 某些路径不可写（如 /Volumes 在 VM 中不可见），静默跳过
       }
-
-      const entry = {
-        timestamp: new Date().toISOString(),
-        adapter: adapterName,
-        direction,
-        model: model || 'default',
-        content: content || '',
-      };
-
-      // 追加一行 JSON，保证按时间顺序
-      fs.appendFileSync(LOG_FILE, JSON.stringify(entry) + '\n');
-    } catch (e) {
-      console.error(`[ModelLogger] Failed to write log: ${e.message}`);
     }
   }
 
@@ -60,20 +90,21 @@ class ModelLogger {
    * 读取最近的 N 条日志
    */
   static getRecentLogs(count = 100) {
-    try {
-      if (!fs.existsSync(LOG_FILE)) return [];
-
-      const raw = fs.readFileSync(LOG_FILE, 'utf8');
-      const lines = raw.trim().split('\n').filter(l => l.trim());
-      const entries = lines.map(l => JSON.parse(l));
-
-      // 按时间戳降序，取最近的
-      entries.sort((a, b) => b.timestamp.localeCompare(a.timestamp));
-      return entries.slice(0, count);
-    } catch (e) {
-      console.error(`[ModelLogger] Failed to read logs: ${e.message}`);
-      return [];
+    // 尝试从所有路径读取，取最新的
+    let allEntries = [];
+    for (const logFile of LOG_FILES) {
+      try {
+        if (!fs.existsSync(logFile)) continue;
+        const raw = fs.readFileSync(logFile, 'utf8');
+        const lines = raw.trim().split('\n').filter(l => l.trim());
+        const entries = lines.map(l => JSON.parse(l));
+        allEntries = allEntries.concat(entries);
+      } catch (e) {
+        // skip unreadable files
+      }
     }
+    allEntries.sort((a, b) => b.timestamp.localeCompare(a.timestamp));
+    return allEntries.slice(0, count);
   }
 
   /**

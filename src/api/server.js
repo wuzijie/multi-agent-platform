@@ -170,18 +170,24 @@ class ApiServer {
 
         // 如果任务未评估复杂度，先评估
         if (task.status === 'created' || task.difficulty === 'unknown') {
-          await orchestrator.assessComplexity(req.params.taskId);
-          const updated = orchestrator.getTask(req.params.taskId);
-          if (updated.complex_flag) {
-            return res.json({
-              message: '任务已标记为复杂任务，完整多Agent协作将于二期上线',
-              task: updated,
-            });
-          }
+          // 从前端获取 multi_agent 开关状态（true=多Agent协作, false=单Agent模式, undefined=自动评估）
+          const multiAgent = req.body.multi_agent;
+          await orchestrator.assessComplexity(req.params.taskId, { multi_agent: multiAgent });
         }
 
-        // 简单任务直接执行
-        const result = await orchestrator.executeSimpleTask(req.params.taskId, req.body.message);
+        // 重新获取最新的 task 状态
+        const updated = orchestrator.getTask(req.params.taskId);
+
+        let result;
+        if (updated.complex_flag) {
+          // 复杂任务走多Agent协作流程
+          result = await orchestrator.executeComplexTask(req.params.taskId, req.body.message);
+        } else {
+          // 简单任务直接执行，传递 @mention agent
+          result = await orchestrator.executeSimpleTask(req.params.taskId, req.body.message, {
+            mentioned_agent: req.body.mentioned_agent
+          });
+        }
         res.json(result);
       } catch (e) {
         res.status(500).json({ error: e.message });
@@ -198,7 +204,14 @@ class ApiServer {
           return res.status(400).json({ error: `Cannot continue task with status: ${task.status}. 请新建对话。` });
         }
 
-        const result = await orchestrator.executeSimpleTask(req.params.taskId, req.body.message);
+        let result;
+        if (task.complex_flag) {
+          result = await orchestrator.executeComplexTask(req.params.taskId, req.body.message);
+        } else {
+          result = await orchestrator.executeSimpleTask(req.params.taskId, req.body.message, {
+            mentioned_agent: req.body.mentioned_agent
+          });
+        }
         res.json(result);
       } catch (e) {
         res.status(500).json({ error: e.message });

@@ -1,5 +1,7 @@
 const { ClaudeAdapter } = require('../adapters/claude');
 const { KimiAdapter } = require('../adapters/kimi');
+const { DeepSeekAdapter } = require('../adapters/deepseek');
+const { QwenAdapter } = require('../adapters/qwen');
 const fs = require('fs');
 const path = require('path');
 const config = require('../utils/config');
@@ -10,7 +12,7 @@ const ROOT = path.resolve(__dirname, '..', '..');
  * Agent 运行时管理器
  *
  * 负责 Agent 的生命周期管理：创建、状态监控、心跳检测
- * 一期仅管理克劳德 Agent
+ * 二期支持四 Agent 并行运行
  */
 class AgentRuntime {
   constructor() {
@@ -29,8 +31,8 @@ class AgentRuntime {
     console.log(`[AgentRuntime] Initializing agents...`);
 
     for (const agentCfg of agentsConfig) {
-      // 启用已配置 Agent
-      if (agentCfg.name === '克劳德' || agentCfg.name === '吉米') {
+      // 启用已配置的 Agent（二期：克劳德、吉米、迪普斯克、钱文）
+      if (['克劳德', '吉米', '迪普斯克', '钱文'].includes(agentCfg.name)) {
         this._registerAgent(agentCfg);
       }
     }
@@ -73,7 +75,12 @@ class AgentRuntime {
     if (modelCli === 'kimi') {
       return new KimiAdapter();
     }
-    // 其他模型二期实现
+    if (modelCli === 'deepseek') {
+      return new DeepSeekAdapter();
+    }
+    if (modelCli === 'qwen') {
+      return new QwenAdapter();
+    }
     console.warn(`[AgentRuntime] No adapter for model_cli: ${modelCli}, using stub`);
     return null;
   }
@@ -148,6 +155,45 @@ class AgentRuntime {
     }
 
     return instruction || `请根据任务描述完成: ${task.description || task.name}`;
+  }
+
+  /**
+   * 通过指定名称的 Agent 执行任务（二期多Agent协作流程用）
+   * @param {Object} task - 任务对象
+   * @param {Array} history - 对话历史
+   * @param {string} agentName - Agent 名称，如 '克劳德', '吉米', '迪普斯克', '钱文'
+   */
+  async executeTaskWithAgent(task, history, agentName) {
+    const agent = this.agents.get(agentName);
+    if (!agent || !agent.adapter) {
+      // 回退到克劳德
+      console.warn(`[AgentRuntime] Agent "${agentName}" not available, falling back to 克劳德`);
+      return this.executeTask(task, history);
+    }
+    if (!agent.online) {
+      console.warn(`[AgentRuntime] Agent "${agentName}" is offline, falling back to 克劳德`);
+      return this.executeTask(task, history);
+    }
+
+    agent.busy = true;
+    agent.current_task = task.task_id;
+
+    try {
+      const input = {
+        task_id: task.task_id,
+        role: task.role || 'executor',
+        context: task.context || `任务名称: ${task.name}\n任务描述: ${task.description || '无'}\n难度等级: ${task.difficulty || '未知'}\n任务类型: ${task.task_type || 'development'}`,
+        instruction: task.instruction || this._buildInstruction(task, history),
+        input_files: task.input_files || [],
+        max_tokens: task.max_tokens || 4096,
+      };
+
+      const result = await agent.adapter.execute(input);
+      return result;
+    } finally {
+      agent.busy = false;
+      agent.current_task = null;
+    }
   }
 
   /**
