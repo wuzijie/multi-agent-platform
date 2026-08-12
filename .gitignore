@@ -2,6 +2,6 @@ node_modules/
 logs/
 tasks/
 .DS_Store
-*.log
 *.pid
 workspace/
+# agents/model_cli.log 是请求/响应日志，需要被 git 追踪
