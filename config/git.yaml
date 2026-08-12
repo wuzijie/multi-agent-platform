@@ -1,0 +1,5 @@
+git:
+  default_repo_url: "https://github.com/user/default-repo.git"
+  default_branch: "main"
+  worktree_root: "./workspace"
+  auto_cleanup_days: 7

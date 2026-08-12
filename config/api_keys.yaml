@@ -1,0 +1,75 @@
+# API 密钥配置
+# 用于 Claude Code CLI / Kimi Code CLI 认证和模型供应商路由
+api_keys:
+  # ============================================
+  # 方式一：Anthropic 原生 API
+  # 直接配置 Anthropic API Key，Claude Code CLI 将请求发往 api.anthropic.com
+  # 留空则使用 Claude Code CLI 原生认证（终端运行 claude /login）
+  # ============================================
+  anthropic_api_key: ""
+
+  # ============================================
+  # 方式二：第三方 Anthropic 兼容供应商（如 DeepSeek）
+  # 通过设置 ANTHROPIC_BASE_URL + ANTHROPIC_API_KEY 将请求路由到其他供应商
+  #
+  # 目前 Anthropic 兼容接口的供应商：
+  #   - DeepSeek: base_url = https://api.deepseek.com/anthropic, api_key = 你的 DeepSeek API Key
+  #   - OfoxAI:   base_url = https://api.ofox.ai/anthropic,   api_key = 你的 OfoxAI API Key
+  #
+  # 也可以配合 cc-switch GUI 工具使用，cc-switch 会自动修改 ~/.claude/settings.json，
+  # 无需在此配置 base_url。安装：brew install --cask cc-switch（macOS）
+  # ============================================
+  anthropic_base_url: ""
+  deepseek_api_key: ""
+
+  # ============================================
+  # 模型名称映射（可选）
+  # 当使用第三方供应商时，可以指定要调用的模型名称
+  # DeepSeek 可选值: "deepseek-chat"（通用）, "deepseek-coder"（编码专用）
+  # OfoxAI 可选值：留空走默认 Claude 模型，或填 "anthropic/claude-sonnet-4.6" 等具体型号
+  # ============================================
+  model_override: ""
+
+  # ============================================
+  # Kimi Code CLI 密钥配置
+  # ============================================
+  # 用于吉米 Agent（KimiAdapter）调用 Kimi Code CLI
+  #
+  # Kimi Code CLI 认证方式（优先级从高到低）：
+  #   1. 环境变量: export KIMI_API_KEY=sk-xxx
+  #   2. 本配置文件: 填入 kimi_api_key
+  #   3. Kimi Code 原生登录: 终端运行 kimi login
+  #
+  # Kimi 原生 API 地址为 https://api.moonshot.cn（或 https://api.moonshot.ai），
+  # 一般无需配置 kimi_base_url，除非使用代理或第三方供应商。
+  # ============================================
+  kimi_api_key: "sk-kjrQZtBxq4OHaB7RHaKz1TpYNs5ZlRnNdB93M71OvEHE6Nnt"
+  kimi_base_url: ""
+  kimi_model: ""
+
+# ============================================
+# 供应商路由说明
+# ============================================
+# 优先级：环境变量 > 本配置文件 > cc-switch / Kimi 原生认证
+#
+# === 克劳德 Agent (ClaudeAdapter) ===
+# 1. cc-switch（推荐，最简单）：
+#    安装 cc-switch GUI 工具，在图形界面中添加供应商并填入 API Key，
+#    点击「使用」按钮切换供应商。cc-switch 自动修改 ~/.claude/settings.json，
+#    平台无需额外配置，ClaudeAdapter 自动生效。
+#
+# 2. 本配置文件（无需 GUI）：
+#    设置 anthropic_base_url 为供应商地址，anthropic_api_key 或 deepseek_api_key 为供应商 Key，
+#    可选设置 model_override 指定模型。启动后 ClaudeAdapter 读取配置并注入环境变量。
+#
+# 3. 环境变量（临时调试）：
+#    export ANTHROPIC_API_KEY=sk-xxx
+#    export ANTHROPIC_BASE_URL=https://api.deepseek.com/anthropic
+#
+# === 吉米 Agent (KimiAdapter) ===
+# 1. 本配置文件: 设置 kimi_api_key
+# 2. Kimi Code 原生登录: 终端运行 kimi login
+# 3. 切换模型: 设置 kimi_model 为具体模型名（如 kimi-k2-thinking 等）
+#    Kimi Code 已内置 Moonshot 官方模型支持，通常无需配置 base_url。
+#
+# ============================================

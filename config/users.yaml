@@ -1,0 +1,4 @@
+users:
+  - id: "user_default"
+    name: "默认用户"
+    role: "admin"

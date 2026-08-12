@@ -1,0 +1,5 @@
+task_defaults:
+  timeout_seconds: 600
+  max_revision_rounds: 3
+  auto_confirm: false
+  guardian_enabled: false

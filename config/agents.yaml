@@ -1,0 +1,29 @@
+agents:
+  - name: "克劳德"
+    model_cli: "claude"
+    capabilities: ["logic", "complex_code", "architecture", "text_refinement"]
+    strengths: ["逻辑严谨", "代码规范", "长文本处理"]
+    weaknesses: ["简单任务执行效率略低"]
+    scenarios: ["complex_development", "architecture_design", "code_review"]
+    default: true
+
+  - name: "吉米"
+    model_cli: "kimi"
+    capabilities: ["long_text", "information_extraction", "documentation"]
+    strengths: ["大容量文本处理", "信息提炼精准"]
+    weaknesses: ["复杂算法优化能力较弱"]
+    scenarios: ["document_analysis", "content_generation"]
+
+  - name: "迪普斯克"
+    model_cli: "deepseek"
+    capabilities: ["algorithm", "performance", "bug_detection", "deep_tech"]
+    strengths: ["技术深度足", "专业性高", "纠错能力突出"]
+    weaknesses: ["通用文本创作适配性一般"]
+    scenarios: ["algorithm_optimization", "performance_tuning", "vulnerability_detection"]
+
+  - name: "钱文"
+    model_cli: "qwen"
+    capabilities: ["lightweight_dev", "fast_iteration", "scenario_fitting", "chinese_optimization"]
+    strengths: ["响应速度快", "场景适配广", "兼容性强"]
+    weaknesses: ["超复杂架构设计能力有限"]
+    scenarios: ["rapid_development", "localization", "simple_tasks"]

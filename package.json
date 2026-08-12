@@ -1,0 +1,23 @@
+{
+  "name": "multi-agent-platform",
+  "version": "1.0.0",
+  "description": "Multi-Agent协作平台 - 本地化运行的多智能体协作工具",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js",
+    "build:frontend": "cd frontend-src && npm run build",
+    "test": "node tests/verification.js"
+  },
+  "dependencies": {
+    "express": "^4.21.0",
+    "ws": "^8.18.0",
+    "js-yaml": "^4.1.0",
+    "uuid": "^10.0.0",
+    "archiver": "^7.0.1",
+    "chokidar": "^4.0.1"
+  },
+  "devDependencies": {
+    "tailwindcss": "^3.4.0"
+  }
+}

@@ -1,0 +1,658 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>多智能体协作平台</title>
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          colors: {
+            brand: { 50:'#eff6ff',100:'#dbeafe',200:'#bfdbfe',300:'#93c5fd',400:'#60a5fa',500:'#3b82f6',600:'#2563eb',700:'#1d4ed8',800:'#1e40af',900:'#1e3a8a' }
+          }
+        }
+      }
+    }
+  </script>
+  <style>
+    :root { color-scheme: light; }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif; background: #f8fafc; color: #1e293b; }
+    /* Markdown */
+    .markdown pre { background: #f1f5f9; border-radius: 8px; padding: 16px; overflow-x: auto; font-size: 13px; line-height: 1.5; }
+    .markdown code { background: #e2e8f0; padding: 2px 6px; border-radius: 4px; font-size: 13px; }
+    .markdown pre code { background: none; padding: 0; }
+    .markdown table { border-collapse: collapse; width: 100%; margin: 8px 0; }
+    .markdown th, .markdown td { border: 1px solid #e2e8f0; padding: 8px 12px; text-align: left; }
+    .markdown th { background: #f8fafc; font-weight: 600; }
+    .markdown h1 { font-size: 1.5em; font-weight: 700; margin: 16px 0 8px; }
+    .markdown h2 { font-size: 1.25em; font-weight: 700; margin: 14px 0 6px; }
+    .markdown h3 { font-size: 1.1em; font-weight: 600; margin: 12px 0 4px; }
+    .markdown h4 { font-size: 1em; font-weight: 600; margin: 10px 0 4px; }
+    .markdown p { margin: 6px 0; line-height: 1.6; }
+    .markdown ul, .markdown ol { margin: 6px 0; padding-left: 24px; }
+    .markdown li { margin: 2px 0; }
+    .markdown blockquote { border-left: 3px solid #e2e8f0; padding-left: 12px; margin: 8px 0; color: #64748b; }
+    .markdown a { color: #2563eb; text-decoration: underline; }
+    .markdown hr { border: none; border-top: 1px solid #e2e8f0; margin: 12px 0; }
+    .markdown strong { font-weight: 600; }
+    .markdown em { font-style: italic; }
+    /* Scrollbar */
+    .scrollbar-thin::-webkit-scrollbar { width: 5px; }
+    .scrollbar-thin::-webkit-scrollbar-track { background: transparent; }
+    .scrollbar-thin::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 3px; }
+    /* Animations */
+    @keyframes pulse-dot { 0%,100%{opacity:1} 50%{opacity:0.3} }
+    .pulse-dot { animation: pulse-dot 1.5s ease-in-out infinite; }
+    @keyframes slide-up { from{opacity:0;transform:translateY(10px)} to{opacity:1;transform:translateY(0)} }
+    .slide-up { animation: slide-up 0.3s ease-out; }
+    @keyframes fade-in { from{opacity:0} to{opacity:1} }
+    .fade-in { animation: fade-in 0.2s ease-out; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <script>
+    'use strict';
+    const { createElement: h, useState, useEffect, useRef, useCallback, Fragment } = React;
+
+    // ====== Simple Markdown to HTML ======
+    function simpleMarkdown(text) {
+      if (!text) return '';
+      let html = text;
+      // Escape HTML
+      html = html.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+      // Code blocks (triple backticks)
+      html = html.replace(/```(\w*)\n([\s\S]*?)```/g, function(m, lang, code) {
+        return '<pre><code class="language-' + (lang || '') + '">' + code.trim() + '</code></pre>';
+      });
+      // Inline code
+      html = html.replace(/`([^`]+)`/g, '<code>$1</code>');
+      // Bold
+      html = html.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+      // Italic
+      html = html.replace(/\*([^*]+)\*/g, '<em>$1</em>');
+      // Headers
+      html = html.replace(/^#### (.+)$/gm, '<h4>$1</h4>');
+      html = html.replace(/^### (.+)$/gm, '<h3>$1</h3>');
+      html = html.replace(/^## (.+)$/gm, '<h2>$1</h2>');
+      html = html.replace(/^# (.+)$/gm, '<h1>$1</h1>');
+      // Unordered lists
+      html = html.replace(/^[\*\-] (.+)$/gm, '<li>$1</li>');
+      html = html.replace(/((?:<li>.*<\/li>\n?)+)/g, '<ul>$1</ul>');
+      // Ordered lists
+      html = html.replace(/^\d+\. (.+)$/gm, '<li>$1</li>');
+      // Blockquote
+      html = html.replace(/^&gt; (.+)$/gm, '<blockquote>$1</blockquote>');
+      // Horizontal rule
+      html = html.replace(/^---$/gm, '<hr>');
+      // Links
+      html = html.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank">$1</a>');
+      // Paragraphs (double newlines)
+      html = html.replace(/\n\n/g, '</p><p>');
+      html = '<p>' + html + '</p>';
+      // Clean empty paragraphs
+      html = html.replace(/<p>\s*<\/p>/g, '');
+      // Fix nested p inside block elements
+      html = html.replace(/<(h[1-4]|pre|ul|ol|blockquote|hr|li)>[\s\S]*?<\/\1>/g, function(m) {
+        return m.replace(/<\/?p>/g, '');
+      });
+      return html;
+    }
+
+    function Markdown({ children }) {
+      if (!children) return null;
+      const html = simpleMarkdown(children);
+      return h('div', { className: 'markdown', dangerouslySetInnerHTML: { __html: html } });
+    }
+
+    // ====== Analytics ======
+    const Analytics = {
+      log(type, data) {
+        try {
+          fetch('/api/analytics/log', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ timestamp: new Date().toISOString(), user_id: 'user_default', type, ...data }) }).catch(function(){});
+        } catch(e) {}
+      },
+      pageLoad() {
+        if (window.performance && window.performance.timing) {
+          var t = window.performance.timing;
+          this.log('page_load', { load_time_ms: t.loadEventEnd - t.navigationStart });
+        }
+      }
+    };
+    window.addEventListener('load', function() { setTimeout(function() { Analytics.pageLoad(); }, 100); });
+
+    // ====== API Client ======
+    async function api(path, opts) {
+      opts = opts || {};
+      var url = '/api' + path;
+      var headers = opts.headers || {};
+      headers['Content-Type'] = 'application/json';
+      headers['user_id'] = 'user_default';
+      var res = await fetch(url, { headers: headers, method: opts.method || 'GET', body: opts.body });
+      if (!res.ok) throw new Error('API ' + res.status);
+      return res;
+    }
+
+    // ====== Status Dot ======
+    function StatusDot(props) {
+      var cls = 'bg-gray-300';
+      if (props.online && !props.busy) cls = 'bg-green-400';
+      else if (props.online && props.busy) cls = 'bg-yellow-400 pulse-dot';
+      else if (!props.online) cls = 'bg-red-400';
+      return h('span', { className: 'inline-block w-2 h-2 rounded-full ' + cls + ' mr-1.5' });
+    }
+
+    // ====== Time formatter ======
+    function timeAgo(iso) {
+      if (!iso) return '';
+      var d = new Date(iso), now = new Date(), diff = now - d;
+      var mins = Math.floor(diff / 60000), hours = Math.floor(diff / 3600000), days = Math.floor(diff / 86400000);
+      if (mins < 1) return '刚刚';
+      if (mins < 60) return mins + '分钟前';
+      if (hours < 24) return hours + '小时前';
+      if (days < 30) return days + '天前';
+      return d.toLocaleDateString('zh-CN');
+    }
+
+    // ====== Parse conversation ======
+    function parseConversation(text) {
+      if (!text) return [];
+      var messages = [];
+      var sections = text.split(/\n### /);
+      for (var i = 1; i < sections.length; i++) {
+        var section = sections[i];
+        var match = section.match(/^(🧑 用户|🤖 助手|⚙️ 系统)/);
+        var role = 'system', label = '系统';
+        if (match) {
+          if (match[1].indexOf('用户') >= 0) { role = 'user'; label = '用户'; }
+          else if (match[1].indexOf('助手') >= 0) { role = 'assistant'; label = '助手'; }
+        }
+        var content = section.replace(/^[^\n]+\n\n/, '').replace(/\n---\n?$/, '').trim();
+        if (content) messages.push({ role: role, label: label, content: content });
+      }
+      return messages;
+    }
+
+    var statusColorMap = { executing:'bg-blue-500', completed:'bg-green-500', failed:'bg-red-500', suspended:'bg-yellow-500', assessing:'bg-purple-500', created:'bg-gray-400' };
+    var statusLabel = { executing:'进行中', completed:'已结束', failed:'错误', suspended:'已挂起', assessing:'评估中', created:'新对话' };
+
+    // ====== Conversation Sidebar ======
+    function ConversationSidebar(props) {
+      var conversations = props.conversations, activeId = props.activeId;
+      var onSelect = props.onSelect, onNew = props.onNew, onDelete = props.onDelete;
+      var collapsed = props.collapsed, onToggle = props.onToggle;
+      var agents = props.agents || [];
+
+      if (collapsed) {
+        return h('div', { className: 'w-12 flex-shrink-0 bg-gray-50 border-r border-gray-200 flex flex-col items-center py-3 gap-3' },
+          h('button', { onClick: onToggle, className: 'p-2 hover:bg-gray-200 rounded-lg', title: '展开侧边栏' },
+            h('svg', { className: 'w-5 h-5 text-gray-500', fill:'none', stroke:'currentColor', viewBox:'0 0 24 24' },
+              h('path', { strokeLinecap:'round', strokeLinejoin:'round', strokeWidth:2, d:'M9 5l7 7-7 7' })
+            )
+          ),
+          h('button', { onClick: onNew, className: 'p-2 hover:bg-blue-100 rounded-lg', title: '新对话' },
+            h('svg', { className: 'w-5 h-5 text-blue-600', fill:'none', stroke:'currentColor', viewBox:'0 0 24 24' },
+              h('path', { strokeLinecap:'round', strokeLinejoin:'round', strokeWidth:2, d:'M12 4v16m8-8H4' })
+            )
+          ),
+          h('div', { className: 'flex-1' }),
+          // Collapsed agent dots
+          agents.map(function(a) {
+            var dotColor = a.online && !a.busy ? 'bg-green-400' : a.online && a.busy ? 'bg-yellow-400' : 'bg-red-400';
+            return h('div', { key: a.name, className: 'relative', title: a.name + ' - ' + (a.busy ? '忙碌' : a.online ? '在线' : '离线') },
+              h('span', { className: 'inline-block w-2.5 h-2.5 rounded-full ' + dotColor })
+            );
+          })
+        );
+      }
+
+      return h('div', { className: 'w-[280px] flex-shrink-0 bg-gray-50 border-r border-gray-200 flex flex-col h-full' },
+        // ===== Top: Conversation List =====
+        h('div', { className: 'px-4 py-3 border-b border-gray-200 flex items-center justify-between' },
+          h('div', { className: 'flex items-center gap-2' },
+            h('button', { onClick: onToggle, className: 'p-1 hover:bg-gray-200 rounded', title: '收起侧边栏' },
+              h('svg', { className: 'w-4 h-4 text-gray-500', fill:'none', stroke:'currentColor', viewBox:'0 0 24 24' },
+                h('path', { strokeLinecap:'round', strokeLinejoin:'round', strokeWidth:2, d:'M15 19l-7-7 7-7' })
+              )
+            ),
+            h('h2', { className: 'font-semibold text-gray-800 text-sm' }, '对话记录'),
+          ),
+          h('button', { onClick: onNew, className: 'p-1.5 bg-blue-600 text-white rounded-lg hover:bg-blue-700', title: '新对话' },
+            h('svg', { className: 'w-4 h-4', fill:'none', stroke:'currentColor', viewBox:'0 0 24 24' },
+              h('path', { strokeLinecap:'round', strokeLinejoin:'round', strokeWidth:2, d:'M12 4v16m8-8H4' })
+            )
+          )
+        ),
+
+        // Conversation items
+        h('div', { className: 'flex-1 overflow-y-auto scrollbar-thin py-1' },
+          conversations.length === 0
+            ? h('div', { className: 'px-4 py-8 text-center text-sm text-gray-400' }, '暂无对话，\n开始你的第一次对话吧')
+            : conversations.map(function(c) {
+                var isActive = c.task_id === activeId;
+                var lastMsg = c._lastMessage || '';
+                var statusColor = statusColorMap;
+                return h('div', {
+                  key: c.task_id,
+                  onClick: function() { onSelect(c.task_id); },
+                  className: 'px-3 py-2.5 mx-2 my-0.5 rounded-lg cursor-pointer transition-colors group ' + (isActive ? 'bg-blue-100 border border-blue-200' : 'hover:bg-gray-100 border border-transparent'),
+                },
+                  h('div', { className: 'flex items-center gap-2' },
+                    h('span', { className: 'w-2 h-2 rounded-full flex-shrink-0 ' + (statusColor[c.status] || 'bg-gray-400') }),
+                    h('span', { className: 'text-sm font-medium truncate flex-1 ' + (isActive ? 'text-blue-800' : 'text-gray-700') }, c.name || '未命名对话'),
+                    h('button', { onClick: function(e) { e.stopPropagation(); onDelete(c.task_id); }, className: 'opacity-0 group-hover:opacity-100 p-0.5 hover:bg-red-100 rounded transition-all', title: '删除' },
+                      h('svg', { className: 'w-3.5 h-3.5 text-red-400', fill:'none', stroke:'currentColor', viewBox:'0 0 24 24' },
+                        h('path', { strokeLinecap:'round', strokeLinejoin:'round', strokeWidth:2, d:'M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16' })
+                      )
+                    )
+                  ),
+                  h('div', { className: 'flex items-center justify-between mt-1' },
+                    h('p', { className: 'text-xs text-gray-400 truncate flex-1' }, lastMsg.substring(0, 40) || '新对话'),
+                    h('span', { className: 'text-xs text-gray-300 ml-2 flex-shrink-0' }, timeAgo(c.updated_at || c.created_at))
+                  ),
+                );
+              })
+        ),
+
+        // ===== Bottom: Agent Status Panel =====
+        h('div', { className: 'border-t border-gray-200 bg-white' },
+          h('div', { className: 'px-4 py-2.5 flex items-center justify-between' },
+            h('span', { className: 'text-xs font-semibold text-gray-500 uppercase tracking-wide' }, '智能体状态'),
+            h('span', { className: 'text-xs text-gray-400' }, agents.length + ' 个')
+          ),
+          h('div', { className: 'px-3 pb-3 space-y-1' },
+            agents.length === 0
+              ? h('p', { className: 'text-xs text-gray-400 px-1 py-2 text-center' }, '暂无 Agent 上线')
+              : agents.map(function(a) {
+                  var dotColor = a.online && !a.busy ? 'bg-green-400' : a.online && a.busy ? 'bg-yellow-400 pulse-dot' : 'bg-red-400';
+                  var statusText = a.busy ? '忙碌中' : a.online ? '在线' : '离线';
+                  var statusColor = a.busy ? 'text-yellow-600' : a.online ? 'text-green-600' : 'text-red-500';
+                  return h('div', {
+                    key: a.name,
+                    className: 'px-3 py-2 rounded-lg hover:bg-gray-50 flex items-center gap-3 transition-colors'
+                  },
+                    h('span', { className: 'w-2.5 h-2.5 rounded-full flex-shrink-0 ' + dotColor }),
+                    h('div', { className: 'flex-1 min-w-0' },
+                      h('div', { className: 'text-sm font-medium text-gray-700' }, a.name),
+                      h('div', { className: 'text-xs text-gray-400 truncate' },
+                        a.model_cli
+                      )
+                    ),
+                    h('span', { className: 'text-xs font-medium flex-shrink-0 ' + statusColor }, statusText),
+                  );
+                })
+          )
+        )
+      );
+    }
+
+    // ====== Conversation View ======
+    function ConversationView(props) {
+      var task = props.task, conversation = props.conversation;
+      var onSend = props.onSend, loading = props.loading;
+      var onEndConversation = props.onEndConversation;
+      var messagesEndRef = props.messagesEndRef, hasActiveConversation = props.hasActiveConversation;
+      var inputRef = useRef(null);
+      var inputState = useState('');
+      var input = inputState[0], setInput = inputState[1];
+
+      var msgs = parseConversation(conversation);
+      var isActive = task && task.status !== 'completed' && task.status !== 'failed' && task.status !== 'suspended';
+      var isNewConversation = !task;
+      var inputEnabled = isActive || isNewConversation;
+      var showWelcome = !task || msgs.length === 0;
+
+      useEffect(function() {
+        if (!loading && inputRef.current) inputRef.current.focus();
+      }, [loading, task]);
+
+      function handleSend() {
+        var msg = input.trim();
+        if (!msg || loading) return;
+        setInput('');
+        onSend(msg);
+      }
+
+      function handleKeyDown(e) {
+        if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleSend(); }
+      }
+
+      // Pick agent name by model_cli
+      function agentLabel(modelCli) {
+        return { claude: '🤖 克劳德', kimi: '🧠 吉米' }[modelCli] || '🤖 助手';
+      }
+
+      return h('div', { className: 'flex flex-col h-full bg-white' },
+        // Header
+        h('div', { className: 'px-5 py-3 border-b border-gray-100 flex items-center justify-between bg-white' },
+          h('div', null,
+            h('h1', { className: 'font-semibold text-gray-800' }, task ? task.name : '多智能体协作平台'),
+            task && h('div', { className: 'flex items-center gap-2 mt-0.5' },
+              h('span', { className: 'inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium ' + (
+                task.status === 'completed' ? 'bg-green-100 text-green-800' :
+                task.status === 'failed' ? 'bg-red-100 text-red-800' :
+                task.status === 'executing' ? 'bg-blue-100 text-blue-800' :
+                task.status === 'suspended' ? 'bg-yellow-100 text-yellow-800' :
+                'bg-gray-100 text-gray-600'
+              )}, statusLabel[task.status] || task.status),
+              task.complex_flag && h('span', { className: 'inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium bg-orange-100 text-orange-800' }, '复杂任务'),
+            ),
+            task && task.complex_flag && task.status === 'suspended' && h('p', { className: 'text-xs text-orange-600 mt-1' }, '完整多Agent协作将于二期上线'),
+          ),
+          task && h('div', { className: 'text-xs text-gray-400' },
+            h('span', null, '创建于 ' + new Date(task.created_at).toLocaleString('zh-CN')),
+          )
+        ),
+
+        // Messages area
+        h('div', { className: 'flex-1 overflow-y-auto px-5 py-4 space-y-4 scrollbar-thin bg-gray-50' },
+          showWelcome && h('div', { className: 'flex flex-col items-center justify-center h-full text-center px-8 fade-in' },
+            h('div', { className: 'text-5xl mb-6' }, '🤖'),
+            h('h2', { className: 'text-xl font-bold text-gray-800 mb-2' }, '多智能体协作平台'),
+            h('p', { className: 'text-gray-500 max-w-md leading-relaxed mb-4' }, '我是你的智能助手克劳德。在下方输入你的需求，我会自动创建任务并开始执行。'),
+            h('div', { className: 'flex flex-wrap gap-2 justify-center' },
+              ['帮我写一个 Python 脚本', '设计一个 API 接口', '审查一段代码', '解释一个技术概念'].map(function(hint, i) {
+                return h('button', {
+                  key: i, onClick: function() { setInput(hint); if (inputRef.current) inputRef.current.focus(); },
+                  className: 'px-3 py-1.5 border border-gray-200 rounded-full text-xs text-gray-600 hover:bg-gray-100 hover:border-gray-300 transition-colors'
+                }, hint);
+              })
+            )
+          ),
+
+          msgs.map(function(msg, i) {
+            return h('div', { key: i, className: 'flex ' + (msg.role === 'user' ? 'justify-end' : 'justify-start') + ' slide-up' },
+              h('div', { className: 'max-w-[80%] rounded-2xl px-4 py-3 ' + (
+                msg.role === 'user' ? 'bg-blue-600 text-white' :
+                msg.role === 'system' ? 'bg-gray-100 text-gray-600 text-sm' :
+                'bg-white border border-gray-200 shadow-sm'
+              )},
+                msg.role !== 'user' && h('div', { className: 'text-xs font-medium text-gray-400 mb-1.5' },
+                  msg.role === 'system' ? '⚙️ 系统' : agentLabel(task ? task.executor_agent : 'claude')
+                ),
+                msg.role === 'user'
+                  ? h('p', { className: 'text-sm leading-relaxed whitespace-pre-wrap' }, msg.content)
+                  : h(Markdown, null, msg.content)
+              )
+            );
+          }),
+
+          // Loading indicator
+          loading && h('div', { className: 'flex justify-start slide-up' },
+            h('div', { className: 'bg-white border border-gray-200 shadow-sm rounded-2xl px-4 py-3' },
+              h('div', { className: 'flex items-center gap-1.5' },
+                h('div', { className: 'w-2 h-2 bg-blue-400 rounded-full pulse-dot' }),
+                h('div', { className: 'w-2 h-2 bg-blue-400 rounded-full pulse-dot', style: { animationDelay: '0.2s' } }),
+                h('div', { className: 'w-2 h-2 bg-blue-400 rounded-full pulse-dot', style: { animationDelay: '0.4s' } }),
+                h('span', { className: 'text-sm text-gray-400 ml-2' }, '思考中...')
+              )
+            )
+          ),
+
+          h('div', { ref: messagesEndRef })
+        ),
+
+        // Input area
+        h('div', { className: 'px-5 py-3 border-t border-gray-100 bg-white' },
+          inputEnabled
+            ? h('div', { className: 'flex items-end gap-2' },
+                h('textarea', {
+                  ref: inputRef, value: input,
+                  placeholder: isNewConversation ? '输入你的需求，开始对话...' : '继续输入...',
+                  rows: 1, disabled: loading,
+                  onChange: function(e) { setInput(e.target.value); e.target.style.height = 'auto'; e.target.style.height = Math.min(e.target.scrollHeight, 200) + 'px'; },
+                  onKeyDown: handleKeyDown,
+                  className: 'flex-1 px-4 py-3 border border-gray-200 rounded-xl focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none text-sm resize-none max-h-[200px]'
+                }),
+                h('button', {
+                  onClick: handleSend, disabled: !input.trim() || loading,
+                  className: 'px-4 py-3 bg-blue-600 text-white rounded-xl font-medium hover:bg-blue-700 disabled:opacity-40 disabled:cursor-not-allowed transition-colors flex-shrink-0'
+                },
+                  h('svg', { className: 'w-5 h-5', fill:'none', stroke:'currentColor', viewBox:'0 0 24 24' },
+                    h('path', { strokeLinecap:'round', strokeLinejoin:'round', strokeWidth:2, d:'M12 19l9 2-9-18-9 18 9-2zm0 0v-8' })
+                  )
+                ),
+                task && h('button', {
+                  onClick: onEndConversation, disabled: loading,
+                  className: 'px-3 py-3 border border-gray-200 text-gray-500 rounded-xl hover:bg-gray-50 hover:border-gray-300 transition-colors flex-shrink-0 text-xs',
+                  title: '结束对话'
+                },
+                  h('svg', { className: 'w-4 h-4', fill:'none', stroke:'currentColor', viewBox:'0 0 24 24' },
+                    h('path', { strokeLinecap:'round', strokeLinejoin:'round', strokeWidth:2, d:'M6 18L18 6M6 6l12 12' })
+                  )
+                )
+              )
+            : h('div', { className: 'flex items-center justify-center py-3' },
+                h('p', { className: 'text-sm text-gray-400' }, '此对话已结束 — 点击左侧「+」开始新对话')
+              )
+        )
+      );
+    }
+
+    // ====== Main App ======
+    function App() {
+      var conversationsState = useState([]);
+      var conversations = conversationsState[0], setConversations = conversationsState[1];
+      var activeIdState = useState(null);
+      var activeId = activeIdState[0], setActiveId = activeIdState[1];
+      var activeTaskState = useState(null);
+      var activeTask = activeTaskState[0], setActiveTask = activeTaskState[1];
+      var conversationState = useState('');
+      var conversation = conversationState[0], setConversation = conversationState[1];
+      var agentsState = useState([]);
+      var agents = agentsState[0], setAgents = agentsState[1];
+      var loadingState = useState(false);
+      var loading = loadingState[0], setLoading = loadingState[1];
+      var sidebarCollapsedState = useState(false);
+      var sidebarCollapsed = sidebarCollapsedState[0], setSidebarCollapsed = sidebarCollapsedState[1];
+      var messagesEndRef = useRef(null);
+
+      // WebSocket
+      var wsConnectedState = useState(false);
+      var wsConnected = wsConnectedState[0], setWsConnected = wsConnectedState[1];
+      var lastMsgState = useState(null);
+      var lastMessage = lastMsgState[0];
+
+      useEffect(function() {
+        var protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+        var ws = new WebSocket(protocol + '//' + location.host + '/ws');
+        ws.onopen = function() { setWsConnected(true); };
+        ws.onclose = function() { setWsConnected(false); };
+        ws.onmessage = function(e) {
+          try {
+            var data = JSON.parse(e.data);
+            // 直接处理 agent:heartbeat，减少状态传递延迟
+            if (data.event_type === 'agent:heartbeat') {
+              setAgents(data.data || []);
+            }
+            lastMsgState[1](data);
+          } catch(err) { console.error('[WS]', err); }
+        };
+        return function() { ws.close(); };
+      }, []);
+
+      // Fetch conversations
+      var fetchConversations = useCallback(async function() {
+        try {
+          var res = await api('/tasks?sort_by=updated_at&sort_order=desc');
+          var tasks = await res.json();
+          var enriched = tasks.map(function(t) {
+            return Object.assign({}, t, { name: t.name || '未命名对话', _lastMessage: t.description || '' });
+          });
+          setConversations(enriched);
+        } catch(e) { console.error(e); }
+      }, []);
+
+      var fetchConversation = useCallback(async function(taskId) {
+        try {
+          var res = await api('/tasks/' + taskId + '/conversation');
+          var data = await res.json();
+          setConversation(data.conversation);
+          setActiveTask(data.task);
+        } catch(e) { console.error(e); }
+      }, []);
+
+      var fetchAgents = useCallback(async function() {
+        try {
+          var res = await api('/agents');
+          var data = await res.json();
+          setAgents(data);
+        } catch(e) { console.error('[fetchAgents]', e); }
+      }, []);
+
+      useEffect(function() { fetchConversations(); fetchAgents(); }, []);
+
+      // WebSocket event handling
+      useEffect(function() {
+        if (!lastMessage || !lastMessage.event_type) return;
+        var event = lastMessage;
+        if (event.event_type.indexOf('task:') === 0) {
+          fetchConversations();
+          if (activeId && event.data && event.data.task_id === activeId) {
+            fetchConversation(activeId);
+          }
+        }
+        if (event.event_type === 'agent:heartbeat') {
+          setAgents(event.data || []);
+        }
+      }, [lastMessage]);
+
+      // Scroll to bottom
+      useEffect(function() {
+        if (messagesEndRef.current) messagesEndRef.current.scrollIntoView({ behavior: 'smooth' });
+      }, [conversation, loading]);
+
+      function handleSend(message) {
+        setLoading(true);
+        (async function() {
+          try {
+            if (activeId) {
+              var res = await api('/tasks/' + activeId + '/chat', { method: 'POST', body: JSON.stringify({ message: message }) });
+              var data = await res.json();
+              if (data.task) setActiveTask(data.task);
+              fetchConversation(activeId);
+            } else {
+              var taskName = message.substring(0, 50) + (message.length > 50 ? '...' : '');
+              var createRes = await api('/tasks', { method: 'POST', body: JSON.stringify({
+                name: taskName, description: message, instruction: message,
+                priority: 'medium', task_type: 'development'
+              })});
+              var newTask = await createRes.json();
+              setActiveId(newTask.task_id);
+              setActiveTask(newTask);
+              setConversation('');
+
+              var execRes = await api('/tasks/' + newTask.task_id + '/execute', { method: 'POST', body: JSON.stringify({ message: message }) });
+              var execData = await execRes.json();
+              if (execData.task) setActiveTask(execData.task);
+              fetchConversation(newTask.task_id);
+            }
+            fetchConversations();
+          } catch(e) {
+            alert('执行失败: ' + e.message);
+          } finally {
+            setLoading(false);
+          }
+        })();
+      }
+
+      function handleSelectConversation(taskId) {
+        if (taskId === activeId) return;
+        setActiveId(taskId);
+        fetchConversation(taskId);
+      }
+
+      function handleNewConversation() {
+        setActiveId(null);
+        setActiveTask(null);
+        setConversation('');
+      }
+
+      async function handleEndConversation() {
+        if (!activeId) return;
+        setLoading(true);
+        try {
+          var res = await api('/tasks/' + activeId + '/complete', { method: 'POST' });
+          var completedTask = await res.json();
+          setActiveTask(completedTask);
+          fetchConversation(activeId);
+          fetchConversations();
+        } catch(e) {
+          alert('结束对话失败: ' + e.message);
+        } finally {
+          setLoading(false);
+        }
+      }
+
+      async function handleDeleteConversation(taskId) {
+        if (!confirm('确定要删除这个对话吗？此操作不可恢复。')) return;
+        try {
+          var res = await api('/tasks/batch/delete', { method: 'POST', body: JSON.stringify({ task_ids: [taskId] }) });
+          var result = await res.json();
+          if (result.failed && result.failed.length > 0) {
+            alert(result.failed[0].reason);
+            return;
+          }
+          if (activeId === taskId) {
+            setActiveId(null);
+            setActiveTask(null);
+            setConversation('');
+          }
+          fetchConversations();
+        } catch(e) { alert('删除失败: ' + e.message); }
+      }
+
+      return h('div', { className: 'h-screen flex flex-col' },
+        // Top bar
+        h('div', { className: 'px-4 py-1.5 bg-white border-b border-gray-200 flex items-center justify-between text-xs' },
+          h('div', { className: 'flex items-center gap-3' },
+            h('span', { className: 'flex items-center gap-1 ' + (wsConnected ? 'text-green-600' : 'text-red-500') },
+              h('span', { className: 'w-1.5 h-1.5 rounded-full ' + (wsConnected ? 'bg-green-400' : 'bg-red-400') }),
+              wsConnected ? '已连接' : '未连接'
+            ),
+          ),
+          h('span', { className: 'text-gray-400' }, '多智能体协作平台 v1.0'),
+        ),
+
+        // Main layout
+        h('div', { className: 'flex flex-1 overflow-hidden' },
+          // Left: Sidebar
+          h(ConversationSidebar, {
+            conversations: conversations,
+            activeId: activeId,
+            onSelect: handleSelectConversation,
+            onNew: handleNewConversation,
+            onDelete: handleDeleteConversation,
+            collapsed: sidebarCollapsed,
+            onToggle: function() { setSidebarCollapsed(!sidebarCollapsed); },
+            agents: agents,
+          }),
+
+          // Right: Main conversation area
+          h('div', { className: 'flex-1 flex flex-col min-w-0' },
+            h(ConversationView, {
+              task: activeTask,
+              conversation: conversation,
+              onSend: handleSend,
+              loading: loading,
+              onEndConversation: handleEndConversation,
+              messagesEndRef: messagesEndRef,
+              hasActiveConversation: !!activeId,
+            })
+          )
+        )
+      );
+    }
+
+    // Render
+    var root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(h(App));
+  </script>
+</body>
+</html>
