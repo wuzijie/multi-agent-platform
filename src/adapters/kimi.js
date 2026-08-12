@@ -2,6 +2,7 @@ const { spawn } = require('child_process');
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
+const ModelLogger = require('../utils/model-logger');
 
 const ROOT = path.resolve(__dirname, '..', '..');
 
@@ -209,17 +210,19 @@ class KimiAdapter {
       fullPrompt += fileContents;
     }
 
-    // 构建 CLI 参数
+    // 获取当前使用的模型名称
+    const model = this._getModel() || process.env.KIMI_MODEL || 'kimi-default';
+    ModelLogger.logRequest(this.name, model, fullPrompt);
+
+    // 构建 CLI 参数（--output-format 需要 = 符号连接值）
     const args = [
-      '-p',  // 非交互模式
-      '--output-format', 'stream-json',
-      '--yolo',  // 自动批准操作
+      '-p',
+      '--output-format=text',
       '--add-dir', ROOT,
     ];
 
-    const model = this._getModel();
-    if (model) {
-      args.push('--model', model);
+    if (model !== 'kimi-default') {
+      args.push('-m', model);
     }
 
     const promptLength = fullPrompt.length;
@@ -229,14 +232,16 @@ class KimiAdapter {
       const result = await this._runCli(args, fullPrompt, timeoutMs);
 
       if (result.exit_code === 0) {
-        // 解析 stream-json 输出，提取最终文本内容
-        const content = this._parseStreamJson(result.stdout);
+        // 使用 text 格式，stdout 直接就是内容；仍然尝试 stream-json 解析以兼容
+        const content = result.stdout ? this._parseStreamJson(result.stdout) : '';
+        ModelLogger.logResponse(this.name, model, content);
         return buildKimiOutput(input.task_id, 'success', content, {
           tokens_used: this._estimateTokens(content),
           duration_ms: Date.now() - startTime,
         });
       } else {
         const errMsg = result.stderr || result.stdout || 'Unknown error';
+        ModelLogger.logResponse(this.name, model, errMsg);
         let errorCode = 'CLI_ERROR';
         if (errMsg.includes('Not logged in') || errMsg.includes('login')) {
           errorCode = 'AUTH_REQUIRED';
@@ -249,6 +254,7 @@ class KimiAdapter {
         });
       }
     } catch (e) {
+      ModelLogger.logResponse(this.name, model, e.message);
       return buildKimiOutput(input.task_id, 'failed', '', {
         error: { code: 'EXECUTION_ERROR', message: e.message },
         duration_ms: Date.now() - startTime,
@@ -295,7 +301,10 @@ class KimiAdapter {
    */
   _parseStreamJson(stdout) {
     if (!stdout) return '';
-    const lines = stdout.split('\n').filter(l => l.trim());
+    // 如果不是 JSON 流（纯文本输出），直接返回
+    const trimmed = stdout.trim();
+    if (!trimmed.startsWith('{')) return trimmed;
+    const lines = trimmed.split('\n').filter(l => l.trim());
     const textParts = [];
 
     for (const line of lines) {
@@ -335,7 +344,13 @@ class KimiAdapter {
       let stdout = '';
       let stderr = '';
 
-      const finalArgs = prompt ? [...args, prompt] : args;
+      const finalArgs = [];
+      for (let i = 0; i < args.length; i++) {
+        finalArgs.push(args[i]);
+        if (args[i] === '-p' && prompt) {
+          finalArgs.push(prompt);
+        }
+      }
 
       const apiKey = this._getApiKey();
       const baseUrl = this._getBaseUrl();

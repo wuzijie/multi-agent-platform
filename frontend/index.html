@@ -52,6 +52,20 @@
     .slide-up { animation: slide-up 0.3s ease-out; }
     @keyframes fade-in { from{opacity:0} to{opacity:1} }
     .fade-in { animation: fade-in 0.2s ease-out; }
+    /* @mention dropdown */
+    .mention-dropdown { position: absolute; bottom: 100%; left: 0; margin-bottom: 4px; background: white; border: 1px solid #e2e8f0; border-radius: 12px; box-shadow: 0 10px 25px rgba(0,0,0,0.1); max-height: 200px; overflow-y: auto; min-width: 200px; z-index: 50; }
+    .mention-item { padding: 8px 12px; cursor: pointer; display: flex; align-items: center; gap: 8px; transition: background 0.1s; }
+    .mention-item:hover, .mention-item.active { background: #f1f5f9; }
+    .mention-item:first-child { border-radius: 12px 12px 0 0; }
+    .mention-item:last-child { border-radius: 0 0 12px 12px; }
+    .mention-item .emoji { font-size: 18px; }
+    .mention-item .name { font-weight: 500; font-size: 14px; color: #1e293b; }
+    .mention-item .role { font-size: 11px; color: #94a3b8; }
+    .mention-item .status-dot { width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0; margin-left: auto; }
+    /* @mention tag chip */
+    .mention-chip { display: inline-flex; align-items: center; gap: 4px; background: #eff6ff; border: 1px solid #bfdbfe; color: #2563eb; border-radius: 6px; padding: 1px 8px; font-size: 13px; font-weight: 500; vertical-align: middle; margin: 0 2px; white-space: nowrap; }
+    .mention-chip .chip-remove { cursor: pointer; opacity: 0.6; font-size: 16px; line-height: 1; margin-left: 2px; }
+    .mention-chip .chip-remove:hover { opacity: 1; }
   </style>
 </head>
 <body>
@@ -298,9 +312,20 @@
       var onSend = props.onSend, loading = props.loading;
       var onEndConversation = props.onEndConversation;
       var messagesEndRef = props.messagesEndRef, hasActiveConversation = props.hasActiveConversation;
+      var agents = props.agents || [];
       var inputRef = useRef(null);
       var inputState = useState('');
       var input = inputState[0], setInput = inputState[1];
+
+      // @mention state
+      var mentionedState = useState(null);  // { name, model_cli } or null
+      var mentionedAgent = mentionedState[0], setMentionedAgent = mentionedState[1];
+      var showMentionState = useState(false);
+      var showMention = showMentionState[0], setShowMention = showMentionState[1];
+      var mentionFilterState = useState('');
+      var mentionFilter = mentionFilterState[0], setMentionFilter = mentionFilterState[1];
+      var mentionIdxState = useState(0);
+      var mentionIndex = mentionIdxState[0], setMentionIndex = mentionIdxState[1];
 
       var msgs = parseConversation(conversation);
       var isActive = task && task.status !== 'completed' && task.status !== 'failed' && task.status !== 'suspended';
@@ -315,17 +340,118 @@
       function handleSend() {
         var msg = input.trim();
         if (!msg || loading) return;
+        var cleanMsg = msg;
+        // 检测 @AgentName 模式 — 使用 state 中记录的 mentionedAgent
+        var atAgent = mentionedAgent;
+        if (!atAgent) {
+          var atMatch = msg.match(/@(\S+)/);
+          if (atMatch) {
+            var atName = atMatch[1];
+            // 尝试匹配 Agent 名称
+            for (var k = 0; k < agents.length; k++) {
+              if (agents[k].name === atName || agents[k].model_cli === atName) {
+                atAgent = agents[k];
+                break;
+              }
+            }
+            // 从消息中移除 @mention 部分
+            if (atAgent) {
+              cleanMsg = msg.replace(/@\S+\s*/, '').trim();
+            }
+          }
+        }
+        if (!cleanMsg) cleanMsg = msg;
         setInput('');
-        onSend(msg);
+        // 粘性 @mention：如果用户在当前消息中 @了新agent，更新为新的；否则保持上一次的
+        if (atAgent) {
+          setMentionedAgent(atAgent);
+        }
+        // 不清除 mentionedAgent — 保持粘性，直到用户手动点击 × 移除
+        setShowMention(false);
+        // 传递 @mentioned agent 信息（优先使用提到的，否则使用粘性保持的）
+        onSend(cleanMsg, atAgent || mentionedAgent);
       }
 
       function handleKeyDown(e) {
+        // @mention dropdown keyboard navigation
+        if (showMention) {
+          var filtered = agents.filter(function(a) {
+            return !mentionFilter || a.name.indexOf(mentionFilter) >= 0 || (a.model_cli && a.model_cli.indexOf(mentionFilter) >= 0);
+          });
+          if (e.key === 'ArrowDown') {
+            e.preventDefault();
+            setMentionIndex(Math.min(mentionIndex + 1, filtered.length - 1));
+            return;
+          }
+          if (e.key === 'ArrowUp') {
+            e.preventDefault();
+            setMentionIndex(Math.max(mentionIndex - 1, 0));
+            return;
+          }
+          if (e.key === 'Enter') {
+            e.preventDefault();
+            var sel = filtered[mentionIndex];
+            if (sel) selectMention(sel);
+            return;
+          }
+          if (e.key === 'Escape') {
+            e.preventDefault();
+            setShowMention(false);
+            return;
+          }
+        }
         if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleSend(); }
       }
 
-      // Pick agent name by model_cli
-      function agentLabel(modelCli) {
-        return { claude: '🤖 克劳德', kimi: '🧠 吉米' }[modelCli] || '🤖 助手';
+      function handleInputChange(e) {
+        var val = e.target.value;
+        setInput(val);
+        e.target.style.height = 'auto';
+        e.target.style.height = Math.min(e.target.scrollHeight, 200) + 'px';
+
+        // @mention detection: look for @ followed by agent name prefix
+        var atPos = val.lastIndexOf('@');
+        if (atPos >= 0 && val.length > atPos + 1) {
+          var afterAt = val.substring(atPos + 1);
+          // Only trigger if @ is at start of line or preceded by space/punctuation
+          var beforeAt = atPos > 0 ? val.charAt(atPos - 1) : '';
+          if (atPos === 0 || /[\s,，。；;:：!！?？]/.test(beforeAt)) {
+            // Only if after @ contains no spaces yet and is a prefix match
+            if (!/\s/.test(afterAt) && afterAt.length < 20) {
+              setShowMention(true);
+              setMentionFilter(afterAt);
+              setMentionIndex(0);
+              return;
+            }
+          }
+        }
+        setShowMention(false);
+      }
+
+      function selectMention(agent) {
+        setMentionedAgent(agent);
+        setShowMention(false);
+        // Replace @filter with @AgentName in input
+        var val = input;
+        var atPos = val.lastIndexOf('@');
+        if (atPos >= 0) {
+          var before = val.substring(0, atPos);
+          var after = val.substring(atPos + 1);
+          var spaceIdx = after.indexOf(' ');
+          if (spaceIdx >= 0) after = after.substring(spaceIdx);
+          else after = '';
+          setInput(before + '@' + agent.name + ' ' + after);
+        }
+        setTimeout(function() { if (inputRef.current) inputRef.current.focus(); }, 50);
+      }
+
+      // Pick agent name by model_cli or direct name
+      function agentLabel(nameOrCli) {
+        var labels = { claude: '🤖 克劳德', kimi: '🧠 吉米', deepseek: '🔬 迪普斯克', qwen: '💡 钱文' };
+        if (labels[nameOrCli]) return labels[nameOrCli];
+        // Also match by direct name
+        var byName = { '克劳德': '🤖 克劳德', '吉米': '🧠 吉米', '迪普斯克': '🔬 迪普斯克', '钱文': '💡 钱文' };
+        return byName[nameOrCli] || '🤖 ' + (nameOrCli || '助手');
       }
 
       return h('div', { className: 'flex flex-col h-full bg-white' },
@@ -341,13 +467,13 @@
                 task.status === 'suspended' ? 'bg-yellow-100 text-yellow-800' :
                 'bg-gray-100 text-gray-600'
               )}, statusLabel[task.status] || task.status),
-              task.complex_flag && h('span', { className: 'inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium bg-orange-100 text-orange-800' }, '复杂任务'),
-            ),
-            task && task.complex_flag && task.status === 'suspended' && h('p', { className: 'text-xs text-orange-600 mt-1' }, '完整多Agent协作将于二期上线'),
+              task.complex_flag && h('span', { className: 'inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium bg-orange-100 text-orange-800' }, '多Agent协作'),
+              task.complex_flag && task.status === 'executing' && h('p', { className: 'text-xs text-orange-600 mt-1' }, '执行→评审→裁决→修正 协作进行中'),
           ),
           task && h('div', { className: 'text-xs text-gray-400' },
             h('span', null, '创建于 ' + new Date(task.created_at).toLocaleString('zh-CN')),
           )
+        ),
         ),
 
         // Messages area
@@ -367,6 +493,12 @@
           ),
 
           msgs.map(function(msg, i) {
+            // 检测消息中是否包含 Agent 名称标记
+            var msgAgentLabel = null;
+            var agentMatch = msg.content.match(/^\*\*(.+?)\*\*/);
+            if (agentMatch && agentLabel(agentMatch[1]) !== '🤖 ' + agentMatch[1]) {
+              msgAgentLabel = agentLabel(agentMatch[1]);
+            }
             return h('div', { key: i, className: 'flex ' + (msg.role === 'user' ? 'justify-end' : 'justify-start') + ' slide-up' },
               h('div', { className: 'max-w-[80%] rounded-2xl px-4 py-3 ' + (
                 msg.role === 'user' ? 'bg-blue-600 text-white' :
@@ -374,7 +506,7 @@
                 'bg-white border border-gray-200 shadow-sm'
               )},
                 msg.role !== 'user' && h('div', { className: 'text-xs font-medium text-gray-400 mb-1.5' },
-                  msg.role === 'system' ? '⚙️ 系统' : agentLabel(task ? task.executor_agent : 'claude')
+                  msg.role === 'system' ? '⚙️ 系统' : (msgAgentLabel || agentLabel(task ? task.executor_agent : 'claude'))
                 ),
                 msg.role === 'user'
                   ? h('p', { className: 'text-sm leading-relaxed whitespace-pre-wrap' }, msg.content)
@@ -401,30 +533,73 @@
         // Input area
         h('div', { className: 'px-5 py-3 border-t border-gray-100 bg-white' },
           inputEnabled
-            ? h('div', { className: 'flex items-end gap-2' },
-                h('textarea', {
-                  ref: inputRef, value: input,
-                  placeholder: isNewConversation ? '输入你的需求，开始对话...' : '继续输入...',
-                  rows: 1, disabled: loading,
-                  onChange: function(e) { setInput(e.target.value); e.target.style.height = 'auto'; e.target.style.height = Math.min(e.target.scrollHeight, 200) + 'px'; },
-                  onKeyDown: handleKeyDown,
-                  className: 'flex-1 px-4 py-3 border border-gray-200 rounded-xl focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none text-sm resize-none max-h-[200px]'
-                }),
-                h('button', {
-                  onClick: handleSend, disabled: !input.trim() || loading,
-                  className: 'px-4 py-3 bg-blue-600 text-white rounded-xl font-medium hover:bg-blue-700 disabled:opacity-40 disabled:cursor-not-allowed transition-colors flex-shrink-0'
-                },
-                  h('svg', { className: 'w-5 h-5', fill:'none', stroke:'currentColor', viewBox:'0 0 24 24' },
-                    h('path', { strokeLinecap:'round', strokeLinejoin:'round', strokeWidth:2, d:'M12 19l9 2-9-18-9 18 9-2zm0 0v-8' })
+            ? h('div', null,
+                // @mention selected chip
+                mentionedAgent && h('div', { className: 'mb-2 flex items-center gap-2' },
+                  h('span', { className: 'text-xs text-gray-400' }, '回答者:'),
+                  h('span', { className: 'mention-chip' },
+                    agentLabel(mentionedAgent.model_cli),
+                    h('span', { className: 'text-xs ml-1' }, mentionedAgent.name),
+                    h('span', {
+                      className: 'chip-remove', onClick: function() { setMentionedAgent(null); },
+                      title: '移除'
+                    }, '×')
                   )
                 ),
-                task && h('button', {
-                  onClick: onEndConversation, disabled: loading,
-                  className: 'px-3 py-3 border border-gray-200 text-gray-500 rounded-xl hover:bg-gray-50 hover:border-gray-300 transition-colors flex-shrink-0 text-xs',
-                  title: '结束对话'
-                },
-                  h('svg', { className: 'w-4 h-4', fill:'none', stroke:'currentColor', viewBox:'0 0 24 24' },
-                    h('path', { strokeLinecap:'round', strokeLinejoin:'round', strokeWidth:2, d:'M6 18L18 6M6 6l12 12' })
+                h('div', { className: 'flex items-end gap-2', style: { position: 'relative' } },
+                  // @mention dropdown
+                  showMention && agents.length > 0 && h('div', { className: 'mention-dropdown' },
+                    agents.filter(function(a) {
+                      return !mentionFilter || a.name.indexOf(mentionFilter) >= 0 || (a.model_cli && a.model_cli.indexOf(mentionFilter) >= 0);
+                    }).map(function(a, idx) {
+                      return h('div', {
+                        key: a.name,
+                        className: 'mention-item' + (idx === mentionIndex ? ' active' : ''),
+                        onClick: function() { selectMention(a); },
+                        onMouseEnter: function() { setMentionIndex(idx); }
+                      },
+                        h('span', { className: 'emoji' }, (function() {
+                          var em = { claude: '🤖', kimi: '🧠', deepseek: '🔬', qwen: '💡' };
+                          return em[a.model_cli] || '🤖';
+                        })()),
+                        h('span', { className: 'name' }, a.name),
+                        h('span', { className: 'role' },
+                          a.model_cli + (a.online ? ' · 在线' : ' · 离线')
+                        ),
+                        h('span', {
+                          className: 'status-dot',
+                          style: { background: a.online && !a.busy ? '#4ade80' : a.online && a.busy ? '#facc15' : '#f87171' }
+                        })
+                      );
+                    }),
+                    !mentionFilter || agents.filter(function(a) { return a.name.indexOf(mentionFilter) >= 0 || (a.model_cli && a.model_cli.indexOf(mentionFilter) >= 0); }).length === 0
+                      ? h('div', { className: 'mention-item', style: { cursor: 'default', color: '#94a3b8' } }, '无匹配的智能体')
+                      : null
+                  ),
+                  h('textarea', {
+                    ref: inputRef, value: input,
+                    placeholder: isNewConversation ? '输入你的需求，开始对话... 也可用 @Agent名 指定回答者' : '继续输入... 也可用 @Agent名 指定回答者',
+                    rows: 1, disabled: loading,
+                    onChange: handleInputChange,
+                    onKeyDown: handleKeyDown,
+                    className: 'flex-1 px-4 py-3 border border-gray-200 rounded-xl focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none text-sm resize-none max-h-[200px]'
+                  }),
+                  h('button', {
+                    onClick: handleSend, disabled: !input.trim() || loading,
+                    className: 'px-4 py-3 bg-blue-600 text-white rounded-xl font-medium hover:bg-blue-700 disabled:opacity-40 disabled:cursor-not-allowed transition-colors flex-shrink-0'
+                  },
+                    h('svg', { className: 'w-5 h-5', fill:'none', stroke:'currentColor', viewBox:'0 0 24 24' },
+                      h('path', { strokeLinecap:'round', strokeLinejoin:'round', strokeWidth:2, d:'M12 19l9 2-9-18-9 18 9-2zm0 0v-8' })
+                    )
+                  ),
+                  task && h('button', {
+                    onClick: onEndConversation, disabled: loading,
+                    className: 'px-3 py-3 border border-gray-200 text-gray-500 rounded-xl hover:bg-gray-50 hover:border-gray-300 transition-colors flex-shrink-0 text-xs',
+                    title: '结束对话'
+                  },
+                    h('svg', { className: 'w-4 h-4', fill:'none', stroke:'currentColor', viewBox:'0 0 24 24' },
+                      h('path', { strokeLinecap:'round', strokeLinejoin:'round', strokeWidth:2, d:'M6 18L18 6M6 6l12 12' })
+                    )
                   )
                 )
               )
@@ -528,27 +703,29 @@
         if (messagesEndRef.current) messagesEndRef.current.scrollIntoView({ behavior: 'smooth' });
       }, [conversation, loading]);
 
-      function handleSend(message) {
+      function handleSend(message, mentionedAgent) {
         setLoading(true);
         (async function() {
           try {
             if (activeId) {
-              var res = await api('/tasks/' + activeId + '/chat', { method: 'POST', body: JSON.stringify({ message: message }) });
+              var res = await api('/tasks/' + activeId + '/chat', { method: 'POST', body: JSON.stringify({ message: message, mentioned_agent: mentionedAgent ? mentionedAgent.name : undefined, model_cli: mentionedAgent ? mentionedAgent.model_cli : undefined }) });
               var data = await res.json();
               if (data.task) setActiveTask(data.task);
               fetchConversation(activeId);
             } else {
               var taskName = message.substring(0, 50) + (message.length > 50 ? '...' : '');
+              var agent = mentionedAgent;
               var createRes = await api('/tasks', { method: 'POST', body: JSON.stringify({
                 name: taskName, description: message, instruction: message,
-                priority: 'medium', task_type: 'development'
+                priority: 'medium', task_type: 'development',
+                executor_agent: agent ? agent.name : undefined
               })});
               var newTask = await createRes.json();
               setActiveId(newTask.task_id);
               setActiveTask(newTask);
               setConversation('');
 
-              var execRes = await api('/tasks/' + newTask.task_id + '/execute', { method: 'POST', body: JSON.stringify({ message: message }) });
+              var execRes = await api('/tasks/' + newTask.task_id + '/execute', { method: 'POST', body: JSON.stringify({ message: message, mentioned_agent: agent ? agent.name : undefined, model_cli: agent ? agent.model_cli : undefined }) });
               var execData = await execRes.json();
               if (execData.task) setActiveTask(execData.task);
               fetchConversation(newTask.task_id);
@@ -637,6 +814,7 @@
           // Right: Main conversation area
           h('div', { className: 'flex-1 flex flex-col min-w-0' },
             h(ConversationView, {
+              key: activeId || 'new',
               task: activeTask,
               conversation: conversation,
               onSend: handleSend,
@@ -644,6 +822,7 @@
               onEndConversation: handleEndConversation,
               messagesEndRef: messagesEndRef,
               hasActiveConversation: !!activeId,
+              agents: agents,
             })
           )
         )
