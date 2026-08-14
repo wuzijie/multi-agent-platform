@@ -1221,23 +1221,29 @@ ${executorOutput}
     if (!fs.existsSync(conversationPath)) return [];
     const raw = fs.readFileSync(conversationPath, 'utf8');
     const messages = [];
-    // 简单解析：按 ### 分割
-    const sections = raw.split(/\n### /);
-    for (let i = 1; i < sections.length; i++) {
-      const section = sections[i];
-      const match = section.match(/^(🧑 用户|🤖 助手|⚙️ 系统|🤖 (克劳德|吉米|迪普斯克|钱文))/);
-      if (match) {
-        let role = 'unknown';
-        if (match[1].includes('用户')) role = 'user';
-        else if (match[1].includes('助手')) role = 'assistant';
-        else if (match[1].includes('系统')) role = 'system';
-        else if (match[2]) role = 'user'; // 模型间转交的问题，视为提问
+    // 真正的消息头：行首 "### 🧑 用户/🤖 助手/⚙️ 系统/🤖 模型名"
+    // 不能用 split(/\n### /) —— 回答正文里的 markdown 标题（### xxx）会被误分割
+    const headerRe = /^### (🧑 用户|🤖 助手|⚙️ 系统|🤖 (克劳德|吉米|迪普斯克|钱文))(?: @[^\n-]+)?[^\n]*$/gm;
+    const starts = [];
+    let m;
+    while ((m = headerRe.exec(raw)) !== null) {
+      starts.push({ pos: m.index, role: m[1], agent: m[2] || null, headerLen: m[0].length });
+    }
+    for (let i = 0; i < starts.length; i++) {
+      const s = starts[i];
+      const bodyStart = s.pos + s.headerLen;
+      const bodyEnd = i + 1 < starts.length ? starts[i + 1].pos : raw.length;
+      const body = raw.slice(bodyStart, bodyEnd).replace(/^\n+/, '');
+      const content = body.replace(/\n---\n?$/, '').trim();
+      if (!content) continue;
 
-        const content = section.replace(/^[^\n]+\n\n/, '').replace(/\n---\n?$/, '').trim();
-        if (content) {
-          messages.push({ role, content });
-        }
-      }
+      let role = 'unknown';
+      if (s.role.includes('用户')) role = 'user';
+      else if (s.role.includes('助手')) role = 'assistant';
+      else if (s.role.includes('系统')) role = 'system';
+      else if (s.agent) role = 'user'; // 模型间转交的问题，视为提问
+
+      messages.push({ role, content });
     }
     return messages;
   }

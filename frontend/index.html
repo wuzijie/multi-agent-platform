@@ -185,19 +185,29 @@
     function parseConversation(text) {
       if (!text) return [];
       var messages = [];
-      var sections = text.split(/\n### /);
-      for (var i = 1; i < sections.length; i++) {
-        var section = sections[i];
-        var match = section.match(/^(🧑 用户|🤖 助手|⚙️ 系统|🤖 (克劳德|吉米|迪普斯克|钱文))(?: @([^\n-]+))?/);
-        var role = 'system', label = '系统', target = null;
-        if (match) {
-          if (match[1].indexOf('用户') >= 0) { role = 'user'; label = '用户'; }
-          else if (match[1].indexOf('助手') >= 0) { role = 'assistant'; label = '助手'; }
-          else if (match[2]) { role = 'user'; label = match[2]; } // 模型间转交的问题
-          if (match[3]) target = match[3].trim();
-        }
-        var content = section.replace(/^[^\n]+\n\n/, '').replace(/\n---\n?$/, '').trim();
-        if (content) messages.push({ role: role, label: label, content: content, target: target });
+      // 真正的消息头格式：行首 "### 🧑 用户/🤖 助手/⚙️ 系统/🤖 模型名"
+      // 不能用 split(/\n### /) —— 回答正文里的 markdown 标题（### xxx）会被误分割
+      var headerRe = /^### (🧑 用户|🤖 助手|⚙️ 系统|🤖 (克劳德|吉米|迪普斯克|钱文))(?: @([^\n-]+))?[^\n]*$/gm;
+      var starts = [];
+      var m;
+      while ((m = headerRe.exec(text)) !== null) {
+        starts.push({ pos: m.index, role: m[1], agent: m[2] || null, target: m[3] ? m[3].trim() : null, headerLen: m[0].length });
+      }
+      if (starts.length === 0) return [];
+      for (var i = 0; i < starts.length; i++) {
+        var s = starts[i];
+        var bodyStart = s.pos + s.headerLen;
+        var bodyEnd = i + 1 < starts.length ? starts[i + 1].pos : text.length;
+        var body = text.slice(bodyStart, bodyEnd);
+        // 头部与正文之间以空行分隔；去掉第一个空行块
+        body = body.replace(/^\n+/, '');
+        var content = body.replace(/\n---\n?$/, '').trim();
+        if (!content) continue;
+        var role = 'system', label = '系统', target = s.target;
+        if (s.role.indexOf('用户') >= 0) { role = 'user'; label = '用户'; }
+        else if (s.role.indexOf('助手') >= 0) { role = 'assistant'; label = '助手'; }
+        else if (s.agent) { role = 'user'; label = s.agent; } // 模型间转交的问题
+        messages.push({ role: role, label: label, content: content, target: target });
       }
       return messages;
     }
