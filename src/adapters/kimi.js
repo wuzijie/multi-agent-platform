@@ -191,7 +191,7 @@ class KimiAdapter {
    * @param {Object} input - UnifiedInput
    * @returns {Promise<Object>} UnifiedOutput
    */
-  async execute(input) {
+  async execute(input, onChunk) {
     validateKimiInput(input);
     const startTime = Date.now();
 
@@ -229,7 +229,7 @@ class KimiAdapter {
     const timeoutMs = Math.max(60000, promptLength * 2 + 30000);
 
     try {
-      const result = await this._runCli(args, fullPrompt, timeoutMs);
+      const result = await this._runCli(args, fullPrompt, timeoutMs, onChunk);
 
       if (result.exit_code === 0) {
         // 使用 text 格式，stdout 直接就是内容；仍然尝试 stream-json 解析以兼容
@@ -339,10 +339,11 @@ class KimiAdapter {
   /**
    * 执行 CLI 命令
    */
-  _runCli(args, prompt, timeoutMs) {
+  _runCli(args, prompt, timeoutMs, onChunk) {
     return new Promise((resolve) => {
       let stdout = '';
       let stderr = '';
+      let streamedLen = 0;
 
       const finalArgs = [];
       for (let i = 0; i < args.length; i++) {
@@ -370,7 +371,15 @@ class KimiAdapter {
       });
 
       proc.stdout.on('data', (data) => {
-        stdout += data.toString();
+        const chunk = data.toString();
+        stdout += chunk;
+        if (typeof onChunk === 'function') {
+          const added = stdout.length - streamedLen;
+          if (added > 0) {
+            streamedLen = stdout.length;
+            onChunk(stdout.substring(streamedLen - added));
+          }
+        }
       });
 
       proc.stderr.on('data', (data) => {

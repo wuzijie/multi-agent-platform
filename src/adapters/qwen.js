@@ -3,6 +3,7 @@ const path = require('path');
 const fs = require('fs');
 const os = require('os');
 const ModelLogger = require('../utils/model-logger');
+const { streamChatCompletion } = require('./openai-sse');
 
 const ROOT = path.resolve(__dirname, '..', '..');
 
@@ -89,6 +90,10 @@ class QwenAdapter {
     if (!this._config) {
       this._config = require('../utils/config');
     }
+    // 惰性加载兜底：若配置尚未加载（如独立调用入口遗漏 loadAll），自动补加载
+    if (this._config && (!this._config.apiKeys || Object.keys(this._config.apiKeys).length === 0)) {
+      try { this._config.loadAll(); } catch (e) { /* 忽略重复加载错误 */ }
+    }
     return this._config;
   }
 
@@ -135,7 +140,7 @@ class QwenAdapter {
     }
   }
 
-  async execute(input) {
+  async execute(input, onChunk) {
     validateInput(input);
     const startTime = Date.now();
 
@@ -158,8 +163,43 @@ class QwenAdapter {
     const promptLength = fullPrompt.length;
     const timeoutMs = Math.max(60000, promptLength * 2 + 30000);
 
+    // 优先：直连 OpenAI 兼容 API 实现真流式（qwen CLI 会缓冲输出）
+    const apiKey = this._getApiKey();
+    const baseUrl = this._getBaseUrl();
+    const directModel = this._getModel() || process.env.QWEN_MODEL || null;
+    if (apiKey && baseUrl && directModel && directModel !== 'qwen-default') {
+      try {
+        const streamed = await streamChatCompletion({
+          baseUrl,
+          apiKey,
+          model: directModel,
+          messages: [{ role: 'user', content: fullPrompt }],
+          timeoutMs,
+          onChunk,
+        });
+        if (streamed.ok && streamed.text) {
+          ModelLogger.logResponse(this.name, directModel, streamed.text);
+          return buildOutput(input.task_id, 'success', streamed.text, {
+            tokens_used: this._estimateTokens(streamed.text),
+            duration_ms: Date.now() - startTime,
+          });
+        }
+        if (streamed.ok && !streamed.text) {
+          ModelLogger.logResponse(this.name, directModel, '(空响应)');
+          return buildOutput(input.task_id, 'failed', '', {
+            error: { code: 'EMPTY_RESPONSE', message: 'API 返回空内容' },
+            duration_ms: Date.now() - startTime,
+          });
+        }
+        // API 直连失败 → 回退 CLI 路径
+        ModelLogger.logResponse(this.name, directModel, `[API直连失败，回退CLI] ${streamed.error || ''}`);
+      } catch (apiErr) {
+        ModelLogger.logResponse(this.name, directModel, `[API直连异常，回退CLI] ${apiErr.message}`);
+      }
+    }
+
     try {
-      const result = await this._runCli(['-p', '-o', 'text'], fullPrompt, timeoutMs, model);
+      const result = await this._runCli(['-p', '-o', 'text'], fullPrompt, timeoutMs, model, onChunk);
 
       if (result.exit_code === 0) {
         ModelLogger.logResponse(this.name, model, result.stdout);
@@ -212,10 +252,11 @@ class QwenAdapter {
     return lines.join('\n');
   }
 
-  _runCli(args, prompt, timeoutMs, modelOverride) {
+  _runCli(args, prompt, timeoutMs, modelOverride, onChunk) {
     return new Promise((resolve) => {
       let stdout = '';
       let stderr = '';
+      let streamedLen = 0;
 
       // Construct final args: args already has ['-p', '-o', 'text']
       // We need to inject the prompt value after -p
@@ -255,7 +296,17 @@ class QwenAdapter {
         stdio: ['ignore', 'pipe', 'pipe'],
       });
 
-      proc.stdout.on('data', (data) => { stdout += data.toString(); });
+      proc.stdout.on('data', (data) => {
+        const chunk = data.toString();
+        stdout += chunk;
+        if (typeof onChunk === 'function') {
+          const added = stdout.length - streamedLen;
+          if (added > 0) {
+            streamedLen = stdout.length;
+            onChunk(stdout.substring(streamedLen - added));
+          }
+        }
+      });
       proc.stderr.on('data', (data) => { stderr += data.toString(); });
 
       proc.on('close', (code) => {

@@ -96,6 +96,10 @@ class ClaudeAdapter {
     if (!this._config) {
       this._config = require('../utils/config');
     }
+    // 惰性加载兜底：若配置尚未加载（如独立调用入口遗漏 loadAll），自动补加载
+    if (this._config && (!this._config.apiKeys || Object.keys(this._config.apiKeys).length === 0)) {
+      try { this._config.loadAll(); } catch (e) { /* 忽略重复加载错误 */ }
+    }
     return this._config;
   }
 
@@ -182,9 +186,10 @@ class ClaudeAdapter {
    * 执行任务
    *
    * @param {Object} input - UnifiedInput
+   * @param {Function} [onChunk] 流式回调：捕获到 CLI 增量输出时调用 onChunk(增量文本)
    * @returns {Promise<Object>} UnifiedOutput
    */
-  async execute(input) {
+  async execute(input, onChunk) {
     validateUnifiedInput(input);
     const startTime = Date.now();
 
@@ -210,20 +215,61 @@ class ClaudeAdapter {
     ModelLogger.logRequest(this.name, model, fullPrompt);
 
     // 构建 CLI 参数
-    const args = [
+    // 注意：text 格式的输出是非流式的（结束才一次性吐出），
+    // 因此优先使用 stream-json（需配合 --verbose）实现真流式。
+    const baseArgs = [
       '--print',
-      '--output-format', 'text',
       '--permission-mode', 'bypassPermissions',
       '--add-dir', ROOT,
       '--bare',
     ];
+    const streamArgs = [...baseArgs, '--output-format', 'stream-json', '--verbose'];
+    const textArgs = [...baseArgs, '--output-format', 'text'];
 
     // 超时计算
     const promptLength = fullPrompt.length;
     const timeoutMs = Math.max(60000, promptLength * 2 + 30000);
 
     try {
-      const result = await this._runCli(args, fullPrompt, timeoutMs);
+      // 先尝试流式模式
+      const streamed = await this._runStreamingCli(streamArgs, fullPrompt, timeoutMs, onChunk);
+
+      if (streamed.exit_code === 0 && streamed.streamed_ok && streamed.text) {
+        ModelLogger.logResponse(this.name, model, streamed.text);
+        return buildUnifiedOutput(input.task_id, 'success', streamed.text, {
+          tokens_used: this._estimateTokens(streamed.text),
+          duration_ms: Date.now() - startTime,
+        });
+      }
+
+      if (streamed.exit_code === 0 && streamed.streamed_ok && !streamed.text) {
+        ModelLogger.logResponse(this.name, model, '(空响应)');
+        return buildUnifiedOutput(input.task_id, 'failed', '', {
+          error: { code: 'EMPTY_RESPONSE', message: '模型返回空内容' },
+          duration_ms: Date.now() - startTime,
+        });
+      }
+
+      if (streamed.exit_code !== 0) {
+        // 流式模式整体失败（如认证错误）：直接按失败处理，不再回退
+        const errMsg = streamed.stderr || streamed.text || 'Unknown error';
+        ModelLogger.logResponse(this.name, model, errMsg);
+        let errorCode = 'CLI_ERROR';
+        if (errMsg.includes('Not logged in')) {
+          errorCode = 'AUTH_REQUIRED';
+        } else if (errMsg.includes('timeout')) {
+          errorCode = 'TIMEOUT';
+        }
+        return buildUnifiedOutput(input.task_id, 'failed', streamed.text || '', {
+          error: { code: errorCode, message: errMsg.substring(0, 500) },
+          duration_ms: Date.now() - startTime,
+        });
+      }
+
+      // stream-json 成功退出但没有解析到事件（旧版 CLI 等）→ 回退 text 模式
+      // 注意：streamed.text 为空，因此不会有已推送的增量需要去重
+      ModelLogger.logResponse(this.name, model, '[stream-json 无事件输出，回退 text 模式]');
+      const result = await this._runCli(textArgs, fullPrompt, timeoutMs, onChunk);
 
       if (result.exit_code === 0) {
         ModelLogger.logResponse(this.name, model, result.stdout);
@@ -287,6 +333,26 @@ class ClaudeAdapter {
   }
 
   /**
+   * 构建 CLI 环境变量：注入 API Key 和供应商地址（如果有配置的话）
+   */
+  _buildEnv() {
+    const apiKey = this._getApiKey();
+    const baseUrl = this._getBaseUrl();
+    const modelOverride = this._getModelOverride();
+    const env = { ...process.env, HOME: this.realHome };
+    if (apiKey) {
+      env.ANTHROPIC_API_KEY = apiKey;
+    }
+    if (baseUrl) {
+      env.ANTHROPIC_BASE_URL = baseUrl;
+    }
+    if (modelOverride) {
+      env.ANTHROPIC_MODEL = modelOverride;
+    }
+    return env;
+  }
+
+  /**
    * 执行 CLI 命令
    *
    * Claude Code CLI 的参数传递方式：
@@ -297,28 +363,17 @@ class ClaudeAdapter {
    * - 跳过 hooks, LSP, plugins, auto-memory, CLAUDE.md 发现
    * - 减少启动延迟，适合编程式调用
    */
-  _runCli(args, prompt, timeoutMs) {
+  _runCli(args, prompt, timeoutMs, onChunk) {
     return new Promise((resolve) => {
       let stdout = '';
       let stderr = '';
+      // 已推送给 onChunk 的输出长度（增量计算用）
+      let streamedLen = 0;
 
       // prompt 作为最后一个位置参数传入
       const finalArgs = prompt ? [...args, prompt] : args;
 
-      // 构建环境变量：注入 API Key 和供应商地址（如果有配置的话）
-      const apiKey = this._getApiKey();
-      const baseUrl = this._getBaseUrl();
-      const modelOverride = this._getModelOverride();
-      const env = { ...process.env, HOME: this.realHome };
-      if (apiKey) {
-        env.ANTHROPIC_API_KEY = apiKey;
-      }
-      if (baseUrl) {
-        env.ANTHROPIC_BASE_URL = baseUrl;
-      }
-      if (modelOverride) {
-        env.ANTHROPIC_MODEL = modelOverride;
-      }
+      const env = this._buildEnv();
 
       const proc = spawn(this.cliCommand, finalArgs, {
         cwd: ROOT,
@@ -328,7 +383,16 @@ class ClaudeAdapter {
       });
 
       proc.stdout.on('data', (data) => {
-        stdout += data.toString();
+        const chunk = data.toString();
+        stdout += chunk;
+        // 流式回调：把增量文本推送给上层（编排器→事件总线→前端）
+        if (typeof onChunk === 'function') {
+          const added = stdout.length - streamedLen;
+          if (added > 0) {
+            streamedLen = stdout.length;
+            onChunk(stdout.substring(streamedLen - added));
+          }
+        }
       });
 
       proc.stderr.on('data', (data) => {
@@ -348,6 +412,126 @@ class ClaudeAdapter {
           exit_code: -1,
           stdout: stdout.trim(),
           stderr: err.message,
+        });
+      });
+    });
+  }
+
+  /**
+   * 执行 CLI 命令（stream-json 流式模式）
+   *
+   * Claude Code 的 --output-format text 是非流式的（输出结束时一次性吐出），
+   * 而 stream-json 会逐行输出 JSON 事件，可以在生成过程中拿到增量文本。
+   * 注意：stream-json 必须配合 --verbose 使用。
+   *
+   * 解析的事件：
+   *  - {"type":"stream_event","event":{"type":"content_block_delta",
+   *     "delta":{"type":"text_delta","text":"..."}}}  → 增量文本（真流式）
+   *  - {"type":"assistant","message":{"content":[{"type":"text","text":"..."}]}}
+   *     → 补齐尚未推送的尾部文本（去重）
+   *
+   * 返回 { exit_code, text, stderr, streamed_ok }：
+   *  - text：从事件中提取的完整回答文本
+   *  - streamed_ok：是否成功解析到 JSON 事件（false 时调用方应回退 text 模式）
+   */
+  _runStreamingCli(args, prompt, timeoutMs, onChunk) {
+    return new Promise((resolve) => {
+      let stderr = '';
+      let buf = '';
+      let streamedText = '';
+      let emittedLen = 0;
+      let parsedAny = false;
+      let settled = false;
+
+      const finish = (result) => {
+        if (settled) return;
+        settled = true;
+        resolve(result);
+      };
+
+      const emit = (text) => {
+        streamedText += text;
+        if (typeof onChunk === 'function') {
+          try {
+            onChunk(text);
+          } catch (e) { /* 回调异常不影响主流程 */ }
+        }
+        emittedLen += text.length;
+      };
+
+      const handleLine = (line) => {
+        const trimmed = line.trim();
+        if (!trimmed) return;
+        let json;
+        try {
+          json = JSON.parse(trimmed);
+        } catch (e) {
+          return; // 非 JSON 行（警告、进度等），忽略
+        }
+        parsedAny = true;
+
+        if (json.type === 'stream_event' && json.event) {
+          const ev = json.event;
+          if (
+            ev.type === 'content_block_delta' &&
+            ev.delta && ev.delta.type === 'text_delta' && ev.delta.text
+          ) {
+            emit(ev.delta.text);
+          }
+        } else if (
+          json.type === 'assistant' &&
+          json.message && Array.isArray(json.message.content)
+        ) {
+          const fullText = json.message.content
+            .filter(b => b && b.type === 'text' && b.text)
+            .map(b => b.text)
+            .join('');
+          if (fullText.length > emittedLen) {
+            emit(fullText.slice(emittedLen));
+          }
+        }
+      };
+
+      const finalArgs = prompt ? [...args, prompt] : args;
+      const env = this._buildEnv();
+
+      const proc = spawn(this.cliCommand, finalArgs, {
+        cwd: ROOT,
+        env,
+        timeout: timeoutMs || 120000,
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+
+      proc.stdout.on('data', (data) => {
+        buf += data.toString();
+        let idx;
+        while ((idx = buf.indexOf('\n')) >= 0) {
+          const line = buf.slice(0, idx);
+          buf = buf.slice(idx + 1);
+          handleLine(line);
+        }
+      });
+
+      proc.stderr.on('data', (data) => {
+        stderr += data.toString();
+      });
+
+      proc.on('close', (code) => {
+        if (buf.trim()) handleLine(buf); // 最后一行可能没有换行符
+        finish({
+          exit_code: code,
+          text: streamedText,
+          stderr: stderr.trim(),
+          streamed_ok: parsedAny,
+        });
+      });
+
+      proc.on('error', (err) => {
+        finish({
+          exit_code: -1,
+          text: streamedText,
+          stderr: err.message,
+          streamed_ok: parsedAny,
         });
       });
     });

@@ -94,6 +94,7 @@ class ApiServer {
           task_type: req.body.task_type,
           created_by: req.headers['user_id'] || 'user_default',
           input_files: req.body.input_files,
+          executor_agent: req.body.executor_agent,
         });
         res.status(201).json(task);
       } catch (e) {
@@ -168,26 +169,12 @@ class ApiServer {
         const task = orchestrator.getTask(req.params.taskId);
         if (!task) return res.status(404).json({ error: 'Task not found' });
 
-        // 如果任务未评估复杂度，先评估
-        if (task.status === 'created' || task.difficulty === 'unknown') {
-          // 从前端获取 multi_agent 开关状态（true=多Agent协作, false=单Agent模式, undefined=自动评估）
-          const multiAgent = req.body.multi_agent;
-          await orchestrator.assessComplexity(req.params.taskId, { multi_agent: multiAgent });
-        }
-
-        // 重新获取最新的 task 状态
-        const updated = orchestrator.getTask(req.params.taskId);
-
+        // 对话开始时不再评估复杂度，直接执行（@mention 路由 / 多Agent讨论）
         let result;
-        if (updated.complex_flag) {
-          // 复杂任务走多Agent协作流程
-          result = await orchestrator.executeComplexTask(req.params.taskId, req.body.message);
-        } else {
-          // 简单任务直接执行，传递 @mention agent
-          result = await orchestrator.executeSimpleTask(req.params.taskId, req.body.message, {
-            mentioned_agent: req.body.mentioned_agent
-          });
-        }
+        result = await orchestrator.executeSimpleTask(req.params.taskId, req.body.message, {
+          mentioned_agent: req.body.mentioned_agent,
+          discussion_agents: req.body.discussion_agents,
+        });
         res.json(result);
       } catch (e) {
         res.status(500).json({ error: e.message });
@@ -204,14 +191,12 @@ class ApiServer {
           return res.status(400).json({ error: `Cannot continue task with status: ${task.status}. 请新建对话。` });
         }
 
+        // 继续对话：默认由任务当前绑定的 Agent 回复，除非用户 @了其他 Agent（或 @多个进入讨论）
         let result;
-        if (task.complex_flag) {
-          result = await orchestrator.executeComplexTask(req.params.taskId, req.body.message);
-        } else {
-          result = await orchestrator.executeSimpleTask(req.params.taskId, req.body.message, {
-            mentioned_agent: req.body.mentioned_agent
-          });
-        }
+        result = await orchestrator.executeSimpleTask(req.params.taskId, req.body.message, {
+          mentioned_agent: req.body.mentioned_agent,
+          discussion_agents: req.body.discussion_agents,
+        });
         res.json(result);
       } catch (e) {
         res.status(500).json({ error: e.message });

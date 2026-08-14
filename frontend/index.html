@@ -52,6 +52,13 @@
     .slide-up { animation: slide-up 0.3s ease-out; }
     @keyframes fade-in { from{opacity:0} to{opacity:1} }
     .fade-in { animation: fade-in 0.2s ease-out; }
+    /* Streaming cursor */
+    .stream-cursor::after { content: '▍'; color: #3b82f6; animation: pulse-dot 1s ease-in-out infinite; }
+    /* Streaming bubble: cap at ~10 lines, scroll inside, bubble size stays fixed */
+    .stream-text { max-height: calc(1.625em * 10); overflow-y: auto; }
+    .stream-text::-webkit-scrollbar { width: 5px; }
+    .stream-text::-webkit-scrollbar-track { background: transparent; }
+    .stream-text::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 3px; }
     /* @mention dropdown */
     .mention-dropdown { position: absolute; bottom: 100%; left: 0; margin-bottom: 4px; background: white; border: 1px solid #e2e8f0; border-radius: 12px; box-shadow: 0 10px 25px rgba(0,0,0,0.1); max-height: 200px; overflow-y: auto; min-width: 200px; z-index: 50; }
     .mention-item { padding: 8px 12px; cursor: pointer; display: flex; align-items: center; gap: 8px; transition: background 0.1s; }
@@ -181,14 +188,16 @@
       var sections = text.split(/\n### /);
       for (var i = 1; i < sections.length; i++) {
         var section = sections[i];
-        var match = section.match(/^(🧑 用户|🤖 助手|⚙️ 系统)/);
-        var role = 'system', label = '系统';
+        var match = section.match(/^(🧑 用户|🤖 助手|⚙️ 系统|🤖 (克劳德|吉米|迪普斯克|钱文))(?: @([^\n-]+))?/);
+        var role = 'system', label = '系统', target = null;
         if (match) {
           if (match[1].indexOf('用户') >= 0) { role = 'user'; label = '用户'; }
           else if (match[1].indexOf('助手') >= 0) { role = 'assistant'; label = '助手'; }
+          else if (match[2]) { role = 'user'; label = match[2]; } // 模型间转交的问题
+          if (match[3]) target = match[3].trim();
         }
         var content = section.replace(/^[^\n]+\n\n/, '').replace(/\n---\n?$/, '').trim();
-        if (content) messages.push({ role: role, label: label, content: content });
+        if (content) messages.push({ role: role, label: label, content: content, target: target });
       }
       return messages;
     }
@@ -313,6 +322,7 @@
       var onEndConversation = props.onEndConversation;
       var messagesEndRef = props.messagesEndRef, hasActiveConversation = props.hasActiveConversation;
       var agents = props.agents || [];
+      var streams = props.streams || {};
       var inputRef = useRef(null);
       var inputState = useState('');
       var input = inputState[0], setInput = inputState[1];
@@ -326,6 +336,9 @@
       var mentionFilter = mentionFilterState[0], setMentionFilter = mentionFilterState[1];
       var mentionIdxState = useState(0);
       var mentionIndex = mentionIdxState[0], setMentionIndex = mentionIdxState[1];
+      // 用户手动点 × 移除绑定后的标志，防止心跳刷新时又被恢复
+      var dismissedRef = useRef(false);
+      var lastBoundTaskRef = useRef(null);
 
       var msgs = parseConversation(conversation);
       var isActive = task && task.status !== 'completed' && task.status !== 'failed' && task.status !== 'suspended';
@@ -337,39 +350,65 @@
         if (!loading && inputRef.current) inputRef.current.focus();
       }, [loading, task]);
 
+      // 从任务绑定的 executor_agent 恢复粘性状态（页面刷新/切换对话后）
+      useEffect(function() {
+        // 切换了对话，重置 dismissed 标志
+        var taskKey = task ? task.task_id : null;
+        if (lastBoundTaskRef.current !== taskKey) {
+          lastBoundTaskRef.current = taskKey;
+          dismissedRef.current = false;
+        }
+        if (dismissedRef.current) return;
+        if (task && task.executor_agent && task.executor_agent !== '克劳德') {
+          for (var k = 0; k < agents.length; k++) {
+            if (agents[k].name === task.executor_agent || agents[k].model_cli === task.executor_agent) {
+              setMentionedAgent(agents[k]);
+              break;
+            }
+          }
+        }
+      }, [task, agents]);
+
       function handleSend() {
         var msg = input.trim();
         if (!msg || loading) return;
         var cleanMsg = msg;
-        // 检测 @AgentName 模式 — 使用 state 中记录的 mentionedAgent
-        var atAgent = mentionedAgent;
-        if (!atAgent) {
-          var atMatch = msg.match(/@(\S+)/);
-          if (atMatch) {
-            var atName = atMatch[1];
-            // 尝试匹配 Agent 名称
+        // 解析消息中的所有 @AgentName（用户可能手动输入 @，也可能通过下拉框选择）
+        var atAgents = [];
+        var atMatchAll = msg.match(/@(\S+)/g);
+        if (atMatchAll) {
+          for (var m = 0; m < atMatchAll.length; m++) {
+            var atName = atMatchAll[m].substring(1);
             for (var k = 0; k < agents.length; k++) {
               if (agents[k].name === atName || agents[k].model_cli === atName) {
-                atAgent = agents[k];
+                if (atAgents.indexOf(agents[k]) < 0) atAgents.push(agents[k]);
                 break;
               }
             }
-            // 从消息中移除 @mention 部分
-            if (atAgent) {
-              cleanMsg = msg.replace(/@\S+\s*/, '').trim();
-            }
+          }
+          if (atAgents.length > 0) {
+            cleanMsg = msg.replace(/@\S+\s*/g, '').trim();
           }
         }
+        var atAgent = atAgents.length > 0 ? atAgents[0] : null;
+        // 消息里没有 @，则沿用粘性状态里记录的 Agent
+        if (!atAgent) atAgent = mentionedAgent;
         if (!cleanMsg) cleanMsg = msg;
         setInput('');
-        // 粘性 @mention：如果用户在当前消息中 @了新agent，更新为新的；否则保持上一次的
+        // 粘性 @mention：如果当前消息中 @了新 Agent，更新绑定；否则保持原绑定
         if (atAgent) {
           setMentionedAgent(atAgent);
         }
         // 不清除 mentionedAgent — 保持粘性，直到用户手动点击 × 移除
         setShowMention(false);
-        // 传递 @mentioned agent 信息（优先使用提到的，否则使用粘性保持的）
-        onSend(cleanMsg, atAgent || mentionedAgent);
+        // 用户点过 × 解除绑定：本次发送时重置后端绑定到默认 Agent
+        var resetAgent = false;
+        if (!atAgent && dismissedRef.current) {
+          resetAgent = true;
+          dismissedRef.current = false;
+        }
+        // 传递所有被@的 Agent（1个=普通模式，2个及以上=讨论模式）
+        onSend(cleanMsg, atAgent, resetAgent, atAgents.length >= 2 ? atAgents : null);
       }
 
       function handleKeyDown(e) {
@@ -454,6 +493,15 @@
         return byName[nameOrCli] || '🤖 ' + (nameOrCli || '助手');
       }
 
+      // 判断是否为已知 Agent 名称（避免把消息开头的加粗文本误当 Agent）
+      function isKnownAgent(nameOrCli) {
+        if (!nameOrCli) return false;
+        var clis = { claude: true, kimi: true, deepseek: true, qwen: true };
+        if (clis[nameOrCli]) return true;
+        var names = { '克劳德': true, '吉米': true, '迪普斯克': true, '钱文': true };
+        return !!names[nameOrCli];
+      }
+
       return h('div', { className: 'flex flex-col h-full bg-white' },
         // Header
         h('div', { className: 'px-5 py-3 border-b border-gray-100 flex items-center justify-between bg-white' },
@@ -493,30 +541,83 @@
           ),
 
           msgs.map(function(msg, i) {
-            // 检测消息中是否包含 Agent 名称标记
-            var msgAgentLabel = null;
+            // 检测消息中是否包含 Agent 名称标记（发送者）
+            var msgSenderLabel = null;
             var agentMatch = msg.content.match(/^\*\*(.+?)\*\*/);
-            if (agentMatch && agentLabel(agentMatch[1]) !== '🤖 ' + agentMatch[1]) {
-              msgAgentLabel = agentLabel(agentMatch[1]);
+            if (agentMatch && isKnownAgent(agentMatch[1])) {
+              msgSenderLabel = agentLabel(agentMatch[1]);
             }
-            return h('div', { key: i, className: 'flex ' + (msg.role === 'user' ? 'justify-end' : 'justify-start') + ' slide-up' },
+            // 如果没提取到发送者，回退到任务绑定的 executor 或克劳德
+            if (!msgSenderLabel) {
+              msgSenderLabel = agentLabel(task ? (task.executor_agent || '克劳德') : '克劳德');
+            }
+            // 构建方向标签：用户：@模型名 或 模型A：@模型B/用户
+            var directionLabel = null;
+            var isModelToModel = false;
+            if (msg.role === 'user') {
+              // 模型间转交的问题：发送者是模型（label 为模型名）
+              if (msg.label && isKnownAgent(msg.label)) {
+                directionLabel = agentLabel(msg.label) + '：@' + (msg.target || '默认Agent');
+                isModelToModel = true;
+              } else {
+                directionLabel = '用户：@' + (msg.target || (task ? task.executor_agent : '默认Agent'));
+              }
+            } else if (msg.role === 'assistant') {
+              directionLabel = msgSenderLabel + '：@' + (msg.target || '用户');
+            }
+            // 剥离内容开头的 **模型名** 前缀（方向标签已显示发送者）
+            var displayContent = msg.content;
+            if (msg.role === 'assistant' && agentMatch && isKnownAgent(agentMatch[1])) {
+              // 统一剥离 "**模型名** " 前缀及后续空白；保留阶段标签（如「综合最终答案:」「评审与修改（第 1 轮）:」）
+              displayContent = msg.content.replace(/^\*\*.+?\*\*\s*/, '');
+            }
+            return h('div', { key: i, className: 'flex ' + (isModelToModel ? 'justify-start' : (msg.role === 'user' ? 'justify-end' : 'justify-start')) + ' slide-up' },
               h('div', { className: 'max-w-[80%] rounded-2xl px-4 py-3 ' + (
-                msg.role === 'user' ? 'bg-blue-600 text-white' :
+                (msg.role === 'user' && !isModelToModel) ? 'bg-blue-600 text-white' :
                 msg.role === 'system' ? 'bg-gray-100 text-gray-600 text-sm' :
                 'bg-white border border-gray-200 shadow-sm'
               )},
-                msg.role !== 'user' && h('div', { className: 'text-xs font-medium text-gray-400 mb-1.5' },
-                  msg.role === 'system' ? '⚙️ 系统' : (msgAgentLabel || agentLabel(task ? task.executor_agent : 'claude'))
+                (msg.role !== 'user' || isModelToModel) && h('div', { className: 'text-xs font-medium text-gray-400 mb-1.5' },
+                  msg.role === 'system' ? '⚙️ 系统' : (directionLabel || msgSenderLabel || agentLabel(task ? task.executor_agent : 'claude'))
                 ),
-                msg.role === 'user'
-                  ? h('p', { className: 'text-sm leading-relaxed whitespace-pre-wrap' }, msg.content)
-                  : h(Markdown, null, msg.content)
+                msg.role === 'user' && !isModelToModel && directionLabel && h('div', { className: 'text-xs font-medium text-blue-100 mb-1.5' },
+                  directionLabel
+                ),
+                (msg.role === 'user' && !isModelToModel)
+                  ? h('p', { className: 'text-sm leading-relaxed whitespace-pre-wrap' }, displayContent)
+                  : h(Markdown, null, displayContent)
               )
             );
           }),
 
-          // Loading indicator
-          loading && h('div', { className: 'flex justify-start slide-up' },
+          // 流式输出气泡（仅渲染当前对话任务的流）
+          Object.keys(streams).map(function(sid) {
+            var st = streams[sid];
+            if (!st || (task && st.task_id !== task.task_id)) return null;
+            if (!st.text && !st.agent) return null;
+            return h('div', { key: 'stream-' + sid, className: 'flex justify-start slide-up' },
+              h('div', { className: 'max-w-[80%] rounded-2xl px-4 py-3 bg-white border border-gray-200 shadow-sm' },
+                h('div', { className: 'text-xs font-medium text-gray-400 mb-1.5 flex items-center gap-2' },
+                  agentLabel(st.agent),
+                  h('span', { className: 'flex items-center gap-1' },
+                    h('span', { className: 'w-1.5 h-1.5 bg-blue-400 rounded-full pulse-dot' }),
+                    h('span', { className: 'w-1.5 h-1.5 bg-blue-400 rounded-full pulse-dot', style: { animationDelay: '0.2s' } }),
+                    h('span', { className: 'w-1.5 h-1.5 bg-blue-400 rounded-full pulse-dot', style: { animationDelay: '0.4s' } })
+                  ),
+                  h('span', { className: 'text-gray-300' }, '正在输入')
+                ),
+                h('div', {
+                  className: 'text-sm leading-relaxed whitespace-pre-wrap stream-cursor stream-text',
+                  ref: function(el) {
+                    if (el) el.scrollTop = el.scrollHeight; // 自动跟随最新内容（仅气泡内滚动，不影响外层）
+                  },
+                }, st.text || '')
+              )
+            );
+          }),
+
+          // Loading indicator（无流式输出时显示）
+          loading && Object.keys(streams).length === 0 && h('div', { className: 'flex justify-start slide-up' },
             h('div', { className: 'bg-white border border-gray-200 shadow-sm rounded-2xl px-4 py-3' },
               h('div', { className: 'flex items-center gap-1.5' },
                 h('div', { className: 'w-2 h-2 bg-blue-400 rounded-full pulse-dot' }),
@@ -541,7 +642,7 @@
                     agentLabel(mentionedAgent.model_cli),
                     h('span', { className: 'text-xs ml-1' }, mentionedAgent.name),
                     h('span', {
-                      className: 'chip-remove', onClick: function() { setMentionedAgent(null); },
+                      className: 'chip-remove', onClick: function() { setMentionedAgent(null); dismissedRef.current = true; },
                       title: '移除'
                     }, '×')
                   )
@@ -624,6 +725,9 @@
       var agents = agentsState[0], setAgents = agentsState[1];
       var loadingState = useState(false);
       var loading = loadingState[0], setLoading = loadingState[1];
+      // 流式输出气泡：stream_id -> { task_id, agent, text }
+      var streamsState = useState({});
+      var streams = streamsState[0], setStreams = streamsState[1];
       var sidebarCollapsedState = useState(false);
       var sidebarCollapsed = sidebarCollapsedState[0], setSidebarCollapsed = sidebarCollapsedState[1];
       var messagesEndRef = useRef(null);
@@ -645,6 +749,35 @@
             // 直接处理 agent:heartbeat，减少状态传递延迟
             if (data.event_type === 'agent:heartbeat') {
               setAgents(data.data || []);
+            }
+            // 流式输出：直接更新 streams 状态（渲染增量文本）
+            if (data.event_type === 'agent:stream:start') {
+              setStreams(function(prev) {
+                var next = Object.assign({}, prev);
+                next[data.data.stream_id] = { task_id: data.data.task_id, agent: data.data.agent, text: '' };
+                return next;
+              });
+              return;
+            }
+            if (data.event_type === 'agent:stream:chunk') {
+              setStreams(function(prev) {
+                var next = Object.assign({}, prev);
+                if (next[data.data.stream_id]) {
+                  next[data.data.stream_id] = Object.assign({}, next[data.data.stream_id], { text: next[data.data.stream_id].text + data.data.chunk });
+                } else {
+                  next[data.data.stream_id] = { task_id: data.data.task_id, agent: data.data.agent, text: data.data.chunk };
+                }
+                return next;
+              });
+              return;
+            }
+            if (data.event_type === 'agent:stream:end') {
+              setStreams(function(prev) {
+                var next = Object.assign({}, prev);
+                delete next[data.data.stream_id];
+                return next;
+              });
+              return;
             }
             lastMsgState[1](data);
           } catch(err) { console.error('[WS]', err); }
@@ -701,14 +834,15 @@
       // Scroll to bottom
       useEffect(function() {
         if (messagesEndRef.current) messagesEndRef.current.scrollIntoView({ behavior: 'smooth' });
-      }, [conversation, loading]);
+      }, [conversation, loading, streams]);
 
-      function handleSend(message, mentionedAgent) {
+      function handleSend(message, mentionedAgent, resetAgent, discussAgents) {
         setLoading(true);
         (async function() {
           try {
+            var discussion = discussAgents && discussAgents.length >= 2 ? discussAgents.map(function(a) { return a.name; }) : null;
             if (activeId) {
-              var res = await api('/tasks/' + activeId + '/chat', { method: 'POST', body: JSON.stringify({ message: message, mentioned_agent: mentionedAgent ? mentionedAgent.name : undefined, model_cli: mentionedAgent ? mentionedAgent.model_cli : undefined }) });
+              var res = await api('/tasks/' + activeId + '/chat', { method: 'POST', body: JSON.stringify({ message: message, mentioned_agent: mentionedAgent ? mentionedAgent.name : (resetAgent ? '克劳德' : undefined), model_cli: mentionedAgent ? mentionedAgent.model_cli : undefined, discussion_agents: discussion }) });
               var data = await res.json();
               if (data.task) setActiveTask(data.task);
               fetchConversation(activeId);
@@ -725,7 +859,7 @@
               setActiveTask(newTask);
               setConversation('');
 
-              var execRes = await api('/tasks/' + newTask.task_id + '/execute', { method: 'POST', body: JSON.stringify({ message: message, mentioned_agent: agent ? agent.name : undefined, model_cli: agent ? agent.model_cli : undefined }) });
+              var execRes = await api('/tasks/' + newTask.task_id + '/execute', { method: 'POST', body: JSON.stringify({ message: message, mentioned_agent: agent ? agent.name : undefined, model_cli: agent ? agent.model_cli : undefined, discussion_agents: discussion }) });
               var execData = await execRes.json();
               if (execData.task) setActiveTask(execData.task);
               fetchConversation(newTask.task_id);
@@ -823,6 +957,7 @@
               messagesEndRef: messagesEndRef,
               hasActiveConversation: !!activeId,
               agents: agents,
+              streams: streams,
             })
           )
         )
