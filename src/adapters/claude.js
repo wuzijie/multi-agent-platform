@@ -470,22 +470,45 @@ class ClaudeAdapter {
         }
         parsedAny = true;
 
+        // 从嵌套对象中安全提取文本内容块
+        const extractText = (msg) => {
+          if (!msg) return '';
+          const content = msg.content;
+          if (typeof content === 'string') return content;
+          if (Array.isArray(content)) {
+            return content
+              .filter(b => b && b.type === 'text' && typeof b.text === 'string')
+              .map(b => b.text)
+              .join('');
+          }
+          return '';
+        };
+
         if (json.type === 'stream_event' && json.event) {
           const ev = json.event;
           if (
             ev.type === 'content_block_delta' &&
-            ev.delta && ev.delta.type === 'text_delta' && ev.delta.text
+            ev.delta &&
+            (ev.delta.type === 'text_delta' || typeof ev.delta.text === 'string') &&
+            ev.delta.text
           ) {
             emit(ev.delta.text);
           }
-        } else if (
-          json.type === 'assistant' &&
-          json.message && Array.isArray(json.message.content)
-        ) {
-          const fullText = json.message.content
-            .filter(b => b && b.type === 'text' && b.text)
-            .map(b => b.text)
-            .join('');
+        } else if (json.type === 'assistant' && json.message) {
+          // 标准 Claude Code stream-json 汇总事件：补齐尚未推送的尾部文本（去重）
+          const fullText = extractText(json.message);
+          if (fullText.length > emittedLen) {
+            emit(fullText.slice(emittedLen));
+          }
+        } else if (json.type === 'result' && json.message) {
+          // 部分版本/网关用 result 事件包裹最终消息
+          const fullText = extractText(json.message);
+          if (fullText.length > emittedLen) {
+            emit(fullText.slice(emittedLen));
+          }
+        } else if (json.type === 'message' && json.content) {
+          // 兼容直接输出 message 对象的情况
+          const fullText = extractText(json);
           if (fullText.length > emittedLen) {
             emit(fullText.slice(emittedLen));
           }

@@ -54,11 +54,11 @@
     .fade-in { animation: fade-in 0.2s ease-out; }
     /* Streaming cursor */
     .stream-cursor::after { content: '▍'; color: #3b82f6; animation: pulse-dot 1s ease-in-out infinite; }
-    /* Streaming bubble: cap at ~10 lines, scroll inside, bubble size stays fixed */
-    .stream-text { max-height: calc(1.625em * 10); overflow-y: auto; }
-    .stream-text::-webkit-scrollbar { width: 5px; }
-    .stream-text::-webkit-scrollbar-track { background: transparent; }
-    .stream-text::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 3px; }
+    /* 所有消息正文（用户/模型回复/流式气泡）：限高10行，超出气泡内滚动，气泡尺寸不变 */
+    .message-body { max-height: calc(1.625em * 10); overflow-y: auto; line-height: 1.625em; }
+    .message-body::-webkit-scrollbar { width: 5px; }
+    .message-body::-webkit-scrollbar-track { background: transparent; }
+    .message-body::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 3px; }
     /* @mention dropdown */
     .mention-dropdown { position: absolute; bottom: 100%; left: 0; margin-bottom: 4px; background: white; border: 1px solid #e2e8f0; border-radius: 12px; box-shadow: 0 10px 25px rgba(0,0,0,0.1); max-height: 200px; overflow-y: auto; min-width: 200px; z-index: 50; }
     .mention-item { padding: 8px 12px; cursor: pointer; display: flex; align-items: center; gap: 8px; transition: background 0.1s; }
@@ -585,7 +585,7 @@
                 ),
                 (msg.role === 'user' && !isModelToModel)
                   ? h('p', { className: 'text-sm leading-relaxed whitespace-pre-wrap' }, displayContent)
-                  : h(Markdown, null, displayContent)
+                  : h('div', { className: 'message-body' }, h(Markdown, null, displayContent))
               )
             );
           }),
@@ -607,7 +607,7 @@
                   h('span', { className: 'text-gray-300' }, '正在输入')
                 ),
                 h('div', {
-                  className: 'text-sm leading-relaxed whitespace-pre-wrap stream-cursor stream-text',
+                  className: 'text-sm whitespace-pre-wrap stream-cursor message-body',
                   ref: function(el) {
                     if (el) el.scrollTop = el.scrollHeight; // 自动跟随最新内容（仅气泡内滚动，不影响外层）
                   },
