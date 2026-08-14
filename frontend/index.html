@@ -584,7 +584,7 @@
                   directionLabel
                 ),
                 (msg.role === 'user' && !isModelToModel)
-                  ? h('p', { className: 'text-sm leading-relaxed whitespace-pre-wrap' }, displayContent)
+                  ? h('p', { className: 'text-sm leading-relaxed whitespace-pre-wrap message-body' }, displayContent)
                   : h('div', { className: 'message-body' }, h(Markdown, null, displayContent))
               )
             );
