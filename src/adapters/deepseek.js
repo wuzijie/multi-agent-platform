@@ -157,7 +157,9 @@ class DeepSeekAdapter {
     ModelLogger.logRequest(this.name, model, fullPrompt);
 
     const promptLength = fullPrompt.length;
-    const timeoutMs = Math.max(60000, promptLength * 2 + 30000);
+    // 下限 240 秒：慢模型完成长任务常超过 60 秒。
+    // 调度器子任务预算 300 秒，适配器需在其内自行返回，避免被 spawn timeout 提前杀死。
+    const timeoutMs = Math.max(240000, promptLength * 2 + 30000);
 
     // 优先：直连 OpenAI 兼容 API 实现真流式（qwen CLI 会缓冲输出）
     const apiKey = this._getApiKey();
@@ -186,7 +188,15 @@ class DeepSeekAdapter {
             duration_ms: Date.now() - startTime,
           });
         }
-        // API 直连失败 → 回退 CLI 路径
+        // API 直连超时：CLI 走的是同一 API，回退只会再耗一轮，直接按超时失败（走调度器重试）
+        if (streamed.error && streamed.error.includes('超时')) {
+          ModelLogger.logResponse(this.name, model, `[API直连超时，直接失败] ${streamed.error}`);
+          return buildOutput(input.task_id, 'failed', '', {
+            error: { code: 'TIMEOUT', message: streamed.error },
+            duration_ms: Date.now() - startTime,
+          });
+        }
+        // API 直连失败（非超时）→ 回退 CLI 路径
         ModelLogger.logResponse(this.name, model, `[API直连失败，回退CLI] ${streamed.error || ''}`);
       } catch (apiErr) {
         ModelLogger.logResponse(this.name, model, `[API直连异常，回退CLI] ${apiErr.message}`);
@@ -203,10 +213,22 @@ class DeepSeekAdapter {
           duration_ms: Date.now() - startTime,
         });
       } else {
-        const errMsg = result.stderr || result.stdout || 'Unknown error';
+        let errMsg;
+        let errorCode = 'CLI_ERROR';
+        if (result.killed_by_timeout) {
+          errorCode = 'TIMEOUT';
+          errMsg = `模型调用超时（超过 ${Math.round(timeoutMs / 1000)} 秒无结果，进程已被中断）`;
+        } else {
+          errMsg = result.stderr || result.stdout || 'Unknown error';
+          if (errMsg.includes('Not logged in') || errMsg.includes('login')) {
+            errorCode = 'AUTH_REQUIRED';
+          } else if (errMsg.includes('timeout')) {
+            errorCode = 'TIMEOUT';
+          }
+        }
         ModelLogger.logResponse(this.name, model, errMsg);
         return buildOutput(input.task_id, 'failed', result.stdout || '', {
-          error: { code: 'CLI_ERROR', message: errMsg.substring(0, 500) },
+          error: { code: errorCode, message: errMsg.substring(0, 500) },
           duration_ms: Date.now() - startTime,
         });
       }
@@ -249,6 +271,7 @@ class DeepSeekAdapter {
 
   _runCli(args, prompt, timeoutMs, modelOverride, onChunk) {
     return new Promise((resolve) => {
+      const startAt = Date.now();
       let stdout = '';
       let stderr = '';
       let streamedLen = 0;
@@ -297,11 +320,22 @@ class DeepSeekAdapter {
       proc.stderr.on('data', (data) => { stderr += data.toString(); });
 
       proc.on('close', (code) => {
-        resolve({ exit_code: code, stdout: stdout.trim(), stderr: stderr.trim() });
+        resolve({
+          exit_code: code,
+          stdout: stdout.trim(),
+          stderr: stderr.trim(),
+          // code === null 表示被信号杀死（spawn timeout 会 SIGTERM 杀掉进程）
+          killed_by_timeout: code === null || Date.now() - startAt >= (timeoutMs || 120000) - 500,
+        });
       });
 
       proc.on('error', (err) => {
-        resolve({ exit_code: -1, stdout: stdout.trim(), stderr: err.message });
+        resolve({
+          exit_code: -1,
+          stdout: stdout.trim(),
+          stderr: err.message,
+          killed_by_timeout: false,
+        });
       });
     });
   }

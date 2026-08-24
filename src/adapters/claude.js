@@ -227,8 +227,11 @@ class ClaudeAdapter {
     const textArgs = [...baseArgs, '--output-format', 'text'];
 
     // 超时计算
+    // 下限 240 秒：克劳德 CLI 启动本身约需 10-20 秒，慢模型（如 DeepSeek 后端）完成长任务
+    // 常超过 60 秒。调度器对子任务的预算为 300 秒，适配器必须在此之内自行返回，
+    // 因此取 240 秒下限（留出事件处理余量），避免进程被 spawn timeout 提前杀死。
     const promptLength = fullPrompt.length;
-    const timeoutMs = Math.max(60000, promptLength * 2 + 30000);
+    const timeoutMs = Math.max(240000, promptLength * 2 + 30000);
 
     try {
       // 先尝试流式模式
@@ -251,15 +254,21 @@ class ClaudeAdapter {
       }
 
       if (streamed.exit_code !== 0) {
-        // 流式模式整体失败（如认证错误）：直接按失败处理，不再回退
-        const errMsg = streamed.stderr || streamed.text || 'Unknown error';
-        ModelLogger.logResponse(this.name, model, errMsg);
+        // 流式模式整体失败（如认证错误/超时被杀）：直接按失败处理，不再回退
+        let errMsg;
         let errorCode = 'CLI_ERROR';
-        if (errMsg.includes('Not logged in')) {
-          errorCode = 'AUTH_REQUIRED';
-        } else if (errMsg.includes('timeout')) {
+        if (streamed.killed_by_timeout) {
           errorCode = 'TIMEOUT';
+          errMsg = `模型调用超时（超过 ${Math.round(timeoutMs / 1000)} 秒无结果，进程已被中断）`;
+        } else {
+          errMsg = streamed.stderr || streamed.text || 'Unknown error';
+          if (errMsg.includes('Not logged in')) {
+            errorCode = 'AUTH_REQUIRED';
+          } else if (errMsg.includes('timeout')) {
+            errorCode = 'TIMEOUT';
+          }
         }
+        ModelLogger.logResponse(this.name, model, errMsg);
         return buildUnifiedOutput(input.task_id, 'failed', streamed.text || '', {
           error: { code: errorCode, message: errMsg.substring(0, 500) },
           duration_ms: Date.now() - startTime,
@@ -278,14 +287,20 @@ class ClaudeAdapter {
           duration_ms: Date.now() - startTime,
         });
       } else {
-        const errMsg = result.stderr || result.stdout || 'Unknown error';
-        ModelLogger.logResponse(this.name, model, errMsg);
+        let errMsg;
         let errorCode = 'CLI_ERROR';
-        if (errMsg.includes('Not logged in')) {
-          errorCode = 'AUTH_REQUIRED';
-        } else if (errMsg.includes('timeout')) {
+        if (result.killed_by_timeout) {
           errorCode = 'TIMEOUT';
+          errMsg = `模型调用超时（超过 ${Math.round(timeoutMs / 1000)} 秒无结果，进程已被中断）`;
+        } else {
+          errMsg = result.stderr || result.stdout || 'Unknown error';
+          if (errMsg.includes('Not logged in')) {
+            errorCode = 'AUTH_REQUIRED';
+          } else if (errMsg.includes('timeout')) {
+            errorCode = 'TIMEOUT';
+          }
         }
+        ModelLogger.logResponse(this.name, model, errMsg);
         return buildUnifiedOutput(input.task_id, 'failed', result.stdout || '', {
           error: { code: errorCode, message: errMsg.substring(0, 500) },
           duration_ms: Date.now() - startTime,
@@ -365,6 +380,7 @@ class ClaudeAdapter {
    */
   _runCli(args, prompt, timeoutMs, onChunk) {
     return new Promise((resolve) => {
+      const startAt = Date.now();
       let stdout = '';
       let stderr = '';
       // 已推送给 onChunk 的输出长度（增量计算用）
@@ -404,6 +420,8 @@ class ClaudeAdapter {
           exit_code: code,
           stdout: stdout.trim(),
           stderr: stderr.trim(),
+          // code === null 表示被信号杀死（spawn timeout 会 SIGTERM 杀掉进程）
+          killed_by_timeout: code === null || Date.now() - startAt >= (timeoutMs || 120000) - 500,
         });
       });
 
@@ -412,6 +430,7 @@ class ClaudeAdapter {
           exit_code: -1,
           stdout: stdout.trim(),
           stderr: err.message,
+          killed_by_timeout: false,
         });
       });
     });
@@ -436,6 +455,7 @@ class ClaudeAdapter {
    */
   _runStreamingCli(args, prompt, timeoutMs, onChunk) {
     return new Promise((resolve) => {
+      const startAt = Date.now();
       let stderr = '';
       let buf = '';
       let streamedText = '';
@@ -448,6 +468,9 @@ class ClaudeAdapter {
         settled = true;
         resolve(result);
       };
+
+      const killedByTimeout = () =>
+        Date.now() - startAt >= (timeoutMs || 120000) - 500;
 
       const emit = (text) => {
         streamedText += text;
@@ -546,6 +569,7 @@ class ClaudeAdapter {
           text: streamedText,
           stderr: stderr.trim(),
           streamed_ok: parsedAny,
+          killed_by_timeout: code === null || killedByTimeout(),
         });
       });
 
@@ -555,6 +579,7 @@ class ClaudeAdapter {
           text: streamedText,
           stderr: err.message,
           streamed_ok: parsedAny,
+          killed_by_timeout: killedByTimeout(),
         });
       });
     });

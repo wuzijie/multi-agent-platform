@@ -21,6 +21,7 @@ api_keys:
   # ============================================
   anthropic_base_url: ""
   deepseek_api_key: "sk-b1f0639cbbe144b89c534081668260a8"
+  deepseek_model: "deepseek-v4-flash"
 
   # ============================================
   # 模型名称映射（可选）
