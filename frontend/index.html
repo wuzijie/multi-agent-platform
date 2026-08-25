@@ -217,12 +217,12 @@
 
     // ====== Collab Task Panel（事件驱动协作：右侧任务列表）======
     function CollabTaskPanel({ tasks }) {
-      var typeLabel = { PLAN_TASK: '规划', CODE_TASK: '执行', REVIEW_TASK: '评审', SUMMARY_TASK: '汇总', DEBUG_TASK: '调试' };
+      var typeLabel = { PLAN_TASK: '规划', CODE_TASK: '执行', REVIEW_TASK: '评审', SUMMARY_TASK: '汇总', DEBUG_TASK: '调试', RESEARCH_TASK: '调研', FINAL_TASK: '终稿' };
       var statusLabel = { PENDING: '待执行', RUNNING: '执行中', SUCCESS: '完成', RETRYING: '重试中', TIMEOUT: '超时', FAILED: '失败', SKIPPED: '跳过' };
       return h('div', { className: 'w-64 flex-shrink-0 border-l border-gray-200 bg-gray-50 p-4 overflow-y-auto' },
         h('div', { className: 'text-xs font-bold text-gray-500 mb-3' }, '任务列表'),
         (!tasks || tasks.length === 0)
-          ? h('div', { className: 'text-xs text-gray-300 mt-2' }, '暂无任务（选择「事件驱动」协作模式后自动生成）')
+          ? h('div', { className: 'text-xs text-gray-300 mt-2' }, '暂无任务（事件驱动协作 / 深度调研时自动生成）')
           : h('div', { className: 'space-y-2' },
               tasks.map(function(t) {
                 var done = t.status === 'SUCCESS';

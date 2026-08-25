@@ -219,6 +219,7 @@ class ApiServer {
           mentioned_agent: req.body.mentioned_agent,
           discussion_agents: req.body.discussion_agents,
           collab_mode: req.body.collab_mode,
+          skill: req.body.skill,
         });
         res.json(result);
       } catch (e) {
@@ -242,6 +243,7 @@ class ApiServer {
           mentioned_agent: req.body.mentioned_agent,
           discussion_agents: req.body.discussion_agents,
           collab_mode: req.body.collab_mode,
+          skill: req.body.skill,
         });
         res.json(result);
       } catch (e) {

@@ -6,6 +6,7 @@ const eventBus = require('../eventbus/bus');
 const config = require('../utils/config');
 const blackboard = require('../blackboard/blackboard');
 const scheduler = require('../engine/scheduler');
+const deepResearch = require('../skills/deep-research');
 const { EVENTS, TASK_STATUS, TASK_TYPES, genSubTaskId } = require('../engine/events');
 
 const ROOT = path.resolve(__dirname, '..', '..');
@@ -17,6 +18,8 @@ const COLLAB_TYPE_LABEL = {
   REVIEW_TASK: '评审',
   SUMMARY_TASK: '汇总',
   DEBUG_TASK: '调试',
+  RESEARCH_TASK: '调研',   // 深度调研 Skill：多角度并行调研
+  FINAL_TASK: '终稿',      // 深度调研 Skill：迭代修正终稿
 };
 
 /**
@@ -230,6 +233,12 @@ class TaskOrchestrator {
 
     eventBus.emit('task:executing', { task_id: taskId, agent: execAgent });
 
+    // 深度调研 Skill：显式指定（skill=deep_research）或自动识别调研类需求
+    // （多模型并行多角度调研 + 汇总成文 + 跨模型独立审核 + 迭代修正终稿）
+    if (opts.skill === 'deep_research' || deepResearch.detect(userMessage || '')) {
+      return await this._executeDeepResearch(task, taskId, userMessage, opts);
+    }
+
     // 事件驱动协作模式（消息总线 + 黑板 + DAG 编排）
     if (opts.collab_mode === 'event-driven') {
       return await this._executeEventDrivenCollaboration(task, taskId, userMessage, opts);
@@ -262,7 +271,8 @@ class TaskOrchestrator {
       if (!d || !d.task_id) return;
       const lines = (d.sub_tasks || []).map((s, i) => `${i + 1}. [${COLLAB_TYPE_LABEL[s.type] || s.type || ''}] ${s.description || ''}`.trim());
       if (lines.length) {
-        const content = `**克劳德** 任务拆解\n\n已拆解为 ${lines.length} 个子任务：\n${lines.join('\n')}`;
+        const who = d.main_agent || '克劳德';
+        const content = `**${who}** 任务拆解\n\n已拆解为 ${lines.length} 个子任务：\n${lines.join('\n')}`;
         self._appendConversation(d.task_id, 'assistant', content);
       }
     });
@@ -452,6 +462,54 @@ class TaskOrchestrator {
       this._saveTask(task);
       this._updateIndex(task);
       eventBus.emit('task:failed', { task_id: taskId, error: e.message });
+      return { task, result: '', error: e.message };
+    }
+  }
+
+  /**
+   * 深度调研 Skill 执行入口（SKILL_DEEP_RESEARCH）
+   *
+   * 按《Multi-Agent 深度调研 Skill 标准化技能定义》：
+   * 维度拆解 -> 多模型多角度并行调研 -> 主模型汇总成文
+   * -> 跨模型独立审核 -> 迭代修正终稿，全程事件驱动（skill 内部事件闭环）。
+   */
+  async _executeDeepResearch(task, taskId, userMessage, opts = {}) {
+    this._ensureEventDrivenEngine();
+    const userQuery = userMessage || task.instruction || task.description;
+
+    try {
+      this._appendConversation(taskId, 'user', userQuery, { target: task.executor_agent || '克劳德' });
+      this._appendConversation(taskId, 'system', '[深度调研] 启动多模型调研流程：维度拆解 → 并行调研 → 汇总成文 → 独立审核 → 迭代终稿');
+
+      const result = await deepResearch.run({
+        taskId,
+        userQuery,
+        mainAgent: task.executor_agent || '克劳德',
+      });
+      // result: { trace_id, final_result, status }
+      const content = (result && result.final_result) || '';
+
+      this._appendConversation(taskId, 'assistant', `**深度调研报告（终稿）**\n\n${content}`);
+
+      // 多轮对话：保持任务 executing，记录最新 trace 供右侧任务面板查询
+      task.status = 'executing';
+      task.result = content;
+      task.collab_trace_id = (result && result.trace_id) || task.collab_trace_id;
+      task.updated_at = new Date().toISOString();
+      delete task.suspend_reason;
+      this._saveTask(task);
+      this._updateIndex(task);
+      eventBus.emit('task:executing', { task_id: taskId, phase: 'collab-done' });
+
+      return { task, result: content };
+    } catch (e) {
+      task.status = 'executing';
+      task.updated_at = new Date().toISOString();
+      task.suspend_reason = `深度调研失败：${e.message}`;
+      this._saveTask(task);
+      this._updateIndex(task);
+      this._appendConversation(taskId, 'system', `[深度调研] 本轮调研失败：${e.message}。可重试或换个说法继续`);
+      eventBus.emit('task:executing', { task_id: taskId, phase: 'collab-done' });
       return { task, result: '', error: e.message };
     }
   }

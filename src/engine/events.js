@@ -40,6 +40,16 @@ const EVENTS = {
   AGENT_HEARTBEAT: 'AGENT_HEARTBEAT_EVENT',
 };
 
+// ===== Skill 专属事件（《Multi-Agent 深度调研 Skill 标准化技能定义》§五）=====
+const SKILL_EVENTS = {
+  DEEP_RESEARCH_START: 'SKILL_DEEP_RESEARCH_START_EVENT',        // 深度调研技能启动
+  RESEARCH_DIMENSION_READY: 'RESEARCH_DIMENSION_READY_EVENT',    // 维度拆解完成，可并行调研
+  MULTI_RESEARCH_ALL_FINISH: 'MULTI_RESEARCH_ALL_FINISH_EVENT',  // 多模型多角度调研全部完成
+  RESEARCH_DRAFT_FINISH: 'RESEARCH_DRAFT_FINISH_EVENT',          // 初稿撰写完成，等待审核
+  REVIEW_RESULT_FINISH: 'REVIEW_RESULT_FINISH_EVENT',            // 独立审核完成，产出整改意见
+  DEEP_RESEARCH_COMPLETE: 'SKILL_DEEP_RESEARCH_COMPLETE_EVENT',  // 深度调研全流程完结
+};
+
 // ===== 任务类型枚举（方案 §4.4.2）=====
 const TASK_TYPES = {
   PLAN: 'PLAN_TASK',       // 任务规划拆解 → 规划类Agent
@@ -168,6 +178,7 @@ function isDuplicate(blackboard, msg, ttlMs) {
 
 module.exports = {
   EVENTS,
+  SKILL_EVENTS,
   TASK_TYPES,
   SUB_STATUS,
   TASK_STATUS,
