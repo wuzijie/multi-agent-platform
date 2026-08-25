@@ -729,16 +729,19 @@ class DeepResearchSkill {
 
   /**
    * 调用模型（流式透传前端气泡 + 外层超时兜底）
+   * 注意：适配器 UnifiedInput 只接受 executor/reviewer/guardian 三个 role，
+   * 中文角色标签（如「审核：独立评审」）只能放 context，不能作 role。
    * @returns {Promise<string>} 模型输出内容
    */
   async _callAgent(agentName, instruction, state, roleLabel) {
     const streamId = uuidv4();
+    const role = /审核|评审/.test(roleLabel || '') ? 'reviewer' : 'executor';
     eventBus.emit('agent:stream:start', { task_id: state.externalTaskId, agent: agentName, stream_id: streamId });
     const run = (async () => {
       try {
         const result = await agentRuntime.executeTaskWithAgent({
           task_id: state.traceId,
-          role: roleLabel || 'executor',
+          role,
           context: `深度调研（trace: ${state.traceId}）${roleLabel ? '· ' + roleLabel : ''}`,
           instruction,
           input_files: [],
