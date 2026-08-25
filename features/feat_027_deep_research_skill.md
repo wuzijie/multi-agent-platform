@@ -10,7 +10,9 @@
 
 | 文件 | 说明 |
 |------|------|
-| `src/skills/deep-research.js` | Skill 本体：DeepResearchSkill 单例，5 步事件闭环 |
+| `skills/deep-research.md` | **技能唯一定义源**：frontmatter（id/触发词/参数）+ 提示词模板（` ```prompt ` 代码块）+ 标准化定义正文；修改触发词/提示词/参数只改此文件 |
+| `src/skills/loader.js` | Skill 定义加载器：解析 frontmatter（js-yaml）与 prompt 模板块，`loadAllSkills()` 扫描 skills/*.md |
+| `src/skills/deep-research.js` | 执行器：5 步事件闭环；启动时从 md 加载触发词/参数/模板，md 缺失时用内置兜底 |
 | `src/engine/events.js` | 新增 `SKILL_EVENTS`（6 个 Skill 专属事件） |
 | `src/orchestrator/orchestrator.js` | 触发准入 + `_executeDeepResearch` 执行入口 + 类型标签 |
 | `src/api/server.js` | execute/chat 接口透传 `skill` 参数 |
@@ -18,13 +20,16 @@
 
 ## 触发条件（§二 精准准入）
 
-满足任一自动触发（`deepResearch.detect()`，在 `executeSimpleTask` 中检查）：
+满足任一自动触发（`deepResearch.detect()`，关键词全部来自 `skills/deep-research.md` 的 `triggers`）：
 
-1. 关键词命中：调研报告 / 研究报告 / 行业分析 / 竞品分析 / 方案调研 / 深度总结 / 复盘分析 / 深度调研
-2. 多视角关键词：多角度 / 多维度 / 多视角 / 利弊 / 优劣 / 正反
+1. 成文类：调研 / 研究报告 / 研究一下 / 行业分析 / 市场分析 / 竞品分析 / 竞争分析 / 深度总结 / 深度分析 / 深入分析 / 全面分析 / 对比分析 / 可行性分析 / 复盘
+2. 多视角/决策类：多角度 / 多维度 / 多视角 / 利弊 / 优劣 / 正反 / 该不该 / 要不要 / 值不值得
 3. 显式指定：API 传 `skill: "deep_research"`（强制触发）
 
-禁止触发：短消息（<8 字符视为简单问答）、指令执行、单步调用。
+禁止触发：短消息（< `trigger_min_length`=8 字符视为简单问答）。
+
+> 2026-08-25 修订：初版触发词过窄（"帮我调研一下…"不触发），已外置到 md 并大幅扩充（23 个关键词）；
+> Skill 定义同步改为 .md 外置形式（用户要求），代码仅做执行器。
 
 ## Agent 调度（§三 无能力画像模式）
 

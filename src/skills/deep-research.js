@@ -1,7 +1,8 @@
 /**
- * 深度调研 Skill（DeepResearch）
+ * 深度调研 Skill（DeepResearch）-- 执行器
  *
- * 按《Multi-Agent 深度调研 Skill（标准化技能定义）》实现：
+ * 按《skills/deep-research.md》定义执行（定义外置：触发词 / 参数 / 提示词模板
+ * 全部来自 md 文件，由 src/skills/loader.js 加载；md 缺失或解析失败时使用内置兜底）：
  * - 5 步事件驱动闭环：维度拆解 -> 多模型多角度并行调研 -> 主模型汇总成文
  *   -> 跨模型独立审核 -> 迭代修正终稿，每步完成发布事件触发下一步，无轮询
  * - 不依赖能力画像：仅按「任务角色分工 + 参与状态」调度，所有在线空闲通用模型可参与
@@ -21,22 +22,113 @@ const agentRuntime = require('../agent/runtime');
 const scheduler = require('../engine/scheduler');
 const config = require('../utils/config');
 const CollabLogger = require('../utils/collab-logger');
+const loader = require('./loader');
 const {
   SKILL_EVENTS, TASK_STATUS, SUB_STATUS, TASK_TYPES,
   AGENT_IDS, genTraceId, genSubTaskId, buildMessage, isDuplicate,
 } = require('../engine/events');
 
-const ALL_AGENTS = Object.keys(AGENT_IDS); // ['克劳德','吉米','迪普斯克','钱文']
+const SKILL_ID = 'deep_research';
 
-// 单次模型调用外层兜底超时（适配器内部已有 240s 超时，此处防悬挂）
-const CALL_TIMEOUT_MS = 400000;
-
-// ===== 触发准入（定义 §二：满足任一自动触发；简单问答不触发）=====
-const TRIGGER_PATTERNS = [
-  /深度调研|调研报告|研究报告|行业分析|竞品分析|方案调研|深度总结|复盘分析/,
-  /多角度|多维度|多个角度|多个维度|多视角/,
-  /利弊|优劣|优劣势|正反方|正反面/,
+// ===== md 定义缺失/解析失败时的内置兜底（与 skills/deep-research.md 保持一致）=====
+const BUILTIN_TRIGGERS = [
+  '调研', '研究报告', '研究一下', '行业分析', '市场分析', '竞品分析', '竞争分析',
+  '深度总结', '深度分析', '深入分析', '全面分析', '对比分析', '可行性分析', '复盘',
+  '多角度', '多维度', '多视角', '利弊', '优劣', '正反', '该不该', '要不要', '值不值得',
 ];
+const BUILTIN_PARAMS = {
+  min_dimensions: 2,
+  max_dimensions: 5,
+  call_timeout_ms: 400000,
+  trigger_min_length: 8,
+};
+const BUILTIN_PROMPTS = {
+  dimension_split: [
+    '你是多智能体平台的深度调研规划模型，负责为一次多模型多角度调研拆解思考维度。',
+    '',
+    '要求：',
+    '1. 针对用户需求拆解出「独立、不重叠、互补」的调研维度（至少{{min_dimensions}}个，复杂任务{{min_dimensions}}-{{max_dimensions}}个）',
+    '2. 维度之间视角必须差异化（如：正向优势/反向风险/行业视角/用户视角/落地视角等）',
+    '3. 每个维度定义：调研目标、分析视角、输出格式、论证要求',
+    '',
+    '输出纯 JSON 数组，不要任何其他文字或 markdown 围栏，格式：',
+    '[{"name":"维度名称","goal":"调研目标","perspective":"分析视角","format":"输出格式与论证要求"}]',
+    '',
+    '用户需求：{{user_query}}',
+  ].join('\n'),
+  dimension_research: [
+    '你是深度调研中的独立调研模型，负责以下调研维度（只做本维度，不要涉及其他视角）：',
+    '维度名称：{{dim_name}}',
+    '调研目标：{{dim_goal}}',
+    '分析视角：{{dim_perspective}}',
+    '输出/论证要求：{{dim_format}}',
+    '',
+    '要求独立调研、给出观点与依据，输出本维度的调研结论（论据、信息、观点），不要写其他维度的内容。',
+    '',
+    '用户需求：{{user_query}}',
+  ].join('\n'),
+  draft: [
+    '你是深度调研的主汇总模型，负责把多个模型的多角度独立调研结果整合为一篇完整报告。',
+    '',
+    '要求：',
+    '1. 读取全部调研素材：去重、互补、纠偏、整合冲突观点',
+    '2. 按调研报告标准结构撰写：标题、背景/概述、多维度分析、综合结论与建议',
+    '3. 逻辑串联、观点论证、内容落地，输出完整初稿（不要写审核意见，终稿另有机会修订）',
+    '',
+    '用户需求：{{user_query}}',
+    '',
+    '=== 多模型多角度调研素材 ===',
+    '{{research_sections}}',
+  ].join('\n'),
+  review: [
+    '你是深度调研的独立审核模型（{{reviewer}}），你没有参与本次调研与撰写，请完全独立、客观地审核以下初稿，不继承任何撰写者的结论偏好。',
+    '',
+    '审核维度：合规性、逻辑性、完整性、片面性、事实风险。',
+    '输出审核报告，必须包含以下清单（逐条列出，没有问题的项写「无」）：',
+    '1. 漏洞清单（论证漏洞/事实存疑）',
+    '2. 逻辑问题',
+    '3. 片面性问题（是否只呈现单方观点）',
+    '4. 表述问题',
+    '5. 缺失维度（调研素材中有但初稿未覆盖的内容）',
+    '6. 优化建议',
+    '7. 风险点',
+    '',
+    '用户需求：{{user_query}}',
+    '',
+    '=== 各模型调研素材（对照用） ===',
+    '{{research_sections}}',
+    '',
+    '=== 待审核初稿 ===',
+    '{{draft}}',
+  ].join('\n'),
+  final: [
+    '你是深度调研的主汇总模型，独立审核模型已对初稿提出审核意见，请逐条对照意见修订。',
+    '',
+    '要求：',
+    '1. 逐条修正内容漏洞、补充缺失维度、优化逻辑、平衡观点、修正片面性',
+    '2. 完成迭代改写，输出最终定稿（完整全文，不是差异说明）',
+    '3. 保留初稿中经得起推敲的内容，不要为改而改',
+    '',
+    '用户需求：{{user_query}}',
+    '',
+    '=== 初稿 ===',
+    '{{draft}}',
+    '',
+    '=== 审核意见 ===',
+    '{{review}}',
+    '',
+    '=== 调研素材（补充论据用） ===',
+    '{{research_sections}}',
+  ].join('\n'),
+  final_no_review: [
+    '你是深度调研的主汇总模型，请对以下初稿做最终定稿：自查逻辑与完整性，微调后输出完整终稿全文。',
+    '',
+    '用户需求：{{user_query}}',
+    '',
+    '=== 初稿 ===',
+    '{{draft}}',
+  ].join('\n'),
+};
 
 /**
  * 维度拆解失败时的兜底双维度（定义 §四 Step2：A 正向、B 反向）
@@ -62,14 +154,18 @@ class DeepResearchSkill {
   constructor() {
     this.ready = false;
     this.eventBus = eventBus;
+    this.def = null;                       // skills/deep-research.md 解析结果
+    this.triggers = BUILTIN_TRIGGERS;      // 触发关键词（md 可覆盖）
+    this.params = Object.assign({}, BUILTIN_PARAMS);
     this._pending = new Map(); // traceId -> { resolve, reject }
-    this._states = new Map();  // traceId -> 运行态（taskId/主模型/维度/参与者/子任务序列…）
+    this._states = new Map();  // traceId -> 运行态
     this._rr = 0;              // 审核轮换计数
   }
 
-  /** 初始化：订阅 6 个 Skill 专属事件（幂等，仅一次） */
+  /** 初始化：加载 md 定义 + 订阅 6 个 Skill 专属事件（幂等，仅一次） */
   init() {
     if (this.ready) return this;
+    this._loadDefinition();
     for (const evt of Object.values(SKILL_EVENTS)) {
       this.eventBus.on(evt, (e) => {
         const payload = (e && e.data !== undefined) ? e.data : e;
@@ -84,12 +180,48 @@ class DeepResearchSkill {
     return this;
   }
 
-  // ===== 触发准入：用户请求是否命中调研类需求 =====
+  /**
+   * 加载外置定义（skills/deep-research.md），失败时保持内置兜底
+   */
+  _loadDefinition() {
+    try {
+      const def = loader.loadSkill(SKILL_ID);
+      if (!def) {
+        console.warn(`[DeepResearch] 未找到 skills/*.md（id=${SKILL_ID}），使用内置兜底定义`);
+        return;
+      }
+      this.def = def;
+      const meta = def.meta || {};
+      if (Array.isArray(meta.triggers) && meta.triggers.length > 0) {
+        this.triggers = meta.triggers.filter((t) => typeof t === 'string' && t);
+      }
+      if (meta.params && typeof meta.params === 'object') {
+        this.params = Object.assign({}, BUILTIN_PARAMS, meta.params);
+      } else if (typeof meta.trigger_min_length === 'number') {
+        this.params.trigger_min_length = meta.trigger_min_length;
+      }
+      const promptCount = Object.keys(def.prompts || {}).length;
+      console.log(`[DeepResearch] 已加载 ${def.file}（触发词 ${this.triggers.length} 个，提示词模板 ${promptCount} 个）`);
+      CollabLogger.log('skill_dr_def_loaded', {
+        file: def.file, triggers: this.triggers.length, prompts: promptCount,
+      });
+    } catch (e) {
+      console.warn('[DeepResearch] 定义加载失败，使用内置兜底:', e.message);
+    }
+  }
+
+  /** 提示词模板渲染：md 模板优先，缺失回退内置 */
+  _tpl(name, vars = {}) {
+    const tpl = (this.def && this.def.prompts && this.def.prompts[name]) || BUILTIN_PROMPTS[name];
+    return loader.renderTemplate(tpl, vars);
+  }
+
+  // ===== 触发准入：用户请求是否命中调研类需求（关键词来自 md 定义）=====
   detect(text) {
     if (!text || typeof text !== 'string') return false;
     const t = text.trim();
-    if (t.length < 8) return false; // 过短视为简单问答，禁止触发
-    return TRIGGER_PATTERNS.some((re) => re.test(t));
+    if (t.length < (this.params.trigger_min_length || 8)) return false; // 过短视为简单问答
+    return this.triggers.some((kw) => t.includes(kw));
   }
 
   /**
@@ -119,7 +251,7 @@ class DeepResearchSkill {
     const mainKey = `blackboard:task:${traceId}:main`;
     blackboard.hset(mainKey, 'trace_id', traceId);
     blackboard.hset(mainKey, 'task_id', taskId || null);
-    blackboard.hset(mainKey, 'skill', 'deep_research');
+    blackboard.hset(mainKey, 'skill', SKILL_ID);
     blackboard.hset(mainKey, 'user_query', userQuery || '');
     blackboard.hset(mainKey, 'executor_agent', mainAgent);
     blackboard.hset(mainKey, 'overall_status', TASK_STATUS.RUNNING);
@@ -148,7 +280,7 @@ class DeepResearchSkill {
   async _handle(type, msg) {
     if (!msg || !msg.msg_meta) return;
     const traceId = msg.msg_meta.trace_id;
-    if (isDuplicate(blackboard, msg, CALL_TIMEOUT_MS)) return;
+    if (isDuplicate(blackboard, msg, this.params.call_timeout_ms)) return;
 
     const state = this._states.get(traceId);
     if (!state) return; // 未知/已完结 trace
@@ -197,7 +329,7 @@ class DeepResearchSkill {
   }
 
   // ============================================================
-  // Step 1：确定思考方向（维度拆解）—— 主模型执行
+  // Step 1：确定思考方向（维度拆解）-- 主模型执行
   // ============================================================
   async _step1Dimensions(state) {
     const { traceId } = state;
@@ -212,19 +344,11 @@ class DeepResearchSkill {
     const subId = this._phaseSub(state, TASK_TYPES.PLAN, '拆解调研维度（多角度思考方向）', state.mainAgent);
     this._phaseStart(state, subId, state.mainAgent);
 
-    const prompt = [
-      '你是多智能体平台的深度调研规划模型，负责为一次多模型多角度调研拆解思考维度。',
-      '',
-      '要求：',
-      '1. 针对用户需求拆解出「独立、不重叠、互补」的调研维度（至少2个，复杂任务3-5个）',
-      '2. 维度之间视角必须差异化（如：正向优势/反向风险/行业视角/用户视角/落地视角等）',
-      '3. 每个维度定义：调研目标、分析视角、输出格式、论证要求',
-      '',
-      '输出纯 JSON 数组，不要任何其他文字或 markdown 围栏，格式：',
-      '[{"name":"维度名称","goal":"调研目标","perspective":"分析视角","format":"输出格式与论证要求"}]',
-      '',
-      '用户需求：' + state.userQuery,
-    ].join('\n');
+    const prompt = this._tpl('dimension_split', {
+      min_dimensions: this.params.min_dimensions,
+      max_dimensions: this.params.max_dimensions,
+      user_query: state.userQuery,
+    });
 
     let dimensions = null;
     try {
@@ -233,16 +357,16 @@ class DeepResearchSkill {
     } catch (e) {
       CollabLogger.log('skill_dr_dimension_call_fail', { trace_id: traceId, error: e.message });
     }
-    if (!dimensions || dimensions.length < 2) {
+    if (!dimensions || dimensions.length < this.params.min_dimensions) {
       dimensions = defaultDimensions(state.userQuery); // 兜底：正向 + 反向
       CollabLogger.log('skill_dr_dimension_fallback', { trace_id: traceId, count: dimensions.length });
     }
-    // 复杂度上限：最多5个维度
-    if (dimensions.length > 5) dimensions = dimensions.slice(0, 5);
+    // 维度数量上限
+    if (dimensions.length > this.params.max_dimensions) dimensions = dimensions.slice(0, this.params.max_dimensions);
 
     state.dimensions = dimensions;
 
-    // 落库：维度清单（黑板专属 Key，定义 §七）
+    // 落库：维度清单（黑板专属 Key）
     blackboard.set(`blackboard:skill:deep_research:${traceId}:dimensions`, dimensions);
     this._phaseDone(state, subId, '维度拆解完成', dimensions.map((d, i) => `${i + 1}. ${d.name}（${d.perspective || ''}）`).join('\n'));
 
@@ -271,7 +395,7 @@ class DeepResearchSkill {
       task_id: state.externalTaskId,
       trace_id: traceId,
       main_agent: state.mainAgent,
-      skill: 'deep_research',
+      skill: SKILL_ID,
       sub_tasks: planned,
     });
 
@@ -285,7 +409,7 @@ class DeepResearchSkill {
   }
 
   // ============================================================
-  // Step 2：多模型多角度并行调研 —— 至少2个不同调研模型
+  // Step 2：多模型多角度并行调研 -- 至少2个不同调研模型
   // ============================================================
   async _step2ParallelResearch(state) {
     const { traceId } = state;
@@ -297,7 +421,7 @@ class DeepResearchSkill {
         pool = pool.concat([state.mainAgent]); // 极端情况兜底：主模型兼任一个调研维度
         CollabLogger.log('skill_dr_research_pool_main_fallback', { trace_id: traceId, pool });
       } else {
-        // 无空闲模型：排队等待节点释放（定义 §六.4），3s 后重试一次
+        // 无空闲模型：排队等待节点释放，3s 后重试一次
         if (!state._poolWaitRetry) {
           state._poolWaitRetry = true;
           CollabLogger.log('skill_dr_wait_agents', { trace_id: traceId, retry_in_ms: 3000 });
@@ -315,7 +439,7 @@ class DeepResearchSkill {
       }
     }
 
-    // 随机分配：不同维度尽量分给不同模型，强制视角差异化（定义 §四 Step2）
+    // 随机分配：不同维度尽量分给不同模型，强制视角差异化
     state.researcherNames = [...new Set(pool)];
     state.assignments.forEach((a, i) => { a.agent = pool[i % pool.length]; });
     for (const n of state.researcherNames) state.participants.add(n);
@@ -360,20 +484,16 @@ class DeepResearchSkill {
     // 最多尝试2次：第一次失败换另一个调研模型重试
     while (attempt < 2) {
       this._phaseStart(state, subId, agent);
-      const prompt = [
-        `你是深度调研中的独立调研模型，负责以下调研维度（只做本维度，不要涉及其他视角）：`,
-        `维度名称：${dim.name}`,
-        `调研目标：${dim.goal || ''}`,
-        `分析视角：${dim.perspective || ''}`,
-        `输出/论证要求：${dim.format || '要点 + 论据'}`,
-        '',
-        '要求独立调研、给出观点与依据，输出本维度的调研结论（论据、信息、观点），不要写其他维度的内容。',
-        '',
-        '用户需求：' + state.userQuery,
-      ].join('\n');
+      const prompt = this._tpl('dimension_research', {
+        dim_name: dim.name,
+        dim_goal: dim.goal || '',
+        dim_perspective: dim.perspective || '',
+        dim_format: dim.format || '要点 + 论据',
+        user_query: state.userQuery,
+      });
       try {
         const output = await this._callAgent(agent, prompt, state, `调研：${dim.name}`);
-        // 落库：独立快照（维度名做 field，互不覆盖，定义 §四 Step2）
+        // 落库：独立快照（维度名做 field，互不覆盖）
         blackboard.hset(`blackboard:skill:deep_research:${traceId}:sub_research`, dim.name, {
           agent, dimension: dim.name, perspective: dim.perspective || '',
           output, duration: Date.now(), retry: attempt,
@@ -401,26 +521,11 @@ class DeepResearchSkill {
     const { traceId } = state;
     this._phaseStart(state, state.subSummary, state.mainAgent);
 
-    const researches = blackboard.hgetall(`blackboard:skill:deep_research:${traceId}:sub_research`) || {};
-    const sections = Object.entries(researches).map(([dimName, r]) => (
-      typeof r === 'string'
-        ? `【${dimName}】\n${r}`
-        : `【${dimName}】（由 ${r.agent} 调研）\n${r.output || ''}`
-    )).join('\n\n---\n\n');
-
-    const prompt = [
-      '你是深度调研的主汇总模型，负责把多个模型的多角度独立调研结果整合为一篇完整报告。',
-      '',
-      '要求：',
-      '1. 读取全部调研素材：去重、互补、纠偏、整合冲突观点',
-      '2. 按调研报告标准结构撰写：标题、背景/概述、多维度分析、综合结论与建议',
-      '3. 逻辑串联、观点论证、内容落地，输出完整初稿（不要写审核意见，终稿另有机会修订）',
-      '',
-      `用户需求：${state.userQuery}`,
-      '',
-      '=== 多模型多角度调研素材 ===',
-      sections,
-    ].join('\n');
+    const sections = this._researchSections(traceId);
+    const prompt = this._tpl('draft', {
+      user_query: state.userQuery,
+      research_sections: sections,
+    });
 
     let draft;
     try {
@@ -446,13 +551,13 @@ class DeepResearchSkill {
   }
 
   // ============================================================
-  // Step 4：跨模型独立审核（强隔离规则，定义 §三/§四 Step4）
+  // Step 4：跨模型独立审核（强隔离规则）
   // ============================================================
   async _step4Review(state) {
     const { traceId } = state;
     let reviewer = this._pickReviewer(state);
     if (!reviewer) {
-      // 极端兜底：无可用审核模型（仅主模型在线）——记录告警，跳过审核直接定稿
+      // 极端兜底：无可用审核模型（仅主模型在线）--记录告警，跳过审核直接定稿
       CollabLogger.log('skill_dr_review_skipped', { trace_id: traceId, reason: '无可用独立审核模型' });
       this._phaseFail(state, state.subReview, '无可用独立审核模型，跳过审核');
       return this._emitReviewFinish(state, null);
@@ -461,33 +566,15 @@ class DeepResearchSkill {
 
     const draft = blackboard.get(`blackboard:skill:deep_research:${traceId}:draft`) || {};
     const draftContent = (typeof draft === 'string' ? draft : draft.content) || '';
-    const researches = blackboard.hgetall(`blackboard:skill:deep_research:${traceId}:sub_research`) || {};
 
     this._phaseStart(state, state.subReview, reviewer);
 
-    const prompt = [
-      `你是深度调研的独立审核模型（${reviewer}），你没有参与本次调研与撰写，请完全独立、客观地审核以下初稿，不继承任何撰写者的结论偏好。`,
-      '',
-      '审核维度：合规性、逻辑性、完整性、片面性、事实风险。',
-      '输出审核报告，必须包含以下清单（逐条列出，没有问题的项写「无」）：',
-      '1. 漏洞清单（论证漏洞/事实存疑）',
-      '2. 逻辑问题',
-      '3. 片面性问题（是否只呈现单方观点）',
-      '4. 表述问题',
-      '5. 缺失维度（调研素材中有但初稿未覆盖的内容）',
-      '6. 优化建议',
-      '7. 风险点',
-      '',
-      `用户需求：${state.userQuery}`,
-      '',
-      '=== 各模型调研素材（对照用） ===',
-      Object.entries(researches).map(([dimName, r]) => (
-        `【${dimName}】${typeof r === 'string' ? r : (r.output || '')}`
-      )).join('\n\n'),
-      '',
-      '=== 待审核初稿 ===',
-      draftContent,
-    ].join('\n');
+    const prompt = this._tpl('review', {
+      reviewer,
+      user_query: state.userQuery,
+      research_sections: this._researchSections(traceId),
+      draft: draftContent,
+    });
 
     let review;
     try {
@@ -541,42 +628,15 @@ class DeepResearchSkill {
     const draftContent = (typeof draft === 'string' ? draft : draft.content) || '';
     const review = blackboard.get(`blackboard:skill:deep_research:${traceId}:review`) || {};
     const reviewContent = (typeof review === 'string' ? review : review.content) || '';
-    const researches = blackboard.hgetall(`blackboard:skill:deep_research:${traceId}:sub_research`) || {};
 
-    let prompt;
-    if (reviewContent) {
-      prompt = [
-        '你是深度调研的主汇总模型，独立审核模型已对初稿提出审核意见，请逐条对照意见修订。',
-        '',
-        '要求：',
-        '1. 逐条修正内容漏洞、补充缺失维度、优化逻辑、平衡观点、修正片面性',
-        '2. 完成迭代改写，输出最终定稿（完整全文，不是差异说明）',
-        '3. 保留初稿中经得起推敲的内容，不要为改而改',
-        '',
-        `用户需求：${state.userQuery}`,
-        '',
-        '=== 初稿 ===',
-        draftContent,
-        '',
-        '=== 审核意见 ===',
-        reviewContent,
-        '',
-        '=== 调研素材（补充论据用） ===',
-        Object.entries(researches).map(([dimName, r]) => (
-          `【${dimName}】${typeof r === 'string' ? r : (r.output || '')}`
-        )).join('\n\n'),
-      ].join('\n');
-    } else {
-      // 审核跳过：初稿即终稿，但仍要求主模型自查一次完整性
-      prompt = [
-        '你是深度调研的主汇总模型，请对以下初稿做最终定稿：自查逻辑与完整性，微调后输出完整终稿全文。',
-        '',
-        `用户需求：${state.userQuery}`,
-        '',
-        '=== 初稿 ===',
-        draftContent,
-      ].join('\n');
-    }
+    const prompt = reviewContent
+      ? this._tpl('final', {
+          user_query: state.userQuery,
+          draft: draftContent,
+          review: reviewContent,
+          research_sections: this._researchSections(traceId),
+        })
+      : this._tpl('final_no_review', { user_query: state.userQuery, draft: draftContent });
 
     let finalText;
     try {
@@ -588,7 +648,7 @@ class DeepResearchSkill {
       if (!finalText) return this._fail(state, `终稿生成失败：${e.message}`);
     }
 
-    // 落库：最终定稿（含完整可溯源材料，定义 §四 Step5）
+    // 落库：最终定稿（含完整可溯源材料）
     blackboard.set(`blackboard:skill:deep_research:${traceId}:final`, {
       agent: state.mainAgent,
       content: finalText,
@@ -617,7 +677,7 @@ class DeepResearchSkill {
   }
 
   // ============================================================
-  // 审核模型选取（强隔离规则，定义 §三）
+  // 审核模型选取（强隔离规则：优先未参与者；禁主模型自审）
   // ============================================================
   _pickReviewer(state, exclude) {
     const online = this._onlineAgents();
@@ -646,6 +706,16 @@ class DeepResearchSkill {
     }
     if (fromProfiles.length > 0) return fromProfiles;
     return (config.agents || []).map((a) => a.name).filter((n) => AGENT_IDS[n]);
+  }
+
+  /** 汇总黑板中的调研素材为可注入文本 */
+  _researchSections(traceId) {
+    const researches = blackboard.hgetall(`blackboard:skill:deep_research:${traceId}:sub_research`) || {};
+    return Object.entries(researches).map(([dimName, r]) => (
+      typeof r === 'string'
+        ? `【${dimName}】\n${r}`
+        : `【${dimName}】（由 ${r.agent} 调研）\n${r.output || ''}`
+    )).join('\n\n---\n\n');
   }
 
   _shuffle(arr) {
@@ -687,7 +757,10 @@ class DeepResearchSkill {
     })();
     return Promise.race([
       run,
-      new Promise((_, rej) => setTimeout(() => rej(new Error(`模型 ${agentName} 调用超时（${CALL_TIMEOUT_MS / 1000}s）`)), CALL_TIMEOUT_MS)),
+      new Promise((_, rej) => setTimeout(
+        () => rej(new Error(`模型 ${agentName} 调用超时（${this.params.call_timeout_ms / 1000}s）`)),
+        this.params.call_timeout_ms
+      )),
     ]);
   }
 
