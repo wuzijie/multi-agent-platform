@@ -118,3 +118,12 @@
   - `frontend/index.html`：拉取面板列表时与服务端列表**合并**而非覆盖，
     本地已推进的状态（RUNNING/SUCCESS）不回退，同时剔除其他回合残留条目；
     WS 面板更新增加 `task_id` 过滤（配合 `activeIdRef`），只接受当前对话任务
+
+## 2026-08-25 增补：流式气泡与正文交接的"真空期"修复
+
+症状：模型流式输出结束后气泡立即删除，但正文要等 collab:subtask:done -> 写 conversation -> 前端重新 fetch -> 响应返回才出现；并行执行时服务器繁忙 fetch 延迟数秒，表现为该模型输出"消失"，其他模型输出完成后才再次出现。
+
+修复（frontend/index.html）：
+- agent:stream:end 不再立即删除气泡，改标记 done（去打字动画，显示"已完成"）继续展示
+- fetchConversation 成功后清理 done 超过 1.5s 的气泡（此时正文已渲染，无缝交接）
+- 兜底定时器：done 超过 8s 的气泡强制移除（异常流无 subtask:done 触发刷新的场景）

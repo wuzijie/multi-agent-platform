@@ -55,7 +55,7 @@ function detectRealHome() {
  * 由于没有独立的 DeepSeek CLI，复用 Qwen Code CLI 作为运行时，
  * 通过 Qwen Code CLI 的 OpenAI 兼容模式调用 DeepSeek API。
  *
- * 调用方式：qwen -p "prompt" -o text -m deepseek-chat
+ * 调用方式：qwen -p "prompt" -o text -m deepseek-v4-flash
  */
 class DeepSeekAdapter {
   constructor() {
@@ -111,7 +111,7 @@ class DeepSeekAdapter {
     if (process.env.DEEPSEEK_MODEL) return process.env.DEEPSEEK_MODEL;
     const cfg = this._getConfig();
     if (cfg.apiKeys && cfg.apiKeys.deepseek_model) return cfg.apiKeys.deepseek_model;
-    return 'deepseek-chat';
+    return 'deepseek-v4-flash'; // 兜底默认：调用 DeepSeek 只用 v4-flash
   }
 
   getName() {

@@ -647,12 +647,14 @@
               h('div', { className: 'max-w-[80%] rounded-2xl px-4 py-3 bg-white border border-gray-200 shadow-sm' },
                 h('div', { className: 'text-xs font-medium text-gray-400 mb-1.5 flex items-center gap-2' },
                   agentLabel(st.agent),
-                  h('span', { className: 'flex items-center gap-1' },
-                    h('span', { className: 'w-1.5 h-1.5 bg-blue-400 rounded-full pulse-dot' }),
-                    h('span', { className: 'w-1.5 h-1.5 bg-blue-400 rounded-full pulse-dot', style: { animationDelay: '0.2s' } }),
-                    h('span', { className: 'w-1.5 h-1.5 bg-blue-400 rounded-full pulse-dot', style: { animationDelay: '0.4s' } })
-                  ),
-                  h('span', { className: 'text-gray-300' }, '正在输入')
+                  st.done
+                    ? h('span', { className: 'text-gray-300' }, '已完成')
+                    : h('span', { className: 'flex items-center gap-1' },
+                        h('span', { className: 'w-1.5 h-1.5 bg-blue-400 rounded-full pulse-dot' }),
+                        h('span', { className: 'w-1.5 h-1.5 bg-blue-400 rounded-full pulse-dot', style: { animationDelay: '0.2s' } }),
+                        h('span', { className: 'w-1.5 h-1.5 bg-blue-400 rounded-full pulse-dot', style: { animationDelay: '0.4s' } }),
+                        h('span', { className: 'text-gray-300' }, '正在输入')
+                      )
                 ),
                 h('div', {
                   className: 'text-sm whitespace-pre-wrap stream-cursor message-body',
@@ -843,9 +845,15 @@
               return;
             }
             if (data.event_type === 'agent:stream:end') {
+              // 不立即删除气泡：正文要等 collab:subtask:done -> 写 conversation -> 重新 fetch
+              // 才出现，立即删除会出现内容"真空期"（并行执行时 fetch 可能延迟数秒，表现为
+              // 模型输出消失、其他模型输出完成后才再次出现）。先标记 done 保留展示，
+              // 待对话刷新成功（fetchConversation 内清理）后再移除。
               setStreams(function(prev) {
                 var next = Object.assign({}, prev);
-                delete next[data.data.stream_id];
+                if (next[data.data.stream_id]) {
+                  next[data.data.stream_id] = Object.assign({}, next[data.data.stream_id], { done: true, endedAt: Date.now() });
+                }
                 return next;
               });
               return;
@@ -895,6 +903,19 @@
           if (mySeq !== convSeqRef.current) return;
           setConversation(data.conversation);
           setActiveTask(data.task);
+          // 对话已含完成的模型输出 -> 清理已完成（done）的流式气泡，完成无缝交接
+          setStreams(function(prev) {
+            var now = Date.now();
+            var next = {};
+            var changed = false;
+            Object.keys(prev).forEach(function(k) {
+              var st = prev[k];
+              // done 且结束超过 1.5s 的气泡移除（此时正文几乎必然已渲染，避免视觉跳动）
+              if (st && st.done && now - (st.endedAt || 0) > 1500) { changed = true; return; }
+              next[k] = st;
+            });
+            return changed ? next : prev;
+          });
         } catch(e) { console.error(e); }
         // 拉取事件驱动协作任务列表（右侧面板）
         try {
@@ -927,6 +948,25 @@
       }, []);
 
       useEffect(function() { fetchConversations(); fetchAgents(); }, []);
+
+      // 兜底清理：异常结束的流（如重试失败）不会再触发对话刷新，
+      // done 气泡若残留超过 8s 则强制移除
+      useEffect(function() {
+        var t = setInterval(function() {
+          setStreams(function(prev) {
+            var now = Date.now();
+            var next = {};
+            var changed = false;
+            Object.keys(prev).forEach(function(k) {
+              var st = prev[k];
+              if (st && st.done && now - (st.endedAt || 0) > 8000) { changed = true; return; }
+              next[k] = st;
+            });
+            return changed ? next : prev;
+          });
+        }, 3000);
+        return function() { clearInterval(t); };
+      }, []);
 
       // WebSocket event handling
       useEffect(function() {

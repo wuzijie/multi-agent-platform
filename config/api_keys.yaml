@@ -26,7 +26,7 @@ api_keys:
   # ============================================
   # 模型名称映射（可选）
   # 当使用第三方供应商时，可以指定要调用的模型名称
-  # DeepSeek 可选值: "deepseek-chat"（通用）, "deepseek-coder"（编码专用）
+  # 统一使用 deepseek-v4-flash
   # OfoxAI 可选值：留空走默认 Claude 模型，或填 "anthropic/claude-sonnet-4.6" 等具体型号
   # ============================================
   model_override: ""
@@ -60,7 +60,7 @@ api_keys:
   # ============================================
   qwen_api_key: "sk-b1f0639cbbe144b89c534081668260a8"
   qwen_base_url: "https://api.deepseek.com/v1"
-  qwen_model: "deepseek-chat"
+  qwen_model: "deepseek-v4-flash"
 
 # ============================================
 # 供应商路由说明
