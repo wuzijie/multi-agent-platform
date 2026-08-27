@@ -4,4 +4,5 @@ tasks/
 .DS_Store
 *.pid
 workspace/
+/blackboard/
 # agents/model_cli.log 是请求/响应日志，需要被 git 追踪

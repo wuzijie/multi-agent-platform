@@ -4,8 +4,23 @@ const path = require('path');
 const agentRuntime = require('../agent/runtime');
 const eventBus = require('../eventbus/bus');
 const config = require('../utils/config');
+const blackboard = require('../blackboard/blackboard');
+const scheduler = require('../engine/scheduler');
+const deepResearch = require('../skills/deep-research');
+const { EVENTS, TASK_STATUS, TASK_TYPES, genSubTaskId } = require('../engine/events');
 
 const ROOT = path.resolve(__dirname, '..', '..');
+
+// 事件驱动协作：任务类型 → 中文标签
+const COLLAB_TYPE_LABEL = {
+  PLAN_TASK: '规划',
+  CODE_TASK: '执行',
+  REVIEW_TASK: '评审',
+  SUMMARY_TASK: '汇总',
+  DEBUG_TASK: '调试',
+  RESEARCH_TASK: '调研',   // 深度调研 Skill：多角度并行调研
+  FINAL_TASK: '终稿',      // 深度调研 Skill：迭代修正终稿
+};
 
 /**
  * 任务编排器 (Task Orchestrator)
@@ -51,7 +66,7 @@ class TaskOrchestrator {
       complex_flag: false,
       required_capabilities: params.required_capabilities || [],
       task_type: params.task_type || 'development',
-      executor_agent: '克劳德',
+      executor_agent: params.executor_agent || '克劳德',
       reviewer_agents: [],
       guardian_agent: null,
       progress: 0.0,
@@ -204,39 +219,633 @@ class TaskOrchestrator {
     const task = this._loadTask(taskId);
     if (!task) throw new Error(`Task not found: ${taskId}`);
 
-    // 如果用户通过 @mention 指定了 Agent，使用该 Agent
-    const mentionedAgent = opts.mentioned_agent || task.executor_agent;
-    const execAgent = mentionedAgent || '克劳德';
+    // 如果用户通过 @mention 指定了 Agent，使用该 Agent（并持久化，后续对话默认由该 Agent 回复）
+    if (opts.mentioned_agent && opts.mentioned_agent !== task.executor_agent) {
+      task.executor_agent = opts.mentioned_agent;
+      this._appendConversation(taskId, 'system', `[回复Agent] 后续对话由 ${opts.mentioned_agent} 回复`);
+    }
+    const execAgent = task.executor_agent || '克劳德';
 
     task.status = 'executing';
     task.updated_at = new Date().toISOString();
     this._saveTask(task);
     this._updateIndex(task);
 
-    // 追加用户消息到对话记录
-    this._appendConversation(taskId, 'user', userMessage || task.instruction || task.description);
-
     eventBus.emit('task:executing', { task_id: taskId, agent: execAgent });
 
+    // 深度调研 Skill：显式指定（skill=deep_research）或自动识别调研类需求
+    // （多模型并行多角度调研 + 汇总成文 + 跨模型独立审核 + 迭代修正终稿）
+    if (opts.skill === 'deep_research' || deepResearch.detect(userMessage || '')) {
+      return await this._executeDeepResearch(task, taskId, userMessage, opts);
+    }
+
+    // 事件驱动协作模式（消息总线 + 黑板 + DAG 编排）
+    if (opts.collab_mode === 'event-driven') {
+      return await this._executeEventDrivenCollaboration(task, taskId, userMessage, opts);
+    }
+
+    // 多模型讨论模式：一条消息中 @了 2 个及以上 Agent
+    if (opts.discussion_agents && Array.isArray(opts.discussion_agents)) {
+      const valid = opts.discussion_agents.filter(n => ['克劳德', '吉米', '迪普斯克', '钱文'].includes(n));
+      const unique = [...new Set(valid)];
+      if (unique.length >= 2) {
+        return await this._executeDiscussionMode(task, taskId, userMessage, unique);
+      }
+    }
+
+    return await this._executeAgentWithMentions(task, taskId, userMessage, execAgent, 0, new Set([execAgent]), null);
+  }
+
+  /**
+   * 初始化事件驱动引擎（统一调度器 + 黑板 + 流式 executor）
+   * 首次使用事件驱动协作模式时调用一次
+   */
+  _ensureEventDrivenEngine() {
+    if (scheduler.ready) return;
+
+    const self = this;
+
+    // 任务拆解完成 → 写入对话，展示主agent（克劳德）的拆解结果
+    eventBus.on('collab:planned', (e) => {
+      const d = (e && e.data !== undefined) ? e.data : e;
+      if (!d || !d.task_id) return;
+      const lines = (d.sub_tasks || []).map((s, i) => `${i + 1}. [${COLLAB_TYPE_LABEL[s.type] || s.type || ''}] ${s.description || ''}`.trim());
+      if (lines.length) {
+        const who = d.main_agent || '克劳德';
+        const content = `**${who}** 任务拆解\n\n已拆解为 ${lines.length} 个子任务：\n${lines.join('\n')}`;
+        self._appendConversation(d.task_id, 'assistant', content);
+      }
+    });
+
+    // 子任务执行完成 → 写入对话，逐条展示各模型的输出
+    eventBus.on('collab:subtask:done', (e) => {
+      const d = (e && e.data !== undefined) ? e.data : e;
+      if (!d || !d.task_id) return;
+      const typeName = COLLAB_TYPE_LABEL[d.type] || d.type || '子任务';
+      for (const o of (d.agents_outputs || [])) {
+        self._appendConversation(d.task_id, 'assistant', `**${o.agent}** 完成「${typeName}」\n\n${o.content || ''}`);
+      }
+      for (const err of (d.errors || [])) {
+        self._appendConversation(d.task_id, 'assistant', `**${err.agent}**「${typeName}」失败\n\n${err.error || ''}`);
+      }
+    });
+
+    scheduler.init({
+      eventBus,
+      agentRuntime,
+      plannerMode: 'llm', // 由主agent（克劳德）拆解任务并分配子任务
+      agentsPerTask: 1,
+      executor: {
+        plan: (userQuery, traceId) => this._planTask(userQuery, traceId),
+        async run(subTask, agentName, onChunk) {
+          const externalTaskId = subTask.external_task_id || subTask.task_id;
+          const streamId = uuidv4();
+          // 流式事件：关联到前端当前任务
+          eventBus.emit('agent:stream:start', { task_id: externalTaskId, agent: agentName, stream_id: streamId });
+          try {
+            const result = await agentRuntime.executeTaskWithAgent(subTask, [], agentName, (chunk) => {
+              if (typeof onChunk === 'function') onChunk(chunk);
+              eventBus.emit('agent:stream:chunk', { task_id: externalTaskId, agent: agentName, chunk, stream_id: streamId });
+            });
+            eventBus.emit('agent:stream:end', { task_id: externalTaskId, agent: agentName, stream_id: streamId });
+            // 适配器失败不 throw，需显式检查 → 抛给调度器走 SUB_TASK_FAIL 重试
+            if (result && (result.status === 'failed' || result.error)) {
+              const errMsg = (result.error && result.error.message) || result.status || 'Agent 执行失败';
+              throw new Error(errMsg);
+            }
+            return result;
+          } catch (e) {
+            eventBus.emit('agent:stream:end', { task_id: externalTaskId, agent: agentName, stream_id: streamId, error: e.message });
+            throw e;
+          }
+        },
+      },
+    });
+  }
+
+  /**
+   * 由主 agent（克劳德）拆解任务，生成子任务 DAG 并指定每个子任务的执行模型
+   * 解析失败/调用失败时回退内置默认 DAG
+   */
+  async _planTask(userQuery, traceId) {
+    const planPrompt = [
+      '你是一个多智能体协作平台中的主智能体（克劳德），负责把用户的请求拆解为可执行的子任务 DAG，并为每个子任务指定执行模型。',
+      '',
+      '可用模型：',
+      '- 克劳德：通用能力、复杂架构、代码规范',
+      '- 吉米：长文本处理、文档分析、信息提炼',
+      '- 迪普斯克：编程实现、算法、纠错调试',
+      '- 钱文：快速开发、场景适配、中文优化',
+      '',
+      '要求：',
+      '1. 把请求拆解为 2-5 个子任务，形成有依赖关系的 DAG（第一个子任务无依赖）',
+      '2. 为每个子任务选择最合适的执行模型（可分配给自己或其他模型）',
+      '3. 每个子任务只指定一个执行模型',
+      '',
+      '输出纯 JSON 数组，不要任何其他文字或 markdown 围栏，格式：',
+      '[{"type":"PLAN_TASK|CODE_TASK|REVIEW_TASK|SUMMARY_TASK|DEBUG_TASK","instruction":"子任务执行指令","deps":[依赖的子任务序号，如0],"agent":"克劳德|吉米|迪普斯克|钱文"}]',
+      '',
+      '用户请求：' + userQuery,
+    ].join('\n');
+
+    try {
+      // 流式展示主agent拆解过程（关联外部任务，前端显示克劳德流式气泡）
+      const externalTaskId = blackboard.hget(`blackboard:task:${traceId}:main`, 'task_id') || traceId;
+      const streamId = uuidv4();
+      eventBus.emit('agent:stream:start', { task_id: externalTaskId, agent: '克劳德', stream_id: streamId });
+      const result = await agentRuntime.executeTaskWithAgent({
+        task_id: traceId,
+        role: 'executor',
+        context: '任务规划拆解',
+        instruction: planPrompt,
+        input_files: [],
+      }, [], '克劳德', (chunk) => {
+        eventBus.emit('agent:stream:chunk', { task_id: externalTaskId, agent: '克劳德', chunk, stream_id: streamId });
+      });
+      eventBus.emit('agent:stream:end', { task_id: externalTaskId, agent: '克劳德', stream_id: streamId });
+
+      const content = (result && result.content) || '';
+      const parsed = this._parsePlanOutput(content, userQuery, traceId);
+      if (parsed) return parsed;
+      console.warn('[EventDriven] 克劳德规划输出无法解析，回退默认 DAG');
+    } catch (e) {
+      console.warn('[EventDriven] 克劳德规划失败，回退默认 DAG:', e.message);
+    }
+    return scheduler.defaultDag(userQuery, traceId);
+  }
+
+  /**
+   * 解析主 agent 规划输出（纯 JSON 数组），失败返回 null
+   */
+  _parsePlanOutput(content, userQuery, traceId) {
+    if (!content || !content.trim()) return null;
+    let text = content.trim();
+    text = text.replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/, '').trim();
+    let arr = null;
+    try {
+      arr = JSON.parse(text);
+    } catch (e) {
+      const m = text.match(/\[[\s\S]*\]/);
+      if (m) {
+        try { arr = JSON.parse(m[0]); } catch (e2) { arr = null; }
+      }
+    }
+    if (!Array.isArray(arr) || arr.length === 0) return null;
+
+    const agentAlias = { claude: '克劳德', kimi: '吉米', deepseek: '迪普斯克', qwen: '钱文' };
+    const nodes = arr.map((item, seq) => {
+      const type = item.type || TASK_TYPES.CODE;
+      const deps = Array.isArray(item.deps) ? item.deps.map(d => Number(d)) : [];
+      const depsIds = deps
+        .filter(d => Number.isInteger(d) && d >= 0 && d < arr.length && d !== seq)
+        .map(d => genSubTaskId(traceId, d));
+      let agent = item.agent || '';
+      agent = agentAlias[String(agent).toLowerCase()] || agent;
+      return {
+        seq,
+        id: genSubTaskId(traceId, seq),
+        type,
+        instruction: item.instruction || item.task || userQuery,
+        deps: depsIds,
+        role: type === TASK_TYPES.REVIEW ? 'reviewer' : type === TASK_TYPES.SUMMARY ? 'guardian' : 'executor',
+        agent: agent || null,
+      };
+    });
+    return nodes;
+  }
+
+  /**
+   * 事件驱动协作模式（消息总线 + 黑板 + DAG 编排）
+   *
+   * 按《消息总线+Redis黑板 多Agent协作生产级方案》：
+   * 调度器拆解 DAG（规划→执行→评审→汇总），按依赖事件驱动调度，
+   * 子任务由能力画像匹配到各 Agent，状态全部落黑板，结果汇总回写。
+   */
+  async _executeEventDrivenCollaboration(task, taskId, userMessage, opts = {}) {
+    this._ensureEventDrivenEngine();
+
+    try {
+      // 用户消息补写进对话（其他模式都会记录用户提问，事件驱动模式此前遗漏）
+      this._appendConversation(taskId, 'user', userMessage || task.instruction || task.description, { target: task.executor_agent || '克劳德' });
+
+      const result = await scheduler.createTask(userMessage, {
+        taskId,
+        executorAgent: task.executor_agent || '克劳德',
+      });
+      // result: { trace_id, final_result, status }
+      const content = (result && result.final_result) || '';
+      const succeeded = result && result.status === TASK_STATUS.SUCCESS;
+      const traceId = result && result.trace_id;
+
+      this._appendConversation(taskId, 'assistant', `**事件驱动协作结果**\n\n${content}`);
+
+      // 多轮对话：保持任务 executing（不结束），记录最新协作 trace 供右侧任务面板查询
+      task.status = 'executing';
+      task.result = content;
+      task.collab_trace_id = traceId || task.collab_trace_id;
+      task.updated_at = new Date().toISOString();
+      if (!succeeded) task.suspend_reason = '本轮协作存在未完成任务，可继续输入或结束对话';
+      else delete task.suspend_reason;
+      this._saveTask(task);
+      this._updateIndex(task);
+      eventBus.emit('task:executing', { task_id: taskId, phase: 'collab-done' });
+
+      if (!succeeded) {
+        this._appendConversation(taskId, 'system', '[事件驱动协作] 本轮存在失败子任务，可继续输入新问题或结束对话');
+      }
+
+      return { task, result: content };
+    } catch (e) {
+      task.status = 'executing';
+      task.updated_at = new Date().toISOString();
+      task.suspend_reason = e.message;
+      this._saveTask(task);
+      this._updateIndex(task);
+      eventBus.emit('task:failed', { task_id: taskId, error: e.message });
+      return { task, result: '', error: e.message };
+    }
+  }
+
+  /**
+   * 深度调研 Skill 执行入口（SKILL_DEEP_RESEARCH）
+   *
+   * 按《Multi-Agent 深度调研 Skill 标准化技能定义》：
+   * 维度拆解 -> 多模型多角度并行调研 -> 主模型汇总成文
+   * -> 跨模型独立审核 -> 迭代修正终稿，全程事件驱动（skill 内部事件闭环）。
+   */
+  async _executeDeepResearch(task, taskId, userMessage, opts = {}) {
+    this._ensureEventDrivenEngine();
+    const userQuery = userMessage || task.instruction || task.description;
+
+    try {
+      this._appendConversation(taskId, 'user', userQuery, { target: task.executor_agent || '克劳德' });
+      this._appendConversation(taskId, 'system', '[深度调研] 启动多模型调研流程：维度拆解 → 并行调研 → 汇总成文 → 独立审核 → 迭代终稿');
+
+      const result = await deepResearch.run({
+        taskId,
+        userQuery,
+        mainAgent: task.executor_agent || '克劳德',
+      });
+      // result: { trace_id, final_result, status }
+      const content = (result && result.final_result) || '';
+
+      this._appendConversation(taskId, 'assistant', `**深度调研报告（终稿）**\n\n${content}`);
+
+      // 多轮对话：保持任务 executing，记录最新 trace 供右侧任务面板查询
+      task.status = 'executing';
+      task.result = content;
+      task.collab_trace_id = (result && result.trace_id) || task.collab_trace_id;
+      task.updated_at = new Date().toISOString();
+      delete task.suspend_reason;
+      this._saveTask(task);
+      this._updateIndex(task);
+      eventBus.emit('task:executing', { task_id: taskId, phase: 'collab-done' });
+
+      return { task, result: content };
+    } catch (e) {
+      task.status = 'executing';
+      task.updated_at = new Date().toISOString();
+      task.suspend_reason = `深度调研失败：${e.message}`;
+      this._saveTask(task);
+      this._updateIndex(task);
+      this._appendConversation(taskId, 'system', `[深度调研] 本轮调研失败：${e.message}。可重试或换个说法继续`);
+      eventBus.emit('task:executing', { task_id: taskId, phase: 'collab-done' });
+      return { task, result: '', error: e.message };
+    }
+  }
+
+  /**
+   * 多模型循环讨论模式（用户一条消息中 @多个Agent 触发）
+   *
+   * 流程（以模型A、B、C为例）：
+   *   1. 模型A（第一个被@的Agent）回答问题
+   *   2. 模型B、C 对 A 的回答进行评审、补充（只给意见和判定，不修改答案）
+   *   3. 模型A 参考 B、C 的评审意见修改自己的答案 —— 此为完整一轮
+   *   4. 重复直至 B、C 都判定「可行」，或达到轮次上限 5 轮
+   *
+   * @param {Array<string>} participants 参与讨论的 Agent 名单（第一个是回答者A）
+   */
+  async _executeDiscussionMode(task, taskId, userMessage, participants) {
+    let hostAgent = participants[0];
+    const reviewers = participants.slice(1);
+    const maxRounds = 5;
     const startTime = Date.now();
 
     try {
+      // 用户提问记录：标明所有参与讨论的 Agent
+      this._appendConversation(taskId, 'user', userMessage || task.instruction || task.description, { target: participants.join('、') });
+      this._appendConversation(taskId, 'system', `[讨论模式] ${participants.join('、')} 协作讨论 | 回答者: ${hostAgent} | 评审者: ${reviewers.join('、')} | 轮次上限 ${maxRounds}`);
+
+      // Step 1: 回答者A给出初始回答（失败自动重试；仍失败则换参与者中第一位可用 Agent 作答）
+      eventBus.emit('task:executing', { task_id: taskId, agent: hostAgent, phase: 'discussion_opening' });
+      const openingPrompt = `${userMessage}\n\n（你负责回答以上问题。稍后会有其他智能体评审你的答案，你需参考评审意见持续修改，直到评审全部通过或达到轮次上限。）`;
+      let draft = await this._tryAgentCall(task, taskId, openingPrompt, hostAgent, 2);
+      if (!draft) {
+        const fallbackHost = participants.find(name => name !== hostAgent);
+        if (fallbackHost) {
+          this._appendConversation(taskId, 'system', `[讨论模式] ${hostAgent} 初始回答失败，改由 ${fallbackHost} 作答`);
+          hostAgent = fallbackHost;
+          draft = await this._tryAgentCall(task, taskId, openingPrompt, fallbackHost, 2);
+        }
+      }
+      if (!draft) {
+        throw new Error('所有参与讨论的 Agent 均无法给出初始回答，讨论无法进行');
+      }
+      this._appendConversation(taskId, 'assistant', `**${hostAgent}** 初始回答:\n\n${draft}`, { target: reviewers.join('、') });
+
+      // Step 2-N: 讨论轮次（最多 maxRounds 轮）
+      //   每轮：评审者逐个评审（判定+意见+补充）→ 回答者参考意见修订答案
+      let allPassed = false;
+      let finalRound = 0;
+      for (let round = 1; round <= maxRounds; round++) {
+        finalRound = round;
+        this._appendConversation(taskId, 'system', `[讨论模式] 第 ${round}/${maxRounds} 轮讨论开始`);
+
+        // 2a. 评审者逐个评审当前答案
+        const reviewResults = [];
+        for (const reviewer of reviewers) {
+          eventBus.emit('task:executing', { task_id: taskId, agent: reviewer, phase: `discussion_round_${round}` });
+          const angle = this._agentAngle(reviewer);
+          const reviewPrompt = [
+            `原始问题：${userMessage}`,
+            ``,
+            `请评审以下答案（来自 ${hostAgent}）：\n\n${draft}`,
+            ``,
+            `请站在你的专长角度（${angle}）进行评审，按以下格式回复：`,
+            ``,
+            `结论：可行 或 需修改`,
+            `意见：指出遗漏的关键点、事实错误或逻辑问题`,
+            `补充：你认为缺失但重要的内容`,
+            ``,
+            `注意：你只负责评审，不要直接修改答案；修改由 ${hostAgent} 完成。`,
+          ].join('\n');
+          const reviewText = await this._tryAgentCall(task, taskId, reviewPrompt, reviewer, 2);
+          if (reviewText) {
+            const verdict = this._parseReviewVerdict(reviewText);
+            reviewResults.push({ reviewer, verdict, text: reviewText });
+            this._appendConversation(taskId, 'assistant',
+              `**${reviewer}** 评审意见（第 ${round} 轮）[${verdict === 'pass' ? '✓ 可行' : '✗ 需修改'}]:\n\n${reviewText}`, { target: hostAgent });
+          } else {
+            // 评审者失败：跳过，视为「需修改」以触发修订（不阻塞流程）
+            reviewResults.push({ reviewer, verdict: 'revise', text: `${reviewer} 本轮评审失败，意见缺失` });
+            this._appendConversation(taskId, 'system',
+              `[讨论模式] ${reviewer} 第 ${round} 轮评审失败（已重试 1 次），跳过该评审者，本轮视为「需修改」`);
+          }
+        }
+
+        // 2b. 判定：所有评审者都「可行」则讨论结束
+        allPassed = reviewResults.length > 0 && reviewResults.every(r => r.verdict === 'pass');
+        if (allPassed) {
+          this._appendConversation(taskId, 'system', `[讨论模式] 第 ${round} 轮：所有评审者均判定「可行」，讨论结束`);
+          break;
+        }
+
+        // 2c. 回答者A参考评审意见修订答案
+        if (round < maxRounds) {
+          eventBus.emit('task:executing', { task_id: taskId, agent: hostAgent, phase: `discussion_revise_${round}` });
+          const reviewSummary = reviewResults.map(r => `【${r.reviewer} 的意见】\n${r.text}`).join('\n\n---\n\n');
+          const revisePrompt = [
+            `原始问题：${userMessage}`,
+            ``,
+            `你上一版答案：\n\n${draft}`,
+            ``,
+            `评审者们给出的意见：\n\n${reviewSummary}`,
+            ``,
+            `请参考以上评审意见修改你的答案，输出完整的修订版答案全文（直接输出答案内容，不要附带说明）。`,
+          ].join('\n');
+          const revised = await this._tryAgentCall(task, taskId, revisePrompt, hostAgent, 2);
+          if (revised) {
+            draft = revised;
+            this._appendConversation(taskId, 'assistant', `**${hostAgent}** 修订版答案（第 ${round} 轮）:\n\n${revised}`, { target: reviewers.join('、') });
+          } else {
+            this._appendConversation(taskId, 'system', `[讨论模式] ${hostAgent} 第 ${round} 轮修订失败（已重试 1 次），继续使用当前版本`);
+          }
+        }
+      }
+
+      // Step 3: 输出最终答案（A 的最后一版）
+      if (!allPassed) {
+        this._appendConversation(taskId, 'system', `[讨论模式] 已达轮次上限 ${maxRounds} 轮，返回 ${hostAgent} 的最后一版答案`);
+      }
+      this._appendConversation(taskId, 'assistant', `**${hostAgent}** 最终答案（第 ${finalRound} 轮后${allPassed ? '，评审通过' : ''}）:\n\n${draft}`, { target: '用户' });
+
+      task.progress = Math.min(1.0, (task.progress || 0) + 0.5);
+      task.updated_at = new Date().toISOString();
+      this._saveTask(task);
+      this._updateIndex(task);
+
+      eventBus.emit('task:updated', { task_id: taskId, status: task.status, phase: 'discussion_done', duration_ms: Date.now() - startTime });
+
+      return { task, result: { status: 'success', content: draft } };
+    } catch (e) {
+      task.status = 'failed';
+      task.suspend_reason = e.message;
+      task.updated_at = new Date().toISOString();
+      this._saveTask(task);
+      this._updateIndex(task);
+
+      this._appendConversation(taskId, 'system', `[讨论中断] ${e.message}`);
+      eventBus.emit('task:failed', { task_id: taskId, error: e.message });
+      throw e;
+    }
+  }
+
+  /**
+   * 解析评审者的结论
+   *
+   * 支持「结论：可行」/「结论: 需修改」等格式；
+   * 无法识别时按正文关键词判断，仍无法判断则默认「需修改」（触发修订，更稳妥）。
+   *
+   * @param {string} reviewText 评审者回复全文
+   * @returns {'pass'|'revise'} 可行 / 需修改
+   */
+  _parseReviewVerdict(reviewText) {
+    if (!reviewText) return 'revise';
+    // 优先匹配「结论」行
+    const conclusionMatch = reviewText.match(/结论[：:]\s*(可行|通过|合格|可接受|无需修改|需修改|需补充|不通过|不可行|存在问题)/);
+    if (conclusionMatch) {
+      const word = conclusionMatch[1];
+      if (['可行', '通过', '合格', '可接受', '无需修改'].includes(word)) return 'pass';
+      return 'revise';
+    }
+    // 回退：正文关键词判断
+    const text = reviewText.slice(0, 500);
+    if (/认为可行|判定.*可行|没有(明显)?问题|无(明显)?问题|基本完善|无需修改|可以通过/.test(text)) return 'pass';
+    if (/需修改|需要修改|需补充|需要补充|不通过|不可行|存在问题|有(以下|如下|几处|一些)?(问题|错误|遗漏)/.test(text)) return 'revise';
+    // 无法判断：默认需修改
+    return 'revise';
+  }
+
+  /**
+   * 直接调用指定 Agent（不注入@转交能力，不做@路由）
+   * 讨论模式的内部调用原语
+   */
+  async _callAgentRaw(task, taskId, instruction, agentName) {
+    const conversationHistory = this._readConversationHistory(taskId);
+    const savedInstruction = task.instruction;
+    task.instruction = instruction;
+    try {
+      const result = await this._streamedExecute(task, taskId, agentName, conversationHistory);
+      if (result.status !== 'success') {
+        throw new Error(`${agentName} 执行失败: ${(result.error && result.error.message) || '未知错误'}`);
+      }
+      return result.content || '';
+    } finally {
+      task.instruction = savedInstruction;
+    }
+  }
+
+  /**
+   * 带重试的 Agent 调用：失败自动重试，全部失败返回 null（不抛异常）
+   *
+   * @param {Object} task - 任务对象
+   * @param {string} taskId - 任务 ID
+   * @param {string} instruction - 指令
+   * @param {string} agentName - Agent 名称
+   * @param {number} maxAttempts - 最大尝试次数（默认 2：初次 + 1 次重试）
+   * @returns {Promise<string|null>} 成功返回内容，失败返回 null
+   */
+  async _tryAgentCall(task, taskId, instruction, agentName, maxAttempts = 2) {
+    let lastError = null;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        const content = await this._callAgentRaw(task, taskId, instruction, agentName);
+        if (content && content.trim()) {
+          return content;
+        }
+        lastError = new Error(`${agentName} 返回空内容`);
+      } catch (e) {
+        lastError = e;
+        if (attempt < maxAttempts) {
+          this._appendConversation(taskId, 'system', `[讨论模式] ${agentName} 调用失败（第 ${attempt} 次）：${e.message}，即将重试...`);
+        }
+      }
+    }
+    if (lastError) {
+      this._appendConversation(taskId, 'system', `[讨论模式] ${agentName} 重试 ${maxAttempts} 次后仍失败：${lastError.message}`);
+    }
+    return null;
+  }
+
+  /**
+   * 带流式推送的执行：把 CLI 增量输出通过事件总线推给前端
+   *
+   * 事件序列（每个 agent 回答一次触发一组）：
+   *   agent:stream:start  { task_id, agent }                      — 前端创建流式气泡
+   *   agent:stream:chunk  { task_id, agent, chunk, stream_id }    — 增量文本
+   *   agent:stream:end    { task_id, agent, stream_id }           — 该回答流结束
+   */
+  async _streamedExecute(task, taskId, agentName, conversationHistory) {
+    const streamId = Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+    eventBus.emit('agent:stream:start', { task_id: taskId, agent: agentName, stream_id: streamId });
+
+    let buffered = '';
+    let lastEmit = 0;
+    const onChunk = (chunk) => {
+      buffered += chunk;
+      // 节流：每 80ms 最多推送一次，避免事件洪泛
+      const now = Date.now();
+      if (buffered && now - lastEmit >= 80) {
+        lastEmit = now;
+        eventBus.emit('agent:stream:chunk', { task_id: taskId, agent: agentName, chunk: buffered, stream_id: streamId });
+        buffered = '';
+      }
+    };
+
+    try {
+      const result = await agentRuntime.executeTaskWithAgent(task, conversationHistory, agentName, onChunk);
+      // 推完剩余缓冲
+      if (buffered) {
+        eventBus.emit('agent:stream:chunk', { task_id: taskId, agent: agentName, chunk: buffered, stream_id: streamId });
+        buffered = '';
+      }
+      eventBus.emit('agent:stream:end', { task_id: taskId, agent: agentName, stream_id: streamId });
+      return result;
+    } catch (e) {
+      if (buffered) {
+        eventBus.emit('agent:stream:chunk', { task_id: taskId, agent: agentName, chunk: buffered, stream_id: streamId });
+      }
+      eventBus.emit('agent:stream:end', { task_id: taskId, agent: agentName, stream_id: streamId, error: e.message });
+      throw e;
+    }
+  }
+
+  /**
+   * Agent 的评审专长角度（用于讨论模式中给不同 Agent 分配视角）
+   */
+  _agentAngle(agentName) {
+    const angles = {
+      '克劳德': '逻辑严谨、代码规范、长文本处理',
+      '吉米': '大容量文本处理、信息提炼精准',
+      '迪普斯克': '技术深度、专业性、纠错能力',
+      '钱文': '场景适配、中文表达优化、兼容性',
+    };
+    return angles[agentName] || '多角度综合审视';
+  }
+
+  /**
+   * 执行指定 Agent 并处理模型间 @ 转交
+   *
+   * 规则：
+   *   1. Agent 回复中包含「@另一个Agent名 + 问题」时，平台把问题转交给被@的Agent
+   *   2. 被@的Agent可以继续@第三个Agent（最多 3 跳，防死循环）
+   *   3. 模型间@不改变用户绑定的回复Agent
+   *
+   * @param {string} fromAgent 问题来源（用户或上一个转交的 Agent），用于方向标签
+   */
+  async _executeAgentWithMentions(task, taskId, userMessage, execAgent, hop, visited, fromAgent) {
+    const startTime = Date.now();
+
+    try {
+      // 记录提问方向：hop 0 是用户提问（用户→@Agent），hop ≥ 1 是模型间转交（模型A→@模型B）
+      if (hop === 0) {
+        this._appendConversation(taskId, 'user', userMessage || task.instruction || task.description, { target: execAgent });
+      } else {
+        this._appendConversation(taskId, 'user', userMessage, { target: execAgent, from: fromAgent });
+      }
+
       // 读取对话历史
       const conversationHistory = this._readConversationHistory(taskId);
 
-      // 更新 task.instruction 为当前用户消息，确保 Agent 收到正确指令
+      // 更新 task.instruction 为当前问题，确保 Agent 收到正确指令
+      // 并注入团队协作说明：允许模型将问题转交给其他智能体
       const savedInstruction = task.instruction;
-      task.instruction = userMessage || task.instruction || task.description;
+      const mentionCapability = '\n\n=== 团队协作 ===\n你可以把问题转交给团队中的其他智能体，格式：@智能体名 问题内容（例如：@吉米 请解释一下这个算法）。可用的智能体：克劳德（Claude，通用）、吉米（Kimi，长文本分析）、迪普斯克（DeepSeek，编程实现）、钱文（Qwen，中文写作）。仅当你自己无法可靠回答该问题时才转交，否则请直接回答。';
+      task.instruction = (userMessage || task.instruction || task.description) + mentionCapability;
 
-      // 通过指定 Agent 执行
-      const result = await agentRuntime.executeTaskWithAgent(task, conversationHistory, execAgent);
+      // 通过指定 Agent 执行（流式：捕获 CLI 增量输出推送到事件总线）
+      const result = await this._streamedExecute(task, taskId, execAgent, conversationHistory);
 
       // 恢复原 instruction
       task.instruction = savedInstruction;
 
-      // 保存输出，带上执行 Agent 的名称标记
+      if (result.status !== 'success') {
+        task.status = 'failed';
+        task.suspend_reason = result.error ? result.error.message : '执行失败';
+        task.updated_at = new Date().toISOString();
+        this._saveTask(task);
+        this._updateIndex(task);
+        return { task, result };
+      }
+
+      // 检查回复中是否包含 @另一个Agent 的转交请求（最多 3 跳，防死循环）
+      const mention = this._extractMentionFromReply(result.content, execAgent);
+      if (mention && hop < 3 && !visited.has(mention.agent)) {
+        visited.add(mention.agent);
+        // 记录模型A的回复全文 + 转交声明
+        const forwardMsg = `**${execAgent}**\n\n${result.content || ''}\n\n[转交] @${mention.agent}：${mention.question}`;
+        this._appendConversation(taskId, 'assistant', forwardMsg, { target: mention.agent, from: execAgent });
+        eventBus.emit('task:executing', { task_id: taskId, agent: mention.agent, phase: 'mention' });
+
+        // 转交给被@的Agent：附带转交说明，B 可从对话历史中看到A的完整回复
+        const forwardPrompt = `问题：${mention.question}\n\n（此问题由 ${execAgent} 转交给你回答。请参考对话历史中 ${execAgent} 的回复内容，直接给出你的回答；只有在确实无法回答时才可再次转交。）`;
+
+        return await this._executeAgentWithMentions(task, taskId, forwardPrompt, mention.agent, hop + 1, visited, execAgent);
+      }
+
+      // 最终回复用户，带上执行 Agent 的名称标记
       const contentWithAgent = `**${execAgent}**\n\n` + (result.content || '');
-      this._appendConversation(taskId, 'assistant', contentWithAgent);
+      this._appendConversation(taskId, 'assistant', contentWithAgent, { target: '用户' });
 
       // 保存输出文件
       if (result.output_files && result.output_files.length > 0) {
@@ -250,15 +859,8 @@ class TaskOrchestrator {
         }
       }
 
-      if (result.status === 'success') {
-        // 不标记为 completed，保持 executing 状态以支持多轮对话
-        // 用户可以通过左侧「+」新建对话或关闭页面来结束当前对话
-        task.progress = Math.min(1.0, (task.progress || 0) + 0.5);
-      } else {
-        task.status = 'failed';
-        task.suspend_reason = result.error ? result.error.message : '执行失败';
-      }
-
+      // 不标记为 completed，保持 executing 状态以支持多轮对话
+      task.progress = Math.min(1.0, (task.progress || 0) + 0.5);
       task.updated_at = new Date().toISOString();
       this._saveTask(task);
       this._updateIndex(task);
@@ -281,6 +883,31 @@ class TaskOrchestrator {
   }
 
   /**
+   * 从模型回复中提取 @另一个Agent 的转交请求
+   *
+   * 格式要求：「@Agent名 + 具体问题」，问题至少 4 个字符才触发转交，
+   * 避免模型在普通回复中偶然提及 @Agent名 造成误转交。
+   *
+   * @returns {Object|null} { agent, question } 或 null
+   */
+  _extractMentionFromReply(content, currentAgent) {
+    if (!content) return null;
+    const pattern = /@(克劳德|吉米|迪普斯克|钱文)/g;
+    let match = pattern.exec(content);
+    while (match) {
+      if (match[1] !== currentAgent) {
+        const afterAt = content.substring(match.index + match[1].length + 1);
+        const question = afterAt.replace(/^[：:，,、\s]+/, '').split(/\n/)[0].trim();
+        if (question && question.length >= 4) {
+          return { agent: match[1], question };
+        }
+      }
+      match = pattern.exec(content);
+    }
+    return null;
+  }
+
+  /**
    * 执行复杂任务 — 多Agent协作流程
    *
    * 流程（二期简化版）：
@@ -299,8 +926,6 @@ class TaskOrchestrator {
     this._saveTask(task);
     this._updateIndex(task);
 
-    this._appendConversation(taskId, 'user', userMessage || task.instruction || task.description);
-
     // ===== Step 1: 任务画像生成 =====
     eventBus.emit('task:executing', { task_id: taskId, agent: '多Agent协作', phase: 'profiling' });
     this._appendConversation(taskId, 'system', '[多Agent协作] 开始任务画像分析...');
@@ -310,6 +935,8 @@ class TaskOrchestrator {
     task.reviewer_agents = profile.reviewers;
     this._saveTask(task);
     this._updateIndex(task);
+
+    this._appendConversation(taskId, 'user', userMessage || task.instruction || task.description, { target: profile.executor });
 
     this._appendConversation(taskId, 'system',
       `[任务画像] 执行者: ${profile.executor} | 评审者: ${profile.reviewers.join(', ')} | 能力需求: ${profile.capabilities.join(', ')}`);
@@ -321,7 +948,7 @@ class TaskOrchestrator {
     const history = this._readConversationHistory(taskId);
     let execResult;
     try {
-      execResult = await agentRuntime.executeTaskWithAgent(task, history, profile.executor);
+      execResult = await this._streamedExecute(task, taskId, profile.executor, history);
     } catch (e) {
       task.status = 'failed';
       task.suspend_reason = `执行失败: ${e.message}`;
@@ -334,7 +961,7 @@ class TaskOrchestrator {
 
     this._appendConversation(taskId, 'assistant', `**${profile.executor}** 的产出:
 
-${execResult.content || ''}`);
+${execResult.content || ''}`, { target: profile.reviewers.join('、') });
 
     if (execResult.status !== 'success') {
       task.status = 'failed';
@@ -358,7 +985,7 @@ ${execResult.content || ''}`);
       this._appendConversation(taskId, 'assistant',
         `**${review.reviewer}** 评审意见 [${passedLabel}]:
 
-${review.content || review.reason || '（无详细意见）'}`);
+${review.content || review.reason || '（无详细意见）'}`, { target: profile.executor });
 
       // 保存评审文件
       const reviewPath = path.join(ROOT, 'tasks', taskId, 'reviews', `${review.reviewer}.md`);
@@ -413,11 +1040,11 @@ ${revisionGuidance}
 ${execResult.content}`,
       };
 
-      const revisedResult = await agentRuntime.executeTaskWithAgent(revisedInput, revisedHistory, profile.executor);
+      const revisedResult = await this._streamedExecute(revisedInput, taskId, profile.executor, revisedHistory);
 
       this._appendConversation(taskId, 'assistant', `**${profile.executor}** 修正后产出:
 
-${revisedResult.content || ''}`);
+${revisedResult.content || ''}`, { target: profile.reviewers.join('、') });
 
       execResult = revisedResult;
     }
@@ -574,7 +1201,25 @@ ${executorOutput}
           max_tokens: 2048,
         };
 
-        const result = await agent.adapter.execute(reviewInput);
+        const streamId = 'rev-' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+        eventBus.emit('agent:stream:start', { task_id: task.task_id, agent: name, stream_id: streamId });
+        let revBuf = '';
+        let revLast = 0;
+        const onRevChunk = (chunk) => {
+          revBuf += chunk;
+          const now = Date.now();
+          if (revBuf && now - revLast >= 80) {
+            revLast = now;
+            eventBus.emit('agent:stream:chunk', { task_id: task.task_id, agent: name, chunk: revBuf, stream_id: streamId });
+            revBuf = '';
+          }
+        };
+
+        const result = await agent.adapter.execute(reviewInput, onRevChunk);
+        if (revBuf) {
+          eventBus.emit('agent:stream:chunk', { task_id: task.task_id, agent: name, chunk: revBuf, stream_id: streamId });
+        }
+        eventBus.emit('agent:stream:end', { task_id: task.task_id, agent: name, stream_id: streamId });
 
         // 解析评审结论
         let verdict = 'pass';  // 默认通过
@@ -833,16 +1478,25 @@ ${executorOutput}
     this._saveIndex(tasks);
   }
 
-  _appendConversation(taskId, role, content) {
+  _appendConversation(taskId, role, content, opts = {}) {
     const conversationPath = path.join(ROOT, 'tasks', taskId, 'conversation.md');
     const timestamp = new Date().toISOString();
-    const roleLabel = {
+    let roleLabel = {
       'user': '🧑 用户',
       'assistant': '🤖 助手',
       'system': '⚙️ 系统',
     }[role] || role;
 
-    const entry = `\n### ${roleLabel} - ${timestamp}\n\n${content}\n\n---\n`;
+    // 模型间转交的问题：发送方标记为模型名（如「🤖 吉米 @钱文」）
+    if (opts.from && role === 'user') {
+      roleLabel = `🤖 ${opts.from}`;
+    }
+    // 模型回复转交给其他模型：回复方标记为模型名（如「🤖 克劳德 @吉米」）
+    if (opts.from && role === 'assistant') {
+      roleLabel = `🤖 ${opts.from}`;
+    }
+
+    const entry = `\n### ${roleLabel}${opts.target ? ` @${opts.target}` : ''} - ${timestamp}\n\n${content}\n\n---\n`;
     fs.appendFileSync(conversationPath, entry);
   }
 
@@ -851,22 +1505,29 @@ ${executorOutput}
     if (!fs.existsSync(conversationPath)) return [];
     const raw = fs.readFileSync(conversationPath, 'utf8');
     const messages = [];
-    // 简单解析：按 ### 分割
-    const sections = raw.split(/\n### /);
-    for (let i = 1; i < sections.length; i++) {
-      const section = sections[i];
-      const match = section.match(/^(🧑 用户|🤖 助手|⚙️ 系统)/);
-      if (match) {
-        let role = 'unknown';
-        if (match[1].includes('用户')) role = 'user';
-        else if (match[1].includes('助手')) role = 'assistant';
-        else if (match[1].includes('系统')) role = 'system';
+    // 真正的消息头：行首 "### 🧑 用户/🤖 助手/⚙️ 系统/🤖 模型名"
+    // 不能用 split(/\n### /) —— 回答正文里的 markdown 标题（### xxx）会被误分割
+    const headerRe = /^### (🧑 用户|🤖 助手|⚙️ 系统|🤖 (克劳德|吉米|迪普斯克|钱文))(?: @[^\n-]+)?[^\n]*$/gm;
+    const starts = [];
+    let m;
+    while ((m = headerRe.exec(raw)) !== null) {
+      starts.push({ pos: m.index, role: m[1], agent: m[2] || null, headerLen: m[0].length });
+    }
+    for (let i = 0; i < starts.length; i++) {
+      const s = starts[i];
+      const bodyStart = s.pos + s.headerLen;
+      const bodyEnd = i + 1 < starts.length ? starts[i + 1].pos : raw.length;
+      const body = raw.slice(bodyStart, bodyEnd).replace(/^\n+/, '');
+      const content = body.replace(/\n---\n?$/, '').trim();
+      if (!content) continue;
 
-        const content = section.replace(/^[^\n]+\n\n/, '').replace(/\n---\n?$/, '').trim();
-        if (content) {
-          messages.push({ role, content });
-        }
-      }
+      let role = 'unknown';
+      if (s.role.includes('用户')) role = 'user';
+      else if (s.role.includes('助手')) role = 'assistant';
+      else if (s.role.includes('系统')) role = 'system';
+      else if (s.agent) role = 'user'; // 模型间转交的问题，视为提问
+
+      messages.push({ role, content });
     }
     return messages;
   }

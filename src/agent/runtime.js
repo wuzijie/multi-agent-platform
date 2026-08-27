@@ -113,8 +113,9 @@ class AgentRuntime {
 
   /**
    * 执行任务 - 通过适配器调用 Agent
+   * @param {Function} [onChunk] 流式输出回调：适配器每次捕获到 CLI 增量输出时调用
    */
-  async executeTask(task, conversationHistory = []) {
+  async executeTask(task, conversationHistory = [], onChunk) {
     const agent = this.agents.get('克劳德');
     if (!agent || !agent.adapter) {
       throw new Error('Default agent (克劳德) is not available');
@@ -136,7 +137,7 @@ class AgentRuntime {
         max_tokens: task.max_tokens || 4096,
       };
 
-      const result = await agent.adapter.execute(input);
+      const result = await agent.adapter.execute(input, onChunk);
       return result;
     } finally {
       agent.busy = false;
@@ -162,17 +163,18 @@ class AgentRuntime {
    * @param {Object} task - 任务对象
    * @param {Array} history - 对话历史
    * @param {string} agentName - Agent 名称，如 '克劳德', '吉米', '迪普斯克', '钱文'
+   * @param {Function} [onChunk] 流式输出回调：适配器每次捕获到 CLI 增量输出时调用
    */
-  async executeTaskWithAgent(task, history, agentName) {
+  async executeTaskWithAgent(task, history, agentName, onChunk) {
     const agent = this.agents.get(agentName);
     if (!agent || !agent.adapter) {
       // 回退到克劳德
       console.warn(`[AgentRuntime] Agent "${agentName}" not available, falling back to 克劳德`);
-      return this.executeTask(task, history);
+      return this.executeTask(task, history, onChunk);
     }
     if (!agent.online) {
       console.warn(`[AgentRuntime] Agent "${agentName}" is offline, falling back to 克劳德`);
-      return this.executeTask(task, history);
+      return this.executeTask(task, history, onChunk);
     }
 
     agent.busy = true;
@@ -188,7 +190,7 @@ class AgentRuntime {
         max_tokens: task.max_tokens || 4096,
       };
 
-      const result = await agent.adapter.execute(input);
+      const result = await agent.adapter.execute(input, onChunk);
       return result;
     } finally {
       agent.busy = false;

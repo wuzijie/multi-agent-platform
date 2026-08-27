@@ -191,7 +191,7 @@ class KimiAdapter {
    * @param {Object} input - UnifiedInput
    * @returns {Promise<Object>} UnifiedOutput
    */
-  async execute(input) {
+  async execute(input, onChunk) {
     validateKimiInput(input);
     const startTime = Date.now();
 
@@ -226,10 +226,12 @@ class KimiAdapter {
     }
 
     const promptLength = fullPrompt.length;
-    const timeoutMs = Math.max(60000, promptLength * 2 + 30000);
+    // 下限 240 秒：CLI 启动开销大，慢模型完成长任务常超过 60 秒。
+    // 调度器子任务预算 300 秒，适配器需在其内自行返回，避免被 spawn timeout 提前杀死。
+    const timeoutMs = Math.max(240000, promptLength * 2 + 30000);
 
     try {
-      const result = await this._runCli(args, fullPrompt, timeoutMs);
+      const result = await this._runCli(args, fullPrompt, timeoutMs, onChunk);
 
       if (result.exit_code === 0) {
         // 使用 text 格式，stdout 直接就是内容；仍然尝试 stream-json 解析以兼容
@@ -240,14 +242,20 @@ class KimiAdapter {
           duration_ms: Date.now() - startTime,
         });
       } else {
-        const errMsg = result.stderr || result.stdout || 'Unknown error';
-        ModelLogger.logResponse(this.name, model, errMsg);
+        let errMsg;
         let errorCode = 'CLI_ERROR';
-        if (errMsg.includes('Not logged in') || errMsg.includes('login')) {
-          errorCode = 'AUTH_REQUIRED';
-        } else if (errMsg.includes('timeout')) {
+        if (result.killed_by_timeout) {
           errorCode = 'TIMEOUT';
+          errMsg = `模型调用超时（超过 ${Math.round(timeoutMs / 1000)} 秒无结果，进程已被中断）`;
+        } else {
+          errMsg = result.stderr || result.stdout || 'Unknown error';
+          if (errMsg.includes('Not logged in') || errMsg.includes('login')) {
+            errorCode = 'AUTH_REQUIRED';
+          } else if (errMsg.includes('timeout')) {
+            errorCode = 'TIMEOUT';
+          }
         }
+        ModelLogger.logResponse(this.name, model, errMsg);
         return buildKimiOutput(input.task_id, 'failed', result.stdout || '', {
           error: { code: errorCode, message: errMsg.substring(0, 500) },
           duration_ms: Date.now() - startTime,
@@ -339,10 +347,12 @@ class KimiAdapter {
   /**
    * 执行 CLI 命令
    */
-  _runCli(args, prompt, timeoutMs) {
+  _runCli(args, prompt, timeoutMs, onChunk) {
     return new Promise((resolve) => {
+      const startAt = Date.now();
       let stdout = '';
       let stderr = '';
+      let streamedLen = 0;
 
       const finalArgs = [];
       for (let i = 0; i < args.length; i++) {
@@ -370,7 +380,15 @@ class KimiAdapter {
       });
 
       proc.stdout.on('data', (data) => {
-        stdout += data.toString();
+        const chunk = data.toString();
+        stdout += chunk;
+        if (typeof onChunk === 'function') {
+          const added = stdout.length - streamedLen;
+          if (added > 0) {
+            streamedLen = stdout.length;
+            onChunk(stdout.substring(streamedLen - added));
+          }
+        }
       });
 
       proc.stderr.on('data', (data) => {
@@ -382,6 +400,8 @@ class KimiAdapter {
           exit_code: code,
           stdout: stdout.trim(),
           stderr: stderr.trim(),
+          // code === null 表示被信号杀死（spawn timeout 会 SIGTERM 杀掉进程）
+          killed_by_timeout: code === null || Date.now() - startAt >= (timeoutMs || 120000) - 500,
         });
       });
 
@@ -390,6 +410,7 @@ class KimiAdapter {
           exit_code: -1,
           stdout: stdout.trim(),
           stderr: err.message,
+          killed_by_timeout: false,
         });
       });
     });
