@@ -14,6 +14,7 @@ const config = require('../utils/config');
 const scheduler = require('../engine/scheduler');
 const { AGENT_NAMES } = require('../engine/events');
 const blackboard = require('../blackboard/blackboard');
+const sessionManager = require('../session/manager');
 
 const ROOT = path.resolve(__dirname, '..', '..');
 
@@ -100,6 +101,35 @@ class ApiServer {
           executor_agent: req.body.executor_agent,
         });
         res.status(201).json(task);
+      } catch (e) {
+        res.status(500).json({ error: e.message });
+      }
+    });
+
+    // 停止当前所有任务/子任务（「结束所有任务」按钮）
+    api.post('/tasks/stop-all', async (req, res) => {
+      try {
+        const result = await orchestrator.stopAllTasks();
+        res.json(result);
+      } catch (e) {
+        res.status(500).json({ error: e.message });
+      }
+    });
+
+    // 停止指定对话的所有任务/子任务（取消按钮，只影响当前对话）
+    api.post('/tasks/:taskId/stop', async (req, res) => {
+      try {
+        const result = await orchestrator.stopTask(req.params.taskId);
+        res.json(result);
+      } catch (e) {
+        res.status(500).json({ error: e.message });
+      }
+    });
+
+    // 查询会话列表（每个对话的独立 session 状态，调试用）
+    api.get('/sessions', (req, res) => {
+      try {
+        res.json(sessionManager.list().map(s => s.toJSON()));
       } catch (e) {
         res.status(500).json({ error: e.message });
       }

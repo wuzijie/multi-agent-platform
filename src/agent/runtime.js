@@ -5,6 +5,9 @@ const { QwenAdapter } = require('../adapters/qwen');
 const fs = require('fs');
 const path = require('path');
 const config = require('../utils/config');
+const toolRegistry = require('../tools/registry');
+const sessionManager = require('../session/manager');
+const { isFatalError, markAgentFatal, isAgentFatal } = require('../utils/fatal-errors');
 
 const ROOT = path.resolve(__dirname, '..', '..');
 
@@ -124,8 +127,10 @@ class AgentRuntime {
       throw new Error('Default agent (克劳德) is offline');
     }
 
+    agent._busyCount = (agent._busyCount || 0) + 1;
     agent.busy = true;
     agent.current_task = task.task_id;
+    sessionManager.get(task.task_id) && sessionManager.get(task.task_id).occupyAgent('克劳德');
 
     try {
       const input = {
@@ -140,8 +145,12 @@ class AgentRuntime {
       const result = await agent.adapter.execute(input, onChunk);
       return result;
     } finally {
-      agent.busy = false;
-      agent.current_task = null;
+      agent._busyCount = Math.max(0, (agent._busyCount || 1) - 1);
+      if (agent._busyCount === 0) {
+        agent.busy = false;
+        agent.current_task = null;
+      }
+      sessionManager.get(task.task_id) && sessionManager.get(task.task_id).releaseAgent('克劳德');
     }
   }
 
@@ -167,35 +176,105 @@ class AgentRuntime {
    */
   async executeTaskWithAgent(task, history, agentName, onChunk) {
     const agent = this.agents.get(agentName);
+    const _fatalFail = () => {
+      const msg = `模型 ${agentName} 处于致命错误熔断中（如余额不足/鉴权失败），已跳过调用`;
+      console.warn(`[AgentRuntime] ${msg}`);
+      return {
+        task_id: task.task_id, status: 'failed', content: '',
+        output_files: [], error: { code: 'FATAL', message: msg }, tokens_used: 0, duration_ms: 0,
+      };
+    };
     if (!agent || !agent.adapter) {
-      // 回退到克劳德
+      // 回退到克劳德（回退目标也熔断则直接失败，不再烧调用）
+      if (isAgentFatal('克劳德')) return _fatalFail();
       console.warn(`[AgentRuntime] Agent "${agentName}" not available, falling back to 克劳德`);
       return this.executeTask(task, history, onChunk);
     }
+    if (isAgentFatal(agentName)) return _fatalFail();
     if (!agent.online) {
+      if (isAgentFatal('克劳德')) return _fatalFail();
       console.warn(`[AgentRuntime] Agent "${agentName}" is offline, falling back to 克劳德`);
       return this.executeTask(task, history, onChunk);
     }
 
+    // 多对话可同时使用同一模型 CLI：不设 BUSY 闸门，直接并发调用
+    // （每次调用都 spawn 新的 CLI 进程）。busy 用计数维护，保证并发时
+    // 一个调用结束不会误清其他调用的 busy 状态。
+    agent._busyCount = (agent._busyCount || 0) + 1;
     agent.busy = true;
     agent.current_task = task.task_id;
+    sessionManager.get(task.task_id).occupyAgent(agentName);
+
+    // ===== function calling 循环（伪 FC：工具 schema 注入 prompt + 解析 [TOOL_CALL] 块）=====
+    // skill 内部调用（dimension split/research/draft/review/final）设 disableTools 防递归
+    const disableTools = !!task.disableTools;
+    const MAX_TOOL_ROUNDS = 5;
+    let currentInstruction = task.instruction || this._buildInstruction(task, history);
+    let currentContext = task.context || `任务名称: ${task.name}\n任务描述: ${task.description || '无'}\n难度等级: ${task.difficulty || '未知'}\n任务类型: ${task.task_type || 'development'}`;
+    const toolPrompt = (disableTools || !toolRegistry) ? '' : toolRegistry.getToolPrompt();
 
     try {
-      const input = {
-        task_id: task.task_id,
-        role: task.role || 'executor',
-        context: task.context || `任务名称: ${task.name}\n任务描述: ${task.description || '无'}\n难度等级: ${task.difficulty || '未知'}\n任务类型: ${task.task_type || 'development'}`,
-        instruction: task.instruction || this._buildInstruction(task, history),
-        input_files: task.input_files || [],
-        max_tokens: task.max_tokens || 4096,
-      };
+      for (let round = 0; round <= MAX_TOOL_ROUNDS; round++) {
+        // 工具说明直接拼入 context（适配器内置 _buildPrompt 会渲染为任务背景），
+        // 不再经过 PromptManager（Prompt 分层管理已回退）
+        const effectiveContext = (toolPrompt ? toolPrompt + '\n\n' : '') + currentContext;
+        const baseInput = {
+          task_id: task.task_id,
+          role: task.role || 'executor',
+          context: effectiveContext,
+          instruction: currentInstruction,
+          input_files: task.input_files || [],
+          max_tokens: task.max_tokens || 4096,
+        };
 
-      const result = await agent.adapter.execute(input, onChunk);
-      return result;
+        const result = await agent.adapter.execute(baseInput, onChunk);
+
+        // 解析工具调用（disableTools 或 skill 内部调用不解析）
+        if (disableTools || !toolRegistry) return result;
+        const parsed = toolRegistry.parseToolCallsFromText(result && result.content);
+        if (!parsed) return result; // 无工具调用，正常回复
+
+        const toolCalls = parsed.tool_calls;
+        console.log(`[AgentRuntime] 模型调用工具（round ${round}）:`, toolCalls.map(t => t.name).join(','));
+        // 执行工具
+        const toolResults = [];
+        for (const tc of toolCalls) {
+          const out = await toolRegistry.execute(tc.name, tc.arguments, { agentName, task, runtime: this });
+          toolResults.push(`[工具结果: ${tc.name}]\n${out}`);
+          // 流式透传工具结果给前端
+          if (onChunk) { try { onChunk(`\n\n[工具 ${tc.name} 已执行，结果如下]\n${out.slice(0, 200)}…\n\n`); } catch (e) {} }
+        }
+
+        // 构建下一轮指令：保留模型已生成文本 + 工具结果，让模型据此继续
+        const prevText = parsed.remaining || '';
+        currentContext = `${baseInput.context}\n\n=== 已调用工具 ===\n${toolResults.join('\n\n')}`;
+        currentInstruction = `你刚才调用了工具并收到了以下结果，请据此完成最终回复（不要再重复调用同一工具）：\n\n${toolResults.join('\n\n')}\n\n${prevText ? `你此前已生成的回复（供参考，可继续完善）：\n${prevText}` : ''}`;
+      }
+      // 超过最大轮数，返回最后一次结果
+      console.warn('[AgentRuntime] 工具调用轮数超过上限，返回当前结果');
+      return await this._executeOnce(agent, task, currentContext, currentInstruction, onChunk, agentName);
     } finally {
-      agent.busy = false;
-      agent.current_task = null;
+      // busy 计数递减：并发调用全部结束后才置空闲
+      agent._busyCount = Math.max(0, (agent._busyCount || 1) - 1);
+      if (agent._busyCount === 0) {
+        agent.busy = false;
+        agent.current_task = null;
+      }
+      sessionManager.get(task.task_id) && sessionManager.get(task.task_id).releaseAgent(agentName);
     }
+  }
+
+  /** 单次执行（无工具循环），用于上限兜底 */
+  async _executeOnce(agent, task, context, instruction, onChunk, agentName) {
+    const baseInput = {
+      task_id: task.task_id,
+      role: task.role || 'executor',
+      context,
+      instruction,
+      input_files: task.input_files || [],
+      max_tokens: task.max_tokens || 4096,
+    };
+    return agent.adapter.execute(baseInput, onChunk);
   }
 
   /**

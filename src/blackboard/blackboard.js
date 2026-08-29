@@ -223,5 +223,4 @@ function _parseValue(v) {
 }
 
 module.exports = new Blackboard();
-module.exports.Blackboard = Blackboard;
-module.exports._filePath = _filePath;
+

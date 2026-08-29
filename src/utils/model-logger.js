@@ -125,10 +125,6 @@ class ModelLogger {
     }
     return entries;
   }
-
-  /**
-   * 读取最近的 N 条日志
-   */
   static getRecentLogs(count = 100) {
     let allEntries = [];
     for (const root of LOG_ROOTS) {
@@ -139,18 +135,10 @@ class ModelLogger {
     allEntries.sort((a, b) => String(b.timestamp).localeCompare(String(a.timestamp)));
     return allEntries.slice(0, count);
   }
-
-  /**
-   * 按适配器筛选日志
-   */
   static getLogsByAdapter(adapterName, count = 100) {
     const all = this.getRecentLogs(count * 2);
     return all.filter(e => e.adapter === adapterName).slice(0, count);
   }
-
-  /**
-   * 按方向筛选日志（request / response）
-   */
   static getLogsByDirection(direction, count = 100) {
     const all = this.getRecentLogs(count * 2);
     return all.filter(e => e.direction === direction).slice(0, count);

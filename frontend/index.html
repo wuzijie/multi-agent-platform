@@ -361,6 +361,7 @@
       var task = props.task, conversation = props.conversation;
       var onSend = props.onSend, loading = props.loading;
       var onEndConversation = props.onEndConversation;
+      var onStopTask = props.onStopTask;
       var messagesEndRef = props.messagesEndRef, hasActiveConversation = props.hasActiveConversation;
       var agents = props.agents || [];
       var streams = props.streams || {};
@@ -639,9 +640,11 @@
           }),
 
           // 流式输出气泡（仅渲染当前对话任务的流）
+          // 注意：task 为 null（新对话占位/未选中任务）时不显示任何流，
+          // 否则其他对话正在输出的气泡会泄漏进新对话视图（2026-08-27 复现）
           Object.keys(streams).map(function(sid) {
             var st = streams[sid];
-            if (!st || (task && st.task_id !== task.task_id)) return null;
+            if (!st || !task || st.task_id !== task.task_id) return null;
             if (!st.text && !st.agent) return null;
             return h('div', { key: 'stream-' + sid, className: 'flex justify-start slide-up' },
               h('div', { className: 'max-w-[80%] rounded-2xl px-4 py-3 bg-white border border-gray-200 shadow-sm' },
@@ -749,16 +752,28 @@
                     onKeyDown: handleKeyDown,
                     className: 'flex-1 px-4 py-3 border border-gray-200 rounded-xl focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none text-sm resize-none max-h-[200px]'
                   }),
-                  h('button', {
-                    onClick: handleSend, disabled: !input.trim() || loading,
-                    className: 'px-4 py-3 bg-blue-600 text-white rounded-xl font-medium hover:bg-blue-700 disabled:opacity-40 disabled:cursor-not-allowed transition-colors flex-shrink-0'
-                  },
-                    h('svg', { className: 'w-5 h-5', fill:'none', stroke:'currentColor', viewBox:'0 0 24 24' },
-                      h('path', { strokeLinecap:'round', strokeLinejoin:'round', strokeWidth:2, d:'M12 19l9 2-9-18-9 18 9-2zm0 0v-8' })
-                    )
-                  ),
+                  // 模型输出时：发送按钮替换为取消按钮（停止当前对话的任务）
+                  loading
+                    ? h('button', {
+                        onClick: function() { if (onStopTask && task) onStopTask(task.task_id); },
+                        className: 'px-4 py-3 bg-red-500 text-white rounded-xl font-medium hover:bg-red-600 transition-colors flex-shrink-0 flex items-center gap-1.5',
+                        title: '停止当前对话的模型输出'
+                      },
+                        h('svg', { className: 'w-5 h-5', fill:'currentColor', viewBox:'0 0 24 24' },
+                          h('path', { d:'M6 6h12v12H6z' })  // 方块图标=停止
+                        ),
+                        '取消'
+                      )
+                    : h('button', {
+                        onClick: handleSend, disabled: !input.trim(),
+                        className: 'px-4 py-3 bg-blue-600 text-white rounded-xl font-medium hover:bg-blue-700 disabled:opacity-40 disabled:cursor-not-allowed transition-colors flex-shrink-0'
+                      },
+                        h('svg', { className: 'w-5 h-5', fill:'none', stroke:'currentColor', viewBox:'0 0 24 24' },
+                          h('path', { strokeLinecap:'round', strokeLinejoin:'round', strokeWidth:2, d:'M12 19l9 2-9-18-9 18 9-2zm0 0v-8' })
+                        )
+                      ),
                   task && h('button', {
-                    onClick: onEndConversation, disabled: loading,
+                    onClick: onEndConversation,
                     className: 'px-3 py-3 border border-gray-200 text-gray-500 rounded-xl hover:bg-gray-50 hover:border-gray-300 transition-colors flex-shrink-0 text-xs',
                     title: '结束对话'
                   },
@@ -793,8 +808,13 @@
       var convSeqRef = useRef(0);
       var agentsState = useState([]);
       var agents = agentsState[0], setAgents = agentsState[1];
-      var loadingState = useState(false);
-      var loading = loadingState[0], setLoading = loadingState[1];
+      // 按对话维度跟踪"正在执行"的任务（多对话并行：A 执行中不影响新开 B）
+      var busyTasksState = useState({});   // { taskId: true } + { __new__: true }（新对话发送中）
+      var busyTasks = busyTasksState[0], setBusyTasks = busyTasksState[1];
+      var globalBusyState = useState(false); // 全局瞬态操作（如 stop-all）
+      var globalBusy = globalBusyState[0], setGlobalBusy = globalBusyState[1];
+      // 停止中标志：拦截后续 WS 流式事件（kill 进程到 WS 断流有短暂延迟）
+      var stoppingRef = useRef(false);
       // 流式输出气泡：stream_id -> { task_id, agent, text }
       var streamsState = useState({});
       var streams = streamsState[0], setStreams = streamsState[1];
@@ -823,8 +843,11 @@
             if (data.event_type === 'agent:heartbeat') {
               setAgents(data.data || []);
             }
-            // 流式输出：直接更新 streams 状态（渲染增量文本）
+            // 流式输出：仅跟踪当前对话任务的流（避免 A 的输出进入 B 的全局流状态）
+            // 停止中（stop-all）时拦截所有流式事件，防止 kill 后残留 chunk 继续显示
             if (data.event_type === 'agent:stream:start') {
+              if (stoppingRef.current) return;
+              if (!data.data || !activeIdRef.current || data.data.task_id !== activeIdRef.current) return;
               setStreams(function(prev) {
                 var next = Object.assign({}, prev);
                 next[data.data.stream_id] = { task_id: data.data.task_id, agent: data.data.agent, text: '' };
@@ -833,6 +856,8 @@
               return;
             }
             if (data.event_type === 'agent:stream:chunk') {
+              if (stoppingRef.current) return;
+              if (!data.data || !activeIdRef.current || data.data.task_id !== activeIdRef.current) return;
               setStreams(function(prev) {
                 var next = Object.assign({}, prev);
                 if (next[data.data.stream_id]) {
@@ -845,6 +870,8 @@
               return;
             }
             if (data.event_type === 'agent:stream:end') {
+              if (stoppingRef.current) return;
+              if (!data.data || !activeIdRef.current || data.data.task_id !== activeIdRef.current) return;
               // 不立即删除气泡：正文要等 collab:subtask:done -> 写 conversation -> 重新 fetch
               // 才出现，立即删除会出现内容"真空期"（并行执行时 fetch 可能延迟数秒，表现为
               // 模型输出消失、其他模型输出完成后才再次出现）。先标记 done 保留展示，
@@ -903,15 +930,17 @@
           if (mySeq !== convSeqRef.current) return;
           setConversation(data.conversation);
           setActiveTask(data.task);
-          // 对话已含完成的模型输出 -> 清理已完成（done）的流式气泡，完成无缝交接
+          // 对话已含完成的模型输出 -> 立即移除当前任务中已 done 的流式气泡：
+          // 此前用"done 超过 1.5s"才清理，但 fetch 通常发生在 stream:end 后 1.5s 内，
+          // 导致 done 气泡与正文里的正式消息同时出现（重复气泡）。由于 setConversation
+          // 与 setStreams 同一批次渲染，移除后正文已显示内容，无真空期。
           setStreams(function(prev) {
-            var now = Date.now();
             var next = {};
             var changed = false;
             Object.keys(prev).forEach(function(k) {
               var st = prev[k];
-              // done 且结束超过 1.5s 的气泡移除（此时正文几乎必然已渲染，避免视觉跳动）
-              if (st && st.done && now - (st.endedAt || 0) > 1500) { changed = true; return; }
+              // 当前任务且已 done -> 移除（正文已渲染）；其他保留（由 8s 兜底清理）
+              if (st && st.done && st.task_id === taskId) { changed = true; return; }
               next[k] = st;
             });
             return changed ? next : prev;
@@ -992,13 +1021,17 @@
       // Scroll to bottom
       useEffect(function() {
         if (messagesEndRef.current) messagesEndRef.current.scrollIntoView({ behavior: 'smooth' });
-      }, [conversation, loading, streams]);
+      }, [conversation, isTaskLoading(activeTask && activeTask.task_id), streams]);
 
       function handleSend(message, mentionedAgent, resetAgent, discussAgents, collabMode) {
-        setLoading(true);
+        // 按对话维度标记忙碌（新对话未创建前用 __new__，创建后换成真实 task_id），
+        // 避免"对话 A 执行中"把对话 B 的输入也禁掉（多对话并行）
+        var sendKey = activeId || '__new__';
+        setBusyTasks(function(prev) { var n = Object.assign({}, prev); n[sendKey] = true; return n; });
         // 新消息 = 可能触发新的事件驱动回合，先清空右侧任务面板
         setCollabTasks([]);
         (async function() {
+          var newTaskId = null;
           try {
             var discussion = discussAgents && discussAgents.length >= 2 ? discussAgents.map(function(a) { return a.name; }) : null;
             var collab = collabMode || null;
@@ -1016,9 +1049,17 @@
                 executor_agent: agent ? agent.name : undefined
               })});
               var newTask = await createRes.json();
+              newTaskId = newTask.task_id;
               setActiveId(newTask.task_id);
               setActiveTask(newTask);
               setConversation('');
+              // __new__ 已转为真实任务，把忙碌标记转移到新任务上
+              setBusyTasks(function(prev) {
+                var n = Object.assign({}, prev);
+                delete n.__new__;
+                n[newTask.task_id] = true;
+                return n;
+              });
 
               var execRes = await api('/tasks/' + newTask.task_id + '/execute', { method: 'POST', body: JSON.stringify({ message: message, mentioned_agent: agent ? agent.name : undefined, model_cli: agent ? agent.model_cli : undefined, discussion_agents: discussion, collab_mode: collab }) });
               var execData = await execRes.json();
@@ -1029,15 +1070,37 @@
           } catch(e) {
             alert('执行失败: ' + e.message);
           } finally {
-            setLoading(false);
+            // 释放本对话忙碌标记
+            setBusyTasks(function(prev) {
+              var n = Object.assign({}, prev);
+              delete n[sendKey];
+              if (newTaskId) delete n[newTaskId];
+              return n;
+            });
           }
         })();
       }
 
       function handleSelectConversation(taskId) {
         if (taskId === activeId) return;
+        // 立即清空旧对话的展示状态：否则切换瞬间 activeTask 还是旧对话，
+        // ConversationView 会用旧对话的 task/conversation/气泡渲染（串扰）
         setActiveId(taskId);
+        setActiveTask(null);
+        setConversation('');
+        setCollabTasks([]);
+        setStreams({});
         fetchConversation(taskId);
+      }
+
+      // 判断某对话是否正在执行（loading 改为按对话维度）：
+      // - 全局瞬态操作（stop-all）视为全忙
+      // - 有 taskId：看该任务是否在 busyTasks
+      // - 无 taskId（新对话）：看 __new__ 是否在发送中
+      function isTaskLoading(taskId) {
+        if (globalBusy) return true;
+        if (taskId) return !!busyTasks[taskId];
+        return !!busyTasks.__new__;
       }
 
       function handleNewConversation() {
@@ -1045,11 +1108,31 @@
         setActiveTask(null);
         setConversation('');
         setCollabTasks([]);
+        setStreams({});
+      }
+
+      async function handleStopTask(taskId) {
+        // 立即清空流式气泡 + 设置 stopping 标志拦住后续 WS 流式事件
+        setStreams({});
+        setCollabTasks([]);
+        stoppingRef.current = true;
+        try {
+          var res = await api('/tasks/' + taskId + '/stop', { method: 'POST' });
+          var data = await res.json();
+          if (data && data.error) throw new Error(data.error);
+          fetchConversation(taskId);
+          fetchConversations();
+        } catch(e) {
+          alert('停止任务失败: ' + e.message);
+        } finally {
+          stoppingRef.current = false;
+          setBusyTasks(function(prev) { var n = Object.assign({}, prev); delete n[taskId]; return n; });
+        }
       }
 
       async function handleEndConversation() {
         if (!activeId) return;
-        setLoading(true);
+        setBusyTasks(function(prev) { var n = Object.assign({}, prev); n[activeId] = true; return n; });
         try {
           var res = await api('/tasks/' + activeId + '/complete', { method: 'POST' });
           var completedTask = await res.json();
@@ -1059,7 +1142,7 @@
         } catch(e) {
           alert('结束对话失败: ' + e.message);
         } finally {
-          setLoading(false);
+          setBusyTasks(function(prev) { var n = Object.assign({}, prev); delete n[activeId]; return n; });
         }
       }
 
@@ -1114,8 +1197,9 @@
               task: activeTask,
               conversation: conversation,
               onSend: handleSend,
-              loading: loading,
+              loading: isTaskLoading(activeTask && activeTask.task_id),
               onEndConversation: handleEndConversation,
+              onStopTask: handleStopTask,
               messagesEndRef: messagesEndRef,
               hasActiveConversation: !!activeId,
               agents: agents,

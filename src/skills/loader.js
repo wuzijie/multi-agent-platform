@@ -2,12 +2,12 @@
  * Skill 定义加载器
  *
  * Skill 以 .md 文件形式提供（skills/ 目录），格式：
- * - YAML frontmatter：id / name / description / triggers（触发关键词）/ params（执行参数）
- * - 正文：人类可读的技能标准化定义
+ * - YAML frontmatter：id / name / description / params / tool / execution
+ * - 正文：人类可读的技能定义 / 执行指令（prompt 型 skill 直接返回给模型）
  * - 提示词模板：正文中的 ```prompt <name> 代码块，{{变量}} 占位
+ * - 内联脚本：正文中的 ```skill-execute 代码块
  *
- * 引擎（如 src/skills/deep-research.js）启动时加载解析：触发词、参数、提示词
- * 全部来自 md，修改技能无需改代码；md 缺失/解析失败时引擎使用内置兜底。
+ * 引擎（如 ToolRegistry）启动时加载解析。修改技能无需改代码。
  */
 
 const fs = require('fs');
@@ -19,7 +19,8 @@ const SKILLS_DIR = path.join(ROOT, 'skills');
 
 /**
  * 解析单个 Skill md 文件
- * @returns {{file, meta, body, prompts}} meta 为 frontmatter 对象，prompts 为 {name: 模板字符串}
+ * @returns {{file, meta, body, prompts, script}} meta=frontmatter, prompts={name:模板},
+ *   script=内联执行脚本（```skill-execute 代码块内容）或 null
  */
 function parseSkillMd(filePath) {
   const raw = fs.readFileSync(filePath, 'utf8');
@@ -38,7 +39,11 @@ function parseSkillMd(filePath) {
   while ((m = re.exec(body))) {
     prompts[m[1]] = m[2].trim();
   }
-  return { file: filePath, meta, body, prompts };
+  // 内联执行脚本：```skill-execute ... ```（可选，供 ToolRegistry 通用执行）
+  let script = null;
+  const sm = body.match(/```skill-execute[^\n]*\r?\n([\s\S]*?)```/);
+  if (sm) script = sm[1].trim();
+  return { file: filePath, meta, body, prompts, script };
 }
 
 /**
@@ -70,14 +75,4 @@ function loadSkill(id, dir = SKILLS_DIR) {
   return all.get(id) || null;
 }
 
-/**
- * 渲染提示词模板（{{var}} 占位替换）
- */
-function renderTemplate(tpl, vars = {}) {
-  if (!tpl) return '';
-  return tpl.replace(/\{\{\s*([A-Za-z0-9_]+)\s*\}\}/g, (whole, key) => (
-    key in vars ? String(vars[key]) : whole
-  ));
-}
-
-module.exports = { parseSkillMd, loadAllSkills, loadSkill, renderTemplate, SKILLS_DIR };
+module.exports = { parseSkillMd, loadAllSkills, loadSkill };
