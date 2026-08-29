@@ -1,9 +1,9 @@
 const { spawn } = require('child_process');
+const procRegistry = require('../utils/proc-registry');
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
 const ModelLogger = require('../utils/model-logger');
-const { streamChatCompletion } = require('./openai-sse');
 
 const ROOT = path.resolve(__dirname, '..', '..');
 
@@ -90,10 +90,8 @@ class QwenAdapter {
     if (!this._config) {
       this._config = require('../utils/config');
     }
-    // 惰性加载兜底：若配置尚未加载（如独立调用入口遗漏 loadAll），自动补加载
-    if (this._config && (!this._config.apiKeys || Object.keys(this._config.apiKeys).length === 0)) {
-      try { this._config.loadAll(); } catch (e) { /* 忽略重复加载错误 */ }
-    }
+    // 每次调用都重新加载（防止运行中改了 api_keys.yaml 但进程缓存旧值）
+    try { this._config.loadAll(); } catch (e) { /* 忽略重复加载错误 */ }
     return this._config;
   }
 
@@ -165,51 +163,9 @@ class QwenAdapter {
     // 调度器子任务预算 300 秒，适配器需在其内自行返回，避免被 spawn timeout 提前杀死。
     const timeoutMs = Math.max(240000, promptLength * 2 + 30000);
 
-    // 优先：直连 OpenAI 兼容 API 实现真流式（qwen CLI 会缓冲输出）
-    const apiKey = this._getApiKey();
-    const baseUrl = this._getBaseUrl();
-    const directModel = this._getModel() || process.env.QWEN_MODEL || null;
-    if (apiKey && baseUrl && directModel && directModel !== 'qwen-default') {
-      try {
-        const streamed = await streamChatCompletion({
-          baseUrl,
-          apiKey,
-          model: directModel,
-          messages: [{ role: 'user', content: fullPrompt }],
-          timeoutMs,
-          onChunk,
-        });
-        if (streamed.ok && streamed.text) {
-          ModelLogger.logResponse(this.name, directModel, streamed.text);
-          return buildOutput(input.task_id, 'success', streamed.text, {
-            tokens_used: this._estimateTokens(streamed.text),
-            duration_ms: Date.now() - startTime,
-          });
-        }
-        if (streamed.ok && !streamed.text) {
-          ModelLogger.logResponse(this.name, directModel, '(空响应)');
-          return buildOutput(input.task_id, 'failed', '', {
-            error: { code: 'EMPTY_RESPONSE', message: 'API 返回空内容' },
-            duration_ms: Date.now() - startTime,
-          });
-        }
-        // API 直连超时：CLI 走的是同一 API，回退只会再耗一轮，直接按超时失败（走调度器重试）
-        if (streamed.error && streamed.error.includes('超时')) {
-          ModelLogger.logResponse(this.name, directModel, `[API直连超时，直接失败] ${streamed.error}`);
-          return buildOutput(input.task_id, 'failed', '', {
-            error: { code: 'TIMEOUT', message: streamed.error },
-            duration_ms: Date.now() - startTime,
-          });
-        }
-        // API 直连失败（非超时）→ 回退 CLI 路径
-        ModelLogger.logResponse(this.name, directModel, `[API直连失败，回退CLI] ${streamed.error || ''}`);
-      } catch (apiErr) {
-        ModelLogger.logResponse(this.name, directModel, `[API直连异常，回退CLI] ${apiErr.message}`);
-      }
-    }
-
+    // 仅走 CLI（不直连 API）：CLI 内部对接对应 API
     try {
-      const result = await this._runCli(['-p', '-o', 'text'], fullPrompt, timeoutMs, model, onChunk);
+      const result = await this._runCli(['-p', '-o', 'text'], fullPrompt, timeoutMs, model, onChunk, input.task_id);
 
       if (result.exit_code === 0) {
         ModelLogger.logResponse(this.name, model, result.stdout);
@@ -274,7 +230,7 @@ class QwenAdapter {
     return lines.join('\n');
   }
 
-  _runCli(args, prompt, timeoutMs, modelOverride, onChunk) {
+  _runCli(args, prompt, timeoutMs, modelOverride, onChunk, taskId) {
     return new Promise((resolve) => {
       const startAt = Date.now();
       let stdout = '';
@@ -318,6 +274,7 @@ class QwenAdapter {
         timeout: timeoutMs || 120000,
         stdio: ['ignore', 'pipe', 'pipe'],
       });
+      procRegistry.register(proc, taskId);
 
       proc.stdout.on('data', (data) => {
         const chunk = data.toString();
@@ -361,4 +318,4 @@ class QwenAdapter {
   }
 }
 
-module.exports = { QwenAdapter, validateInput, buildOutput };
+module.exports = { QwenAdapter };

@@ -35,11 +35,9 @@ class ConfigLoader {
   getDefaultAgent() {
     return this.agents.find(a => a.default) || this.agents[0] || null;
   }
-
   getAgentByName(name) {
     return this.agents.find(a => a.name === name) || null;
   }
-
   getAgentByCli(cli) {
     return this.agents.find(a => a.model_cli === cli) || null;
   }

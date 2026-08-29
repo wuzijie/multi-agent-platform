@@ -5,4 +5,6 @@ tasks/
 *.pid
 workspace/
 /blackboard/
+# 密钥配置不入库（api_keys.yaml 含真实 API key，曾在历史中暴露，建议轮换）
+config/api_keys.yaml
 # agents/model_cli.log 是请求/响应日志，需要被 git 追踪

@@ -1,4 +1,5 @@
 const { spawn } = require('child_process');
+const procRegistry = require('../utils/proc-registry');
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
@@ -96,10 +97,8 @@ class ClaudeAdapter {
     if (!this._config) {
       this._config = require('../utils/config');
     }
-    // 惰性加载兜底：若配置尚未加载（如独立调用入口遗漏 loadAll），自动补加载
-    if (this._config && (!this._config.apiKeys || Object.keys(this._config.apiKeys).length === 0)) {
-      try { this._config.loadAll(); } catch (e) { /* 忽略重复加载错误 */ }
-    }
+    // 每次调用都重新加载配置（防止运行中改了 api_keys.yaml 但进程缓存旧值）
+    try { this._config.loadAll(); } catch (e) { /* 忽略重复加载错误 */ }
     return this._config;
   }
 
@@ -235,7 +234,7 @@ class ClaudeAdapter {
 
     try {
       // 先尝试流式模式
-      const streamed = await this._runStreamingCli(streamArgs, fullPrompt, timeoutMs, onChunk);
+      const streamed = await this._runStreamingCli(streamArgs, fullPrompt, timeoutMs, onChunk, input.task_id);
 
       if (streamed.exit_code === 0 && streamed.streamed_ok && streamed.text) {
         ModelLogger.logResponse(this.name, model, streamed.text);
@@ -278,7 +277,7 @@ class ClaudeAdapter {
       // stream-json 成功退出但没有解析到事件（旧版 CLI 等）→ 回退 text 模式
       // 注意：streamed.text 为空，因此不会有已推送的增量需要去重
       ModelLogger.logResponse(this.name, model, '[stream-json 无事件输出，回退 text 模式]');
-      const result = await this._runCli(textArgs, fullPrompt, timeoutMs, onChunk);
+      const result = await this._runCli(textArgs, fullPrompt, timeoutMs, onChunk, input.task_id);
 
       if (result.exit_code === 0) {
         ModelLogger.logResponse(this.name, model, result.stdout);
@@ -364,7 +363,51 @@ class ClaudeAdapter {
     if (modelOverride) {
       env.ANTHROPIC_MODEL = modelOverride;
     }
+    // 同步 ~/.claude/ 下的 API key 到 config 一致（静默，不打印）
+    this._syncSettingsKey(apiKey, baseUrl);
     return env;
+  }
+
+  /**
+   * 同步 ~/.claude/ 下所有可能存 key 的文件到 config 一致（静默）
+   */
+  _syncSettingsKey(apiKey) {
+    if (!apiKey) return;
+    const home = this.realHome;
+    // 检查所有可能的配置文件
+    const candidates = [
+      path.join(home, '.claude', 'settings.json'),
+      path.join(home, '.claude.json'),
+      path.join(home, '.claude', 'config.json'),
+    ];
+    for (const settingsPath of candidates) {
+      try {
+        if (!fs.existsSync(settingsPath)) continue;
+        const raw = fs.readFileSync(settingsPath, 'utf8');
+        if (!raw.trim()) continue;
+        const settings = JSON.parse(raw);
+        let changed = false;
+        // 递归查找并替换所有 sk- 开头的旧 key
+        const replaceKey = (obj) => {
+          if (!obj || typeof obj !== 'object') return;
+          for (const k of Object.keys(obj)) {
+            const v = obj[k];
+            if (typeof v === 'string' && v.startsWith('sk-') && v !== apiKey && v.length > 20) {
+              obj[k] = apiKey;
+              changed = true;
+            } else if (typeof v === 'object') {
+              replaceKey(v);
+            }
+          }
+        };
+        replaceKey(settings);
+        if (changed) {
+          fs.writeFileSync(settingsPath, JSON.stringify(settings, null, 2));
+        }
+      } catch (e) {
+        // 静默失败：settings.json 读取/写入失败不影响主流程（env var 仍传了新 key）
+      }
+    }
   }
 
   /**
@@ -378,7 +421,7 @@ class ClaudeAdapter {
    * - 跳过 hooks, LSP, plugins, auto-memory, CLAUDE.md 发现
    * - 减少启动延迟，适合编程式调用
    */
-  _runCli(args, prompt, timeoutMs, onChunk) {
+  _runCli(args, prompt, timeoutMs, onChunk, taskId) {
     return new Promise((resolve) => {
       const startAt = Date.now();
       let stdout = '';
@@ -397,6 +440,7 @@ class ClaudeAdapter {
         timeout: timeoutMs || 120000,
         stdio: ['ignore', 'pipe', 'pipe'],
       });
+      procRegistry.register(proc, taskId);
 
       proc.stdout.on('data', (data) => {
         const chunk = data.toString();
@@ -453,7 +497,7 @@ class ClaudeAdapter {
    *  - text：从事件中提取的完整回答文本
    *  - streamed_ok：是否成功解析到 JSON 事件（false 时调用方应回退 text 模式）
    */
-  _runStreamingCli(args, prompt, timeoutMs, onChunk) {
+  _runStreamingCli(args, prompt, timeoutMs, onChunk, taskId) {
     return new Promise((resolve) => {
       const startAt = Date.now();
       let stderr = '';
@@ -547,6 +591,7 @@ class ClaudeAdapter {
         timeout: timeoutMs || 120000,
         stdio: ['ignore', 'pipe', 'pipe'],
       });
+      procRegistry.register(proc, taskId);
 
       proc.stdout.on('data', (data) => {
         buf += data.toString();
@@ -599,4 +644,4 @@ class ClaudeAdapter {
   }
 }
 
-module.exports = { ClaudeAdapter, validateUnifiedInput, buildUnifiedOutput };
+module.exports = { ClaudeAdapter };

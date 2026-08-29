@@ -1,4 +1,5 @@
 const { spawn } = require('child_process');
+const procRegistry = require('../utils/proc-registry');
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
@@ -113,6 +114,8 @@ class KimiAdapter {
     if (!this._config) {
       this._config = require('../utils/config');
     }
+    // 每次调用都重新加载（防止运行中改了 api_keys.yaml 但进程缓存旧值）
+    try { this._config.loadAll(); } catch (e) { /* 忽略重复加载错误 */ }
     return this._config;
   }
 
@@ -231,7 +234,7 @@ class KimiAdapter {
     const timeoutMs = Math.max(240000, promptLength * 2 + 30000);
 
     try {
-      const result = await this._runCli(args, fullPrompt, timeoutMs, onChunk);
+      const result = await this._runCli(args, fullPrompt, timeoutMs, onChunk, input.task_id);
 
       if (result.exit_code === 0) {
         // 使用 text 格式，stdout 直接就是内容；仍然尝试 stream-json 解析以兼容
@@ -347,7 +350,7 @@ class KimiAdapter {
   /**
    * 执行 CLI 命令
    */
-  _runCli(args, prompt, timeoutMs, onChunk) {
+  _runCli(args, prompt, timeoutMs, onChunk, taskId) {
     return new Promise((resolve) => {
       const startAt = Date.now();
       let stdout = '';
@@ -378,6 +381,7 @@ class KimiAdapter {
         timeout: timeoutMs || 120000,
         stdio: ['ignore', 'pipe', 'pipe'],
       });
+      procRegistry.register(proc, taskId);
 
       proc.stdout.on('data', (data) => {
         const chunk = data.toString();
@@ -427,4 +431,4 @@ class KimiAdapter {
   }
 }
 
-module.exports = { KimiAdapter, validateKimiInput, buildKimiOutput };
+module.exports = { KimiAdapter };
