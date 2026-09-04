@@ -4,8 +4,8 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>多智能体协作平台</title>
-  <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
-  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="/vendor/react.production.min.js"></script>
+  <script src="/vendor/react-dom.production.min.js"></script>
   <script src="https://cdn.tailwindcss.com"></script>
   <script>
     tailwind.config = {
@@ -79,6 +79,12 @@
   <div id="root"></div>
 
   <script>
+    window.onerror = function(msg, src, line, col, err) {
+      var d = document.getElementById('root');
+      if (d) d.innerHTML = '<div style="padding:30px;font-family:monospace;color:#dc2626;font-size:13px;white-space:pre-wrap">JS ERROR: ' + msg + '\nat ' + src + ':' + line + ':' + col + '\n\n' + (err && err.stack ? err.stack : '') + '</div>';
+      console.error('[Frontend Error]', msg, src, line, col, err);
+      return true;
+    };
     'use strict';
     const { createElement: h, useState, useEffect, useRef, useCallback, Fragment } = React;
 
@@ -365,8 +371,6 @@
       var messagesEndRef = props.messagesEndRef, hasActiveConversation = props.hasActiveConversation;
       var agents = props.agents || [];
       var streams = props.streams || {};
-      var collabModeState = useState('auto'); // 'auto' | 'event-driven'
-      var collabMode = collabModeState[0], setCollabMode = collabModeState[1];
       var inputRef = useRef(null);
       var inputState = useState('');
       var input = inputState[0], setInput = inputState[1];
@@ -452,7 +456,7 @@
           dismissedRef.current = false;
         }
         // 传递所有被@的 Agent（1个=普通模式，2个及以上=讨论模式）
-        onSend(cleanMsg, atAgent, resetAgent, atAgents.length >= 2 ? atAgents : null, collabMode);
+        onSend(cleanMsg, atAgent, resetAgent, atAgents.length >= 2 ? atAgents : null);
       }
 
       function handleKeyDown(e) {
@@ -700,20 +704,6 @@
                     }, '×')
                   )
                 ),
-                // 协作模式选择
-                h('div', { className: 'mb-2 flex items-center gap-1.5' },
-                  h('span', { className: 'text-xs text-gray-400 mr-1' }, '协作:'),
-                  [['auto', '自动'], ['event-driven', '事件驱动']].map(function(pair) {
-                    var mode = pair[0], label = pair[1];
-                    return h('button', {
-                      key: mode,
-                      onClick: function() { setCollabMode(mode); },
-                      title: mode === 'event-driven' ? '调度器拆解DAG（规划→执行→评审→汇总），按事件驱动调度' : '@多Agent=讨论模式，否则单Agent',
-                      className: 'text-xs px-2 py-1 rounded-md transition-colors ' +
-                        (collabMode === mode ? 'bg-blue-600 text-white shadow-sm' : 'bg-gray-100 text-gray-600 hover:bg-gray-200')
-                    }, label);
-                  })
-                ),
                 h('div', { className: 'flex items-end gap-2', style: { position: 'relative' } },
                   // @mention dropdown
                   showMention && agents.length > 0 && h('div', { className: 'mention-dropdown' },
@@ -806,6 +796,12 @@
       // 对话刷新序号：协作期间多个 fetch 并发，响应可能乱序返回，
       // 早发出的旧响应（不含刚写入的中间结果）后到时不能覆盖新状态
       var convSeqRef = useRef(0);
+      // 当前已展示对话文本长度：conversation.md 只追加不截断，长度单调增长。
+      // 用长度判断 fetch 快照是否过期（"触发较晚但读取较早"的响应内容更短），
+      // 防止旧快照覆盖刚写入的新内容（表现为模型输出先消失、下次 fetch 才复现）。
+      var convLenRef = useRef(0);
+      // 供 WS 流结束事件与兜底逻辑取用最新的 fetchConversation（各次渲染返回同一函数）
+      var fetchConversationRef = useRef(null);
       var agentsState = useState([]);
       var agents = agentsState[0], setAgents = agentsState[1];
       // 按对话维度跟踪"正在执行"的任务（多对话并行：A 执行中不影响新开 B）
@@ -818,6 +814,8 @@
       // 流式输出气泡：stream_id -> { task_id, agent, text }
       var streamsState = useState({});
       var streams = streamsState[0], setStreams = streamsState[1];
+      // streams 最新值镜像（供定时器在 setState 提交前同步读取当前气泡状态）
+      var streamsRef = useRef({});
       // 事件驱动协作：右侧任务面板子任务状态
       var collabTasksState = useState([]); // [{ sub_task_id, type, status, agent, input }]
       var collabTasks = collabTasksState[0], setCollabTasks = collabTasksState[1];
@@ -876,6 +874,7 @@
               // 才出现，立即删除会出现内容"真空期"（并行执行时 fetch 可能延迟数秒，表现为
               // 模型输出消失、其他模型输出完成后才再次出现）。先标记 done 保留展示，
               // 待对话刷新成功（fetchConversation 内清理）后再移除。
+              var endTaskId = data.data.task_id;
               setStreams(function(prev) {
                 var next = Object.assign({}, prev);
                 if (next[data.data.stream_id]) {
@@ -883,6 +882,14 @@
                 }
                 return next;
               });
+              // 该模型输出流结束后主动触发一次对话调和：待服务端把该输出写入 conversation
+              // 后（紧随其后），用正文替换"已完成"气泡。避免在讨论/Swarm 等并发场景里
+              // 依赖"其他模型的完成事件"才刷新，导致已完成气泡长时间不转正式消息。
+              setTimeout(function() {
+                if (!stoppingRef.current && activeIdRef.current === endTaskId && fetchConversationRef.current) {
+                  fetchConversationRef.current(endTaskId);
+                }
+              }, 600);
               return;
             }
             // 事件驱动协作：子任务状态更新（右侧任务面板，只接收当前对话任务的事件）
@@ -922,25 +929,40 @@
       }, []);
 
       var fetchConversation = useCallback(async function(taskId) {
+        if (!taskId) return; // 无有效任务 id 时不请求（避免 /api/tasks/undefined/... 404）
         var mySeq = ++convSeqRef.current;
         try {
           var res = await api('/tasks/' + taskId + '/conversation');
           var data = await res.json();
-          // 丢弃过期响应：乱序返回的旧响应会覆盖掉刚展示的中间结果（表现为结果"消失"）
-          if (mySeq !== convSeqRef.current) return;
-          setConversation(data.conversation);
+          // 只接受仍处于"当前对话"的响应：切换/删除对话后，丢弃旧任务在途请求的迟到结果，防串扰
+          if (taskId !== activeIdRef.current) return;
+          // 对话单调增长保护：conversation.md 只追加、长度只增不减。并发 fetch 时，
+          // "触发较晚但读取较早"的响应内容更短；若应用它会覆盖掉刚写入/刚展示的新内容
+          // （模型输出先消失、下次 fetch 才复现）。因此比当前已展示更短的快照一律丢弃，
+          // 不再用"是否最后一次触发"来判断（序号最新的响应未必读取到最新内容）。
+          var convText = data.conversation || '';
+          if (convText.length < convLenRef.current) return;
+          // 快照不比当前短即视为有效：写入对话/任务并推进长度水位。
+          // 等长=内容未变，重复写入无害（顺带刷新任务状态等头部元信息）。
+          convLenRef.current = convText.length;
+          setConversation(convText);
           setActiveTask(data.task);
-          // 对话已含完成的模型输出 -> 立即移除当前任务中已 done 的流式气泡：
-          // 此前用"done 超过 1.5s"才清理，但 fetch 通常发生在 stream:end 后 1.5s 内，
-          // 导致 done 气泡与正文里的正式消息同时出现（重复气泡）。由于 setConversation
-          // 与 setStreams 同一批次渲染，移除后正文已显示内容，无真空期。
+          // 清理已完成（done）的流式气泡：仅当 conversation 已包含该气泡内容时才移除，
+          // 避免两个问题：
+          // 1) 正文未写入时误删 -> 输出消失（真空期，等下次 fetch 才出现）
+          // 2) 正文已写入但不删 -> 与正文重复（重复气泡）
+          // 用气泡 text 前 40 字符（去空白）在 conversation 中匹配，命中才认为已写入。
+          var convNoSpace = convText.replace(/\s+/g, '');
           setStreams(function(prev) {
             var next = {};
             var changed = false;
             Object.keys(prev).forEach(function(k) {
               var st = prev[k];
-              // 当前任务且已 done -> 移除（正文已渲染）；其他保留（由 8s 兜底清理）
-              if (st && st.done && st.task_id === taskId) { changed = true; return; }
+              if (st && st.done && st.task_id === taskId) {
+                var sample = (st.text || '').slice(0, 40).replace(/\s+/g, '');
+                if (sample && convNoSpace.indexOf(sample) >= 0) { changed = true; return; }
+                // 未匹配 -> 正文尚未写入，保留气泡（待后续 fetch 命中后再移除，绝不提前删）
+              }
               next[k] = st;
             });
             return changed ? next : prev;
@@ -948,6 +970,7 @@
         } catch(e) { console.error(e); }
         // 拉取事件驱动协作任务列表（右侧面板）
         try {
+          if (taskId !== activeIdRef.current) return;
           var cres = await api('/tasks/' + taskId + '/collab/state');
           var cdata = await cres.json();
           if (mySeq !== convSeqRef.current) return;
@@ -968,6 +991,9 @@
         } catch(e) { console.error(e); }
       }, []);
 
+      // 供 WS 流结束事件/兜底取用：useCallback 依赖为空，各次渲染返回同一函数，赋一次即可
+      fetchConversationRef.current = fetchConversation;
+
       var fetchAgents = useCallback(async function() {
         try {
           var res = await api('/agents');
@@ -978,22 +1004,29 @@
 
       useEffect(function() { fetchConversations(); fetchAgents(); }, []);
 
-      // 兜底清理：异常结束的流（如重试失败）不会再触发对话刷新，
-      // done 气泡若残留超过 8s 则强制移除
+      // streams 最新值镜像：供兜底调和定时器在 setState 提交前同步读取气泡状态
+      useEffect(function() { streamsRef.current = streams; }, [streams]);
+
+      // 兜底调和（不再无条件强删 done 气泡——那会造成"正文尚未写入、气泡先消失，
+      // 下次 fetch 正文写入后才复现"）。当某"已完成"气泡停留超过 4s 仍未转入正式消息时，
+      // 主动触发一次对话 fetch；fetchConversation 内只有确认正文已包含该气泡内容才移除，
+      // 正文迟迟未写入时气泡保留（输出持续可见），等待后续事件/下一次调和。
+      // 调和只持续到气泡完成后的前 60s，避免内容永久无法落库时无限轮询。
       useEffect(function() {
         var t = setInterval(function() {
-          setStreams(function(prev) {
-            var now = Date.now();
-            var next = {};
-            var changed = false;
-            Object.keys(prev).forEach(function(k) {
-              var st = prev[k];
-              if (st && st.done && now - (st.endedAt || 0) > 8000) { changed = true; return; }
-              next[k] = st;
-            });
-            return changed ? next : prev;
+          var now = Date.now();
+          var sts = streamsRef.current || {};
+          var target = null;
+          Object.keys(sts).forEach(function(k) {
+            var st = sts[k];
+            if (!st || !st.done || !st.task_id) return;
+            var age = now - (st.endedAt || 0);
+            if (age > 4000 && age < 60000) target = st.task_id;
           });
-        }, 3000);
+          if (target && target === activeIdRef.current && !stoppingRef.current && fetchConversationRef.current) {
+            fetchConversationRef.current(target);
+          }
+        }, 4000);
         return function() { clearInterval(t); };
       }, []);
 
@@ -1023,20 +1056,33 @@
         if (messagesEndRef.current) messagesEndRef.current.scrollIntoView({ behavior: 'smooth' });
       }, [conversation, isTaskLoading(activeTask && activeTask.task_id), streams]);
 
-      function handleSend(message, mentionedAgent, resetAgent, discussAgents, collabMode) {
+      function handleSend(message, mentionedAgent, resetAgent, discussAgents) {
         // 按对话维度标记忙碌（新对话未创建前用 __new__，创建后换成真实 task_id），
         // 避免"对话 A 执行中"把对话 B 的输入也禁掉（多对话并行）
         var sendKey = activeId || '__new__';
         setBusyTasks(function(prev) { var n = Object.assign({}, prev); n[sendKey] = true; return n; });
         // 新消息 = 可能触发新的事件驱动回合，先清空右侧任务面板
         setCollabTasks([]);
+        // 新一轮消息：清掉当前对话上一轮残留的"已完成"流式气泡（其正文已随上一轮 fetch
+        // 写入对话），避免与新一轮模型的并发输出并存导致重复/错位；仍在流式中的不受影响
+        if (activeId) {
+          setStreams(function(prev) {
+            var next = {};
+            var changed = false;
+            Object.keys(prev).forEach(function(k) {
+              var st = prev[k];
+              if (st && st.task_id === activeId && st.done) { changed = true; return; }
+              next[k] = st;
+            });
+            return changed ? next : prev;
+          });
+        }
         (async function() {
           var newTaskId = null;
           try {
             var discussion = discussAgents && discussAgents.length >= 2 ? discussAgents.map(function(a) { return a.name; }) : null;
-            var collab = collabMode || null;
             if (activeId) {
-              var res = await api('/tasks/' + activeId + '/chat', { method: 'POST', body: JSON.stringify({ message: message, mentioned_agent: mentionedAgent ? mentionedAgent.name : (resetAgent ? '克劳德' : undefined), model_cli: mentionedAgent ? mentionedAgent.model_cli : undefined, discussion_agents: discussion, collab_mode: collab }) });
+              var res = await api('/tasks/' + activeId + '/chat', { method: 'POST', body: JSON.stringify({ message: message, mentioned_agent: mentionedAgent ? mentionedAgent.name : (resetAgent ? '克劳德' : undefined), model_cli: mentionedAgent ? mentionedAgent.model_cli : undefined, discussion_agents: discussion }) });
               var data = await res.json();
               if (data.task) setActiveTask(data.task);
               fetchConversation(activeId);
@@ -1049,10 +1095,13 @@
                 executor_agent: agent ? agent.name : undefined
               })});
               var newTask = await createRes.json();
+              if (!newTask || !newTask.task_id) throw new Error('创建对话失败：未返回有效的任务ID');
               newTaskId = newTask.task_id;
               setActiveId(newTask.task_id);
+              activeIdRef.current = newTask.task_id; // 同步更新：在途 fetch/WS 立刻以新任务为准
               setActiveTask(newTask);
               setConversation('');
+              convLenRef.current = 0; // 对话已清空，长度水位重置
               // __new__ 已转为真实任务，把忙碌标记转移到新任务上
               setBusyTasks(function(prev) {
                 var n = Object.assign({}, prev);
@@ -1061,7 +1110,7 @@
                 return n;
               });
 
-              var execRes = await api('/tasks/' + newTask.task_id + '/execute', { method: 'POST', body: JSON.stringify({ message: message, mentioned_agent: agent ? agent.name : undefined, model_cli: agent ? agent.model_cli : undefined, discussion_agents: discussion, collab_mode: collab }) });
+              var execRes = await api('/tasks/' + newTask.task_id + '/execute', { method: 'POST', body: JSON.stringify({ message: message, mentioned_agent: agent ? agent.name : undefined, model_cli: agent ? agent.model_cli : undefined, discussion_agents: discussion }) });
               var execData = await execRes.json();
               if (execData.task) setActiveTask(execData.task);
               fetchConversation(newTask.task_id);
@@ -1086,8 +1135,10 @@
         // 立即清空旧对话的展示状态：否则切换瞬间 activeTask 还是旧对话，
         // ConversationView 会用旧对话的 task/conversation/气泡渲染（串扰）
         setActiveId(taskId);
+        activeIdRef.current = taskId; // 同步更新，丢弃旧对话在途 fetch/WS 的迟到结果
         setActiveTask(null);
         setConversation('');
+        convLenRef.current = 0;
         setCollabTasks([]);
         setStreams({});
         fetchConversation(taskId);
@@ -1105,8 +1156,10 @@
 
       function handleNewConversation() {
         setActiveId(null);
+        activeIdRef.current = null; // 同步更新
         setActiveTask(null);
         setConversation('');
+        convLenRef.current = 0;
         setCollabTasks([]);
         setStreams({});
       }
@@ -1157,8 +1210,10 @@
           }
           if (activeId === taskId) {
             setActiveId(null);
+            activeIdRef.current = null; // 同步更新
             setActiveTask(null);
             setConversation('');
+            convLenRef.current = 0;
           }
           fetchConversations();
         } catch(e) { alert('删除失败: ' + e.message); }

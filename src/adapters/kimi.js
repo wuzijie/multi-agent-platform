@@ -215,7 +215,16 @@ class KimiAdapter {
 
     // 获取当前使用的模型名称
     const model = this._getModel() || process.env.KIMI_MODEL || 'kimi-default';
-    ModelLogger.logRequest(this.name, model, fullPrompt);
+    // 请求链路追踪元信息
+    const meta = {
+      task_id: input.task_id || '',
+      trace_id: input.trace_id || '',
+      external_task_id: input.external_task_id || '',
+      agent_name: input.agent_name || '',
+      phase: input.phase || 'initial',
+      attempt: input.attempt || 1,
+    };
+    const requestId = ModelLogger.logRequest(this.name, model, fullPrompt, meta);
 
     // 构建 CLI 参数（--output-format 需要 = 符号连接值）
     const args = [
@@ -234,15 +243,22 @@ class KimiAdapter {
     const timeoutMs = Math.max(240000, promptLength * 2 + 30000);
 
     try {
-      const result = await this._runCli(args, fullPrompt, timeoutMs, onChunk, input.task_id);
+      const result = await this._runCli(args, fullPrompt, timeoutMs, onChunk, input.external_task_id || input.task_id);
 
       if (result.exit_code === 0) {
         // 使用 text 格式，stdout 直接就是内容；仍然尝试 stream-json 解析以兼容
         const content = result.stdout ? this._parseStreamJson(result.stdout) : '';
-        ModelLogger.logResponse(this.name, model, content);
-        return buildKimiOutput(input.task_id, 'success', content, {
+        ModelLogger.logResponse(this.name, model, content, {
+          ...meta, request_id: requestId, status: content ? 'success' : 'failed',
+          error_code: content ? '' : 'EMPTY_RESPONSE',
+          error_message: content ? '' : '模型返回空内容',
+          duration_ms: Date.now() - startTime, exit_code: result.exit_code,
+          killed_by_timeout: false, stream_ok: null,
+        });
+        return buildKimiOutput(input.task_id, content ? 'success' : 'failed', content, {
           tokens_used: this._estimateTokens(content),
           duration_ms: Date.now() - startTime,
+          error: content ? undefined : { code: 'EMPTY_RESPONSE', message: '模型返回空内容' },
         });
       } else {
         let errMsg;
@@ -258,14 +274,23 @@ class KimiAdapter {
             errorCode = 'TIMEOUT';
           }
         }
-        ModelLogger.logResponse(this.name, model, errMsg);
+        ModelLogger.logResponse(this.name, model, errMsg, {
+          ...meta, request_id: requestId, status: 'failed', error_code: errorCode,
+          error_message: String(errMsg).substring(0, 500), duration_ms: Date.now() - startTime,
+          exit_code: result.exit_code, killed_by_timeout: result.killed_by_timeout,
+          stream_ok: null,
+        });
         return buildKimiOutput(input.task_id, 'failed', result.stdout || '', {
           error: { code: errorCode, message: errMsg.substring(0, 500) },
           duration_ms: Date.now() - startTime,
         });
       }
     } catch (e) {
-      ModelLogger.logResponse(this.name, model, e.message);
+      ModelLogger.logResponse(this.name, model, e.message, {
+        ...meta, request_id: requestId, status: 'failed', error_code: 'EXECUTION_ERROR',
+        error_message: String(e.message).substring(0, 500), duration_ms: Date.now() - startTime,
+        exit_code: null, killed_by_timeout: false, stream_ok: null,
+      });
       return buildKimiOutput(input.task_id, 'failed', '', {
         error: { code: 'EXECUTION_ERROR', message: e.message },
         duration_ms: Date.now() - startTime,

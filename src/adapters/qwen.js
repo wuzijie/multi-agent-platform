@@ -156,7 +156,16 @@ class QwenAdapter {
     }
 
     const model = this._getModel() || process.env.QWEN_MODEL || 'qwen-default';
-    ModelLogger.logRequest(this.name, model, fullPrompt);
+    // 请求链路追踪元信息
+    const meta = {
+      task_id: input.task_id || '',
+      trace_id: input.trace_id || '',
+      external_task_id: input.external_task_id || '',
+      agent_name: input.agent_name || '',
+      phase: input.phase || 'initial',
+      attempt: input.attempt || 1,
+    };
+    const requestId = ModelLogger.logRequest(this.name, model, fullPrompt, meta);
 
     const promptLength = fullPrompt.length;
     // 下限 240 秒：慢模型完成长任务常超过 60 秒。
@@ -165,10 +174,14 @@ class QwenAdapter {
 
     // 仅走 CLI（不直连 API）：CLI 内部对接对应 API
     try {
-      const result = await this._runCli(['-p', '-o', 'text'], fullPrompt, timeoutMs, model, onChunk, input.task_id);
+      const result = await this._runCli(['-p', '-o', 'text'], fullPrompt, timeoutMs, model, onChunk, input.external_task_id || input.task_id);
 
       if (result.exit_code === 0) {
-        ModelLogger.logResponse(this.name, model, result.stdout);
+        ModelLogger.logResponse(this.name, model, result.stdout, {
+          ...meta, request_id: requestId, status: 'success',
+          duration_ms: Date.now() - startTime, exit_code: result.exit_code,
+          killed_by_timeout: false, stream_ok: null,
+        });
         return buildOutput(input.task_id, 'success', result.stdout, {
           tokens_used: this._estimateTokens(result.stdout),
           duration_ms: Date.now() - startTime,
@@ -187,14 +200,23 @@ class QwenAdapter {
             errorCode = 'TIMEOUT';
           }
         }
-        ModelLogger.logResponse(this.name, model, errMsg);
+        ModelLogger.logResponse(this.name, model, errMsg, {
+          ...meta, request_id: requestId, status: 'failed', error_code: errorCode,
+          error_message: String(errMsg).substring(0, 500), duration_ms: Date.now() - startTime,
+          exit_code: result.exit_code, killed_by_timeout: result.killed_by_timeout,
+          stream_ok: null,
+        });
         return buildOutput(input.task_id, 'failed', result.stdout || '', {
           error: { code: errorCode, message: errMsg.substring(0, 500) },
           duration_ms: Date.now() - startTime,
         });
       }
     } catch (e) {
-      ModelLogger.logResponse(this.name, model, e.message);
+      ModelLogger.logResponse(this.name, model, e.message, {
+        ...meta, request_id: requestId, status: 'failed', error_code: 'EXECUTION_ERROR',
+        error_message: String(e.message).substring(0, 500), duration_ms: Date.now() - startTime,
+        exit_code: null, killed_by_timeout: false, stream_ok: null,
+      });
       return buildOutput(input.task_id, 'failed', '', {
         error: { code: 'EXECUTION_ERROR', message: e.message },
         duration_ms: Date.now() - startTime,

@@ -211,7 +211,16 @@ class ClaudeAdapter {
 
     // 获取当前使用的模型名称
     const model = this._getModelOverride() || process.env.ANTHROPIC_MODEL || 'claude-default';
-    ModelLogger.logRequest(this.name, model, fullPrompt);
+    // 请求链路追踪元信息（用于把 request/response 关联成对，并按任务回溯）
+    const meta = {
+      task_id: input.task_id || '',
+      trace_id: input.trace_id || '',
+      external_task_id: input.external_task_id || '',
+      agent_name: input.agent_name || '',
+      phase: input.phase || 'initial',
+      attempt: input.attempt || 1,
+    };
+    const requestId = ModelLogger.logRequest(this.name, model, fullPrompt, meta);
 
     // 构建 CLI 参数
     // 注意：text 格式的输出是非流式的（结束才一次性吐出），
@@ -234,10 +243,14 @@ class ClaudeAdapter {
 
     try {
       // 先尝试流式模式
-      const streamed = await this._runStreamingCli(streamArgs, fullPrompt, timeoutMs, onChunk, input.task_id);
+      const streamed = await this._runStreamingCli(streamArgs, fullPrompt, timeoutMs, onChunk, input.external_task_id || input.task_id);
 
       if (streamed.exit_code === 0 && streamed.streamed_ok && streamed.text) {
-        ModelLogger.logResponse(this.name, model, streamed.text);
+        ModelLogger.logResponse(this.name, model, streamed.text, {
+          ...meta, request_id: requestId, status: 'success',
+          duration_ms: Date.now() - startTime, exit_code: streamed.exit_code,
+          killed_by_timeout: false, stream_ok: true,
+        });
         return buildUnifiedOutput(input.task_id, 'success', streamed.text, {
           tokens_used: this._estimateTokens(streamed.text),
           duration_ms: Date.now() - startTime,
@@ -245,7 +258,11 @@ class ClaudeAdapter {
       }
 
       if (streamed.exit_code === 0 && streamed.streamed_ok && !streamed.text) {
-        ModelLogger.logResponse(this.name, model, '(空响应)');
+        ModelLogger.logResponse(this.name, model, '(空响应)', {
+          ...meta, request_id: requestId, status: 'failed', error_code: 'EMPTY_RESPONSE',
+          error_message: '模型返回空内容', duration_ms: Date.now() - startTime,
+          exit_code: streamed.exit_code, killed_by_timeout: false, stream_ok: true,
+        });
         return buildUnifiedOutput(input.task_id, 'failed', '', {
           error: { code: 'EMPTY_RESPONSE', message: '模型返回空内容' },
           duration_ms: Date.now() - startTime,
@@ -267,7 +284,12 @@ class ClaudeAdapter {
             errorCode = 'TIMEOUT';
           }
         }
-        ModelLogger.logResponse(this.name, model, errMsg);
+        ModelLogger.logResponse(this.name, model, errMsg, {
+          ...meta, request_id: requestId, status: 'failed', error_code: errorCode,
+          error_message: String(errMsg).substring(0, 500), duration_ms: Date.now() - startTime,
+          exit_code: streamed.exit_code, killed_by_timeout: streamed.killed_by_timeout,
+          stream_ok: streamed.streamed_ok,
+        });
         return buildUnifiedOutput(input.task_id, 'failed', streamed.text || '', {
           error: { code: errorCode, message: errMsg.substring(0, 500) },
           duration_ms: Date.now() - startTime,
@@ -276,11 +298,19 @@ class ClaudeAdapter {
 
       // stream-json 成功退出但没有解析到事件（旧版 CLI 等）→ 回退 text 模式
       // 注意：streamed.text 为空，因此不会有已推送的增量需要去重
-      ModelLogger.logResponse(this.name, model, '[stream-json 无事件输出，回退 text 模式]');
-      const result = await this._runCli(textArgs, fullPrompt, timeoutMs, onChunk, input.task_id);
+      ModelLogger.logResponse(this.name, model, '[stream-json 无事件输出，回退 text 模式]', {
+        ...meta, request_id: requestId, status: 'success',
+        duration_ms: Date.now() - startTime, exit_code: streamed.exit_code,
+        killed_by_timeout: false, stream_ok: false,
+      });
+      const result = await this._runCli(textArgs, fullPrompt, timeoutMs, onChunk, input.external_task_id || input.task_id);
 
       if (result.exit_code === 0) {
-        ModelLogger.logResponse(this.name, model, result.stdout);
+        ModelLogger.logResponse(this.name, model, result.stdout, {
+          ...meta, request_id: requestId, status: 'success',
+          duration_ms: Date.now() - startTime, exit_code: result.exit_code,
+          killed_by_timeout: false, stream_ok: null,
+        });
         return buildUnifiedOutput(input.task_id, 'success', result.stdout, {
           tokens_used: this._estimateTokens(result.stdout),
           duration_ms: Date.now() - startTime,
@@ -299,14 +329,23 @@ class ClaudeAdapter {
             errorCode = 'TIMEOUT';
           }
         }
-        ModelLogger.logResponse(this.name, model, errMsg);
+        ModelLogger.logResponse(this.name, model, errMsg, {
+          ...meta, request_id: requestId, status: 'failed', error_code: errorCode,
+          error_message: String(errMsg).substring(0, 500), duration_ms: Date.now() - startTime,
+          exit_code: result.exit_code, killed_by_timeout: result.killed_by_timeout,
+          stream_ok: null,
+        });
         return buildUnifiedOutput(input.task_id, 'failed', result.stdout || '', {
           error: { code: errorCode, message: errMsg.substring(0, 500) },
           duration_ms: Date.now() - startTime,
         });
       }
     } catch (e) {
-      ModelLogger.logResponse(this.name, model, e.message);
+      ModelLogger.logResponse(this.name, model, e.message, {
+        ...meta, request_id: requestId, status: 'failed', error_code: 'EXECUTION_ERROR',
+        error_message: String(e.message).substring(0, 500), duration_ms: Date.now() - startTime,
+        exit_code: null, killed_by_timeout: false, stream_ok: null,
+      });
       return buildUnifiedOutput(input.task_id, 'failed', '', {
         error: { code: 'EXECUTION_ERROR', message: e.message },
         duration_ms: Date.now() - startTime,

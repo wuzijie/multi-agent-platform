@@ -4,8 +4,8 @@
  */
 const blackboard = require('../blackboard/blackboard');
 const CollabLogger = require('../utils/collab-logger');
-const { isFatalError, markAgentFatal, isAgentFatal } = require('../utils/fatal-errors');
-const { EVENTS, SUB_STATUS, AGENT_IDS, AGENT_NAMES, genSubTaskId, buildMessage } = require('./events');
+const { isFatalError, markAgentFatal, isAgentFatal, fatalAgents } = require('../utils/fatal-errors');
+const { EVENTS, SUB_STATUS, TASK_TYPES, AGENT_IDS, AGENT_NAMES, genSubTaskId, buildMessage } = require('./events');
 
 // 指数退避（与 scheduler.js 一致）
 const BACKOFF_MS = [0, 1000, 3000, 5000, 10000];

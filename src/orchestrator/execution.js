@@ -3,8 +3,13 @@
  * 方法内的 this 指向 TaskOrchestrator 实例
  */
 const { v4: uuidv4 } = require('uuid');
+const path = require('path');
+const fs = require('fs');
 const eventBus = require('../eventbus/bus');
 const agentRuntime = require('../agent/runtime');
+const { enabledAgentNames, enabledAgents } = require('../utils/agent-list');
+
+const ROOT = path.resolve(__dirname, '..', '..');
 
 module.exports = {
 
@@ -194,7 +199,10 @@ module.exports = {
   async _callAgentRaw(task, taskId, instruction, agentName) {
     const conversationHistory = this._readConversationHistory(taskId);
     const savedInstruction = task.instruction;
+    const savedDisableTools = task.disableTools;
     task.instruction = instruction;
+    // 内部调用（讨论各阶段）禁用工具循环，防止递归调用工具导致流式气泡嵌套乱序
+    task.disableTools = true;
     try {
       const result = await this._streamedExecute(task, taskId, agentName, conversationHistory);
       if (result.status !== 'success') {
@@ -203,6 +211,7 @@ module.exports = {
       return result.content || '';
     } finally {
       task.instruction = savedInstruction;
+      task.disableTools = savedDisableTools;
     }
   }
 
@@ -360,7 +369,12 @@ module.exports = {
       // 更新 task.instruction 为当前问题，确保 Agent 收到正确指令
       // 并注入团队协作说明：允许模型将问题转交给其他智能体
       const savedInstruction = task.instruction;
-      const mentionCapability = '\n\n=== 团队协作 ===\n你可以把问题转交给团队中的其他智能体，格式：@智能体名 问题内容（例如：@吉米 请解释一下这个算法）。可用的智能体：克劳德（Claude，通用）、吉米（Kimi，长文本分析）、迪普斯克（DeepSeek，编程实现）、钱文（Qwen，中文写作）。仅当你自己无法可靠回答该问题时才转交，否则请直接回答。';
+      const mentionDesc = { claude: 'Claude', kimi: 'Kimi', deepseek: 'DeepSeek', qwen: 'Qwen' };
+      const mentionAngle = { claude: '通用', kimi: '长文本分析', deepseek: '编程实现', qwen: '中文写作' };
+      const mentionAgents = enabledAgents(); // 只列当前已启用模型（吉米 enabled:false 时不出现）
+      const mentionRoleText = (a) => `${a.name}（${mentionDesc[a.model_cli] || a.model_cli}，${mentionAngle[a.model_cli] || ''}）`;
+      const mentionExample = (mentionAgents[0] && mentionAgents[0].name) || '克劳德';
+      const mentionCapability = `\n\n=== 团队协作 ===\n你可以把问题转交给团队中的其他智能体，格式：@智能体名 问题内容（例如：@${mentionExample} 请解释一下这个算法）。可用的智能体：${mentionAgents.map(mentionRoleText).join('、')}。仅当你自己无法可靠回答该问题时才转交，否则请直接回答。`;
       task.instruction = (userMessage || task.instruction || task.description) + mentionCapability;
 
       // 通过指定 Agent 执行（流式：捕获 CLI 增量输出推送到事件总线）
@@ -430,18 +444,7 @@ module.exports = {
       eventBus.emit('task:failed', { task_id: taskId, error: e.message });
       throw e;
     }
-  }
-
-  /**
-   * 从模型回复中提取 @另一个Agent 的转交请求
-   *
-   * 格式要求：「@Agent名 + 具体问题」，问题至少 4 个字符才触发转交，
-   * 避免模型在普通回复中偶然提及 @Agent名 造成误转交。
-   *
-   * @returns {Object|null} { agent, question } 或 null
-   */
-,
-
+  },
   /**
    * 从模型回复中提取 @另一个Agent 的转交请求
    *
@@ -452,7 +455,11 @@ module.exports = {
    */
   _extractMentionFromReply(content, currentAgent) {
     if (!content) return null;
-    const pattern = /@(克劳德|吉米|迪普斯克|钱文)/g;
+    // 只识别已启用模型的 @转交（enabled:false 的模型不触发转交，避免转给未注册 Agent）
+    const names = enabledAgentNames();
+    if (names.length === 0) return null;
+    const escaped = names.map(n => n.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|');
+    const pattern = new RegExp('@(' + escaped + ')', 'g');
     let match = pattern.exec(content);
     while (match) {
       if (match[1] !== currentAgent) {
