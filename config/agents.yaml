@@ -13,6 +13,7 @@ agents:
     strengths: ["大容量文本处理", "信息提炼精准"]
     weaknesses: ["复杂算法优化能力较弱"]
     scenarios: ["document_analysis", "content_generation"]
+    enabled: false
 
   - name: "迪普斯克"
     model_cli: "deepseek"

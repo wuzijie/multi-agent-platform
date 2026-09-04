@@ -34,6 +34,8 @@ class AgentRuntime {
     console.log(`[AgentRuntime] Initializing agents...`);
 
     for (const agentCfg of agentsConfig) {
+      // 跳过 enabled: false 的 Agent（如吉米暂停使用）
+      if (agentCfg.enabled === false) continue;
       // 启用已配置的 Agent（二期：克劳德、吉米、迪普斯克、钱文）
       if (['克劳德', '吉米', '迪普斯克', '钱文'].includes(agentCfg.name)) {
         this._registerAgent(agentCfg);
@@ -135,12 +137,23 @@ class AgentRuntime {
     try {
       const input = {
         task_id: task.task_id,
+        external_task_id: task.external_task_id || task.task_id,
+        trace_id: task.trace_id || '',
         role: 'executor',
         context: `任务名称: ${task.name}\n任务描述: ${task.description || '无'}\n难度等级: ${task.difficulty || '未知'}\n任务类型: ${task.task_type || 'development'}`,
         instruction: this._buildInstruction(task, conversationHistory),
         input_files: task.input_files || [],
         max_tokens: task.max_tokens || 4096,
+        // 请求链路追踪元信息
+        agent_name: '克劳德',
+        phase: 'initial',
+        attempt: task.attempt || 1,
       };
+
+      // 记忆上下文（Session + Auto Memory）注入
+      if (task.memory_context && typeof task.memory_context === 'string' && task.memory_context.trim()) {
+        input.context = `[系统记忆上下文]\n${task.memory_context.trim()}\n\n${input.context}`;
+      }
 
       const result = await agent.adapter.execute(input, onChunk);
       return result;
@@ -217,14 +230,25 @@ class AgentRuntime {
       for (let round = 0; round <= MAX_TOOL_ROUNDS; round++) {
         // 工具说明直接拼入 context（适配器内置 _buildPrompt 会渲染为任务背景），
         // 不再经过 PromptManager（Prompt 分层管理已回退）
-        const effectiveContext = (toolPrompt ? toolPrompt + '\n\n' : '') + currentContext;
+        // 记忆上下文（Session + Auto Memory）由编排器构建后经 task.memory_context 注入。
+        // 仅在首轮注入：工具结果回灌轮（round>0）不再注入，避免无关会话历史干扰
+        // 模型按工具结果生成最终回复（如旧会话摘要混入导致答非所问）。
+        const memoryBlock = (round === 0 && task.memory_context) ? String(task.memory_context).trim() : '';
+        const effectiveContext = (toolPrompt ? toolPrompt + '\n\n' : '') +
+          (memoryBlock ? `[系统记忆上下文]\n${memoryBlock}\n\n` : '') + currentContext;
         const baseInput = {
           task_id: task.task_id,
+          external_task_id: task.external_task_id || task.task_id, // 对话级 task_id，供进程注册/停止匹配
+          trace_id: task.trace_id || '', // 事件驱动协作 trace_id（DAG 编排唯一ID）
           role: task.role || 'executor',
           context: effectiveContext,
           instruction: currentInstruction,
           input_files: task.input_files || [],
           max_tokens: task.max_tokens || 4096,
+          // 请求链路追踪元信息：agent 名 + 工具调用轮次（initial / tool_round_N）
+          agent_name: agentName,
+          phase: round === 0 ? 'initial' : `tool_round_${round}`,
+          attempt: task.attempt || 1,
         };
 
         const result = await agent.adapter.execute(baseInput, onChunk);
@@ -236,7 +260,8 @@ class AgentRuntime {
 
         const toolCalls = parsed.tool_calls;
         console.log(`[AgentRuntime] 模型调用工具（round ${round}）:`, toolCalls.map(t => t.name).join(','));
-        // 执行工具
+
+        // 常规工具执行
         const toolResults = [];
         for (const tc of toolCalls) {
           const out = await toolRegistry.execute(tc.name, tc.arguments, { agentName, task, runtime: this });
@@ -247,7 +272,9 @@ class AgentRuntime {
 
         // 构建下一轮指令：保留模型已生成文本 + 工具结果，让模型据此继续
         const prevText = parsed.remaining || '';
-        currentContext = `${baseInput.context}\n\n=== 已调用工具 ===\n${toolResults.join('\n\n')}`;
+        // currentContext 保持干净（不含记忆）：记忆只在 round0 拼进 effectiveContext，
+        // 不写回 currentContext，避免工具结果回灌轮仍带无关会话历史记忆
+        currentContext = `${currentContext}\n\n=== 已调用工具 ===\n${toolResults.join('\n\n')}`;
         currentInstruction = `你刚才调用了工具并收到了以下结果，请据此完成最终回复（不要再重复调用同一工具）：\n\n${toolResults.join('\n\n')}\n\n${prevText ? `你此前已生成的回复（供参考，可继续完善）：\n${prevText}` : ''}`;
       }
       // 超过最大轮数，返回最后一次结果
@@ -268,11 +295,17 @@ class AgentRuntime {
   async _executeOnce(agent, task, context, instruction, onChunk, agentName) {
     const baseInput = {
       task_id: task.task_id,
+      external_task_id: task.external_task_id || task.task_id,
+      trace_id: task.trace_id || '',
       role: task.role || 'executor',
       context,
       instruction,
       input_files: task.input_files || [],
       max_tokens: task.max_tokens || 4096,
+      // 请求链路追踪元信息
+      agent_name: agentName,
+      phase: 'initial',
+      attempt: task.attempt || 1,
     };
     return agent.adapter.execute(baseInput, onChunk);
   }

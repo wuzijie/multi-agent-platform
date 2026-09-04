@@ -29,9 +29,10 @@ execution:
 ## 可用模型
 
 - 克劳德：通用能力、复杂架构、代码规范
-- 吉米：长文本处理、文档分析、信息提炼
 - 迪普斯克：编程实现、算法、纠错调试
 - 钱文：快速开发、场景适配、中文优化
+
+> 注：只能把子任务分配给上面列出的、当前已启用的模型；平台最终以本次调用时注入的"可用模型"名单为准。
 
 ## 拆解要求
 
@@ -45,7 +46,7 @@ execution:
 输出**纯 JSON 数组**，不要任何其他文字或 markdown 围栏，格式：
 
 ```json
-[{"type":"PLAN_TASK|CODE_TASK|REVIEW_TASK|SUMMARY_TASK|DEBUG_TASK","instruction":"子任务执行指令","deps":[依赖的子任务序号，如0],"agent":"克劳德|吉米|迪普斯克|钱文"}]
+[{"type":"PLAN_TASK|CODE_TASK|REVIEW_TASK|SUMMARY_TASK|DEBUG_TASK","instruction":"子任务执行指令","deps":[依赖的子任务序号，如0],"agent":"克劳德|迪普斯克|钱文"}]
 ```
 
 `type` 取值：

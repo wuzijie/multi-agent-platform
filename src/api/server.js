@@ -473,6 +473,12 @@ class ApiServer {
     });
 
     this.app.use('/api', api);
+
+    // API 404 日志：记录所有未匹配的 /api 请求路径，便于定位前端发起的无效请求
+    this.app.use('/api', (req, res) => {
+      console.error(`[ApiServer] 404: ${req.method} ${req.originalUrl}`);
+      res.status(404).json({ error: `Not Found: ${req.originalUrl}` });
+    });
   }
 
   _setupWebSocket() {

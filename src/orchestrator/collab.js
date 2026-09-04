@@ -8,7 +8,19 @@ const blackboard = require('../blackboard/blackboard');
 const agentRuntime = require('../agent/runtime');
 const scheduler = require('../engine/scheduler');
 const skillLoader = require('../skills/loader');
+const { enabledAgentNames } = require('../utils/agent-list');
 const { TASK_STATUS, TASK_TYPES, genSubTaskId } = require('../engine/events');
+
+// 事件驱动协作：任务类型 → 中文标签（与 orchestrator.js 保持一致）
+const COLLAB_TYPE_LABEL = {
+  PLAN_TASK: '规划',
+  CODE_TASK: '执行',
+  REVIEW_TASK: '评审',
+  SUMMARY_TASK: '汇总',
+  DEBUG_TASK: '调试',
+  RESEARCH_TASK: '调研',
+  FINAL_TASK: '终稿',
+};
 
 module.exports = {
 
@@ -101,8 +113,12 @@ module.exports = {
       planPrompt = (def && def.body) || '';
     } catch (e) { planPrompt = ''; }
     if (!planPrompt.trim()) {
-      planPrompt = '你是一个多智能体协作平台中的主智能体（克劳德），负责把用户的请求拆解为可执行的子任务 DAG（2-5 个子任务，有依赖关系），并为每个子任务指定执行模型（克劳德/吉米/迪普斯克/钱文）。输出纯 JSON 数组，格式：[{"type":"PLAN_TASK|CODE_TASK|REVIEW_TASK|SUMMARY_TASK|DEBUG_TASK","instruction":"执行指令","deps":[依赖序号],"agent":"克劳德"}]，不要任何其他文字。';
+      const defaultAgent = enabledAgentNames()[0] || '克劳德';
+      planPrompt = `你是一个多智能体协作平台中的主智能体（克劳德），负责把用户的请求拆解为可执行的子任务 DAG（2-5 个子任务，有依赖关系），并为每个子任务指定执行模型（${enabledAgentNames().join('/')}）。输出纯 JSON 数组，格式：[{"type":"PLAN_TASK|CODE_TASK|REVIEW_TASK|SUMMARY_TASK|DEBUG_TASK","instruction":"执行指令","deps":[依赖序号],"agent":"${defaultAgent}"}]，不要任何其他文字。`;
     }
+    // 权威提示：即使 task_planning skill 正文仍列着停用的模型，最终都以当前已启用名单为准，
+    // 防止主 agent 给停用模型（如吉米）分配子任务。
+    planPrompt += `\n\n重要：当前已启用的可分配执行模型只有：${enabledAgentNames().join('、') || '无'}。子任务的 "agent" 字段只能取上述名单之一，禁止分配给名单外的模型。`;
     planPrompt += '\n\n用户请求：' + userQuery;
 
     try {

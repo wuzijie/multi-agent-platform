@@ -38,6 +38,14 @@ const EVENTS = {
 
   // 系统运维心跳
   AGENT_HEARTBEAT: 'AGENT_HEARTBEAT_EVENT',
+
+  // 多模型协作讨论（三类模式）
+  DISC_START: 'DISC_START_EVENT',         // 讨论开始
+  DISC_ROUND_START: 'DISC_ROUND_START',   // 一轮开始 { traceId, round, mode, participants }
+  DISC_ROUND_DONE: 'DISC_ROUND_DONE',     // 一轮完成 { traceId, round, summaries }
+  DISC_CONVERGED: 'DISC_CONVERGED',       // 讨论收敛 { traceId, consensus, divergences }
+  DISC_FAILED: 'DISC_FAILED',             // 讨论失败 { traceId, error }
+  DISC_END: 'DISC_END_EVENT',             // 讨论结束
 };
 
 // ===== 任务类型枚举（方案 §4.4.2）=====
