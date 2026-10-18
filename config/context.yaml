@@ -1,0 +1,20 @@
+context:
+  history:
+    # 是否启用多轮上下文注入
+    enabled: true
+    # 单次注入最多保留的轮数（1 轮 = 用户 + 助手）
+    max_turns: 6
+    # 单次注入历史的总字符预算（超预算从最旧开始丢弃）
+    max_chars: 12000
+    # 单条助手消息写入转录时的截断长度
+    message_max_chars: 4000
+    # 转录超过该长度时触发一次性压缩（会重建一次 KV 缓存）
+    compact_threshold: 10000
+    # 压缩后保留的轮数
+    recent_turns_after_compact: 2
+    # 长期记忆按会话冻结（会话内不变，保证 prompt 前缀稳定）
+    freeze_memory_per_session: true
+    # DAG 规划器注入的压缩历史字符上限
+    dag_planner_history_chars: 6000
+    # DAG 子任务注入的上一轮结果字符上限
+    dag_last_result_chars: 2000

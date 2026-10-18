@@ -66,6 +66,7 @@ const SUB_STATUS = {
   TIMEOUT: 'TIMEOUT',
   FAILED: 'FAILED',
   SKIPPED: 'SKIPPED',
+  CANCELLED: 'CANCELLED',
 };
 
 // ===== 顶层任务状态枚举（方案 §2.4.1）=====

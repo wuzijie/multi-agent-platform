@@ -6,12 +6,16 @@ const blackboard = require('../blackboard/blackboard');
 const CollabLogger = require('../utils/collab-logger');
 const { isFatalError, markAgentFatal, isAgentFatal, fatalAgents } = require('../utils/fatal-errors');
 const { EVENTS, SUB_STATUS, TASK_TYPES, AGENT_IDS, AGENT_NAMES, genSubTaskId, buildMessage } = require('./events');
+const { historyConfig } = require('../prompt/config');
+const { truncate } = require('../prompt/history');
 
 // 指数退避（与 scheduler.js 一致）
 const BACKOFF_MS = [0, 1000, 3000, 5000, 10000];
 
 module.exports = {
   async _dispatchSubTask(traceId, sub) {
+    // 已取消的 trace：不再派发（避免停止后重试链继续拉起模型）
+    if (this._isTraceCancelled(traceId)) return;
     // 优先使用拆解时主agent指定的模型（preferred_agent）；不在线/熔断/未指定则能力匹配兜底
     let agentNames = [];
     if (sub.preferred_agent && this.profiles.has(sub.preferred_agent) && !isAgentFatal(sub.preferred_agent)) {
@@ -95,13 +99,20 @@ module.exports = {
       ? `\n\n=== 上游任务输出（供参考，据此完成本子任务） ===\n${upstreamParts.join('\n\n---\n\n')}`
       : '';
 
+    // 多轮协作：注入上一轮最终结果，让“在上面的基础上改”这类指令有上下文。
+    // 子任务保持隔离，不注入完整对话历史。
+    const prevResult = blackboard.hget(mainKey, 'previous_result') || '';
+    const prevContext = prevResult
+      ? `\n\n=== 上一轮协作结果（供延续，不必复述） ===\n${truncate(prevResult, historyConfig().dag_last_result_chars)}`
+      : '';
+
     const subTask = {
       task_id: sub.sub_task_id,
       trace_id: traceId,
       external_task_id: externalTaskId, // 关联外部平台 task_id（流式事件/UI 用）
       type: sub.type || '',
       role: sub.role || 'executor',
-      context: `任务ID: ${traceId}\n子任务: ${sub.sub_task_id}\n类型: ${sub.type}\n原始请求: ${userQuery}\n参与模型: ${agentNames.join('、')}${upstreamContext}`,
+      context: `任务ID: ${traceId}\n子任务: ${sub.sub_task_id}\n类型: ${sub.type}\n原始请求: ${userQuery}\n参与模型: ${agentNames.join('、')}${upstreamContext}${prevContext}`,
       instruction: sub.input || '',
       input_files: [],
     };
@@ -122,6 +133,12 @@ module.exports = {
     if (this._timers.has(sub.sub_task_id)) {
       clearTimeout(this._timers.get(sub.sub_task_id));
       this._timers.delete(sub.sub_task_id);
+    }
+
+    // 执行期间被用户取消：不再推送完成事件、不写对话、不进入重试链
+    if (this._isTraceCancelled(traceId)) {
+      this._releaseAgents(sub);
+      return;
     }
 
     // 分类各 Agent 结果
@@ -217,6 +234,8 @@ module.exports = {
 ,
   async _onSubTaskFinish(msg, ok) {
     const { trace_id: traceId, sub_task_id: subId } = msg.msg_meta;
+    // 已取消：忽略迟到的完成/失败回调，不再重试或推进
+    if (this._isTraceCancelled(traceId)) return;
     const subKey = `blackboard:task:${traceId}:sub:${subId}`;
     const sub = blackboard.hgetall(subKey);
     if (!sub || sub.status !== SUB_STATUS.RUNNING) {
@@ -292,6 +311,8 @@ module.exports = {
   async _onSubTaskRetry(msg) {
     const traceId = msg.msg_meta.trace_id;
     const subId = msg.msg_meta.sub_task_id;
+    // 已取消：重试定时器触发的迟到事件不再重置为 PENDING / 重新派发
+    if (this._isTraceCancelled(traceId)) return;
     const sub = blackboard.hgetall(`blackboard:task:${traceId}:sub:${subId}`);
     if (!sub) return;
     // 重置为 PENDING，重新调度（状态 RETRYING → 重新下发）

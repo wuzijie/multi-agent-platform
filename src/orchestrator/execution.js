@@ -7,11 +7,26 @@ const path = require('path');
 const fs = require('fs');
 const eventBus = require('../eventbus/bus');
 const agentRuntime = require('../agent/runtime');
+const transcript = require('../prompt/transcript');
 const { enabledAgentNames, enabledAgents } = require('../utils/agent-list');
 
 const ROOT = path.resolve(__dirname, '..', '..');
 
 module.exports = {
+
+  /**
+   * 用户停止本轮后的统一收尾：
+   * 写系统提示、记录 stopped 状态，但不把任务标为 failed/completed（对话仍可继续）。
+   */
+  _finishStoppedTurn(task, taskId) {
+    this._appendConversation(taskId, 'system', '[本轮已停止] 用户停止了本轮任务');
+    task.last_run_status = 'stopped';
+    task.updated_at = new Date().toISOString();
+    this._saveTask(task);
+    this._updateIndex(task);
+    eventBus.emit('task:stopped', { task_id: taskId, scope: 'turn' });
+    return { task, result: { status: 'cancelled', content: '' }, stopped: true };
+  },
 
   /**
    * 多模型循环讨论模式（用户一条消息中 @多个Agent 触发）
@@ -39,12 +54,14 @@ module.exports = {
       eventBus.emit('task:executing', { task_id: taskId, agent: hostAgent, phase: 'discussion_opening' });
       const openingPrompt = `${userMessage}\n\n（你负责回答以上问题。稍后会有其他智能体评审你的答案，你需参考评审意见持续修改，直到评审全部通过或达到轮次上限。）`;
       let draft = await this._tryAgentCall(task, taskId, openingPrompt, hostAgent, 2);
+      if (this._isCancelled(taskId)) return this._finishStoppedTurn(task, taskId);
       if (!draft) {
         const fallbackHost = participants.find(name => name !== hostAgent);
         if (fallbackHost) {
           this._appendConversation(taskId, 'system', `[讨论模式] ${hostAgent} 初始回答失败，改由 ${fallbackHost} 作答`);
           hostAgent = fallbackHost;
           draft = await this._tryAgentCall(task, taskId, openingPrompt, fallbackHost, 2);
+          if (this._isCancelled(taskId)) return this._finishStoppedTurn(task, taskId);
         }
       }
       if (!draft) {
@@ -57,12 +74,15 @@ module.exports = {
       let allPassed = false;
       let finalRound = 0;
       for (let round = 1; round <= maxRounds; round++) {
+        // 每轮开始前检查：用户已停止则不再推进
+        if (this._isCancelled(taskId)) return this._finishStoppedTurn(task, taskId);
         finalRound = round;
         this._appendConversation(taskId, 'system', `[讨论模式] 第 ${round}/${maxRounds} 轮讨论开始`);
 
         // 2a. 评审者逐个评审当前答案
         const reviewResults = [];
         for (const reviewer of reviewers) {
+          if (this._isCancelled(taskId)) return this._finishStoppedTurn(task, taskId);
           eventBus.emit('task:executing', { task_id: taskId, agent: reviewer, phase: `discussion_round_${round}` });
           const angle = this._agentAngle(reviewer);
           const reviewPrompt = [
@@ -79,6 +99,7 @@ module.exports = {
             `注意：你只负责评审，不要直接修改答案；修改由 ${hostAgent} 完成。`,
           ].join('\n');
           const reviewText = await this._tryAgentCall(task, taskId, reviewPrompt, reviewer, 2);
+          if (this._isCancelled(taskId)) return this._finishStoppedTurn(task, taskId);
           if (reviewText) {
             const verdict = this._parseReviewVerdict(reviewText);
             reviewResults.push({ reviewer, verdict, text: reviewText });
@@ -101,6 +122,7 @@ module.exports = {
 
         // 2c. 回答者A参考评审意见修订答案
         if (round < maxRounds) {
+          if (this._isCancelled(taskId)) return this._finishStoppedTurn(task, taskId);
           eventBus.emit('task:executing', { task_id: taskId, agent: hostAgent, phase: `discussion_revise_${round}` });
           const reviewSummary = reviewResults.map(r => `【${r.reviewer} 的意见】\n${r.text}`).join('\n\n---\n\n');
           const revisePrompt = [
@@ -113,6 +135,7 @@ module.exports = {
             `请参考以上评审意见修改你的答案，输出完整的修订版答案全文（直接输出答案内容，不要附带说明）。`,
           ].join('\n');
           const revised = await this._tryAgentCall(task, taskId, revisePrompt, hostAgent, 2);
+          if (this._isCancelled(taskId)) return this._finishStoppedTurn(task, taskId);
           if (revised) {
             draft = revised;
             this._appendConversation(taskId, 'assistant', `**${hostAgent}** 修订版答案（第 ${round} 轮）:\n\n${revised}`, { target: reviewers.join('、') });
@@ -128,6 +151,10 @@ module.exports = {
       }
       this._appendConversation(taskId, 'assistant', `**${hostAgent}** 最终答案（第 ${finalRound} 轮后${allPassed ? '，评审通过' : ''}）:\n\n${draft}`, { target: '用户' });
 
+      // 讨论模式的中间阶段不写入转录，这里只记录「用户问题 + 最终答案」，
+      // 供下一轮对话延续上下文。
+      this._recordTurnToTranscript(taskId, userMessage, hostAgent, draft);
+
       task.progress = Math.min(1.0, (task.progress || 0) + 0.5);
       task.updated_at = new Date().toISOString();
       this._saveTask(task);
@@ -137,6 +164,8 @@ module.exports = {
 
       return { task, result: { status: 'success', content: draft } };
     } catch (e) {
+      // 用户停止本轮导致的异常：优雅收尾，不把任务判为失败
+      if (this._isCancelled(taskId)) return this._finishStoppedTurn(task, taskId);
       task.status = 'failed';
       task.suspend_reason = e.message;
       task.updated_at = new Date().toISOString();
@@ -197,14 +226,18 @@ module.exports = {
    * 讨论模式的内部调用原语
    */
   async _callAgentRaw(task, taskId, instruction, agentName) {
-    const conversationHistory = this._readConversationHistory(taskId);
     const savedInstruction = task.instruction;
     const savedDisableTools = task.disableTools;
+    // 讨论/辩论等内部调用：读取历史作为稳定前缀，但**不写入**转录
+    // （否则阶段性的评审/修订文本会污染下一轮聊天历史）。
+    task.history_segments = transcript.loadSegments(taskId);
+    task.chat_mode = true;
+    task.record_transcript = false;
     task.instruction = instruction;
     // 内部调用（讨论各阶段）禁用工具循环，防止递归调用工具导致流式气泡嵌套乱序
     task.disableTools = true;
     try {
-      const result = await this._streamedExecute(task, taskId, agentName, conversationHistory);
+      const result = await this._streamedExecute(task, taskId, agentName, []);
       if (result.status !== 'success') {
         throw new Error(`${agentName} 执行失败: ${(result.error && result.error.message) || '未知错误'}`);
       }
@@ -240,6 +273,8 @@ module.exports = {
   async _tryAgentCall(task, taskId, instruction, agentName, maxAttempts = 2) {
     let lastError = null;
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      // 用户已停止本轮：不再发起新调用，也不再重试
+      if (this._isCancelled(taskId)) return null;
       try {
         const content = await this._callAgentRaw(task, taskId, instruction, agentName);
         if (content && content.trim()) {
@@ -248,6 +283,8 @@ module.exports = {
         lastError = new Error(`${agentName} 返回空内容`);
       } catch (e) {
         lastError = e;
+        // 取消导致的失败不重试（否则会重新拉起模型）
+        if (this._isCancelled(taskId)) break;
         if (attempt < maxAttempts) {
           this._appendConversation(taskId, 'system', `[讨论模式] ${agentName} 调用失败（第 ${attempt} 次）：${e.message}，即将重试...`);
         }
@@ -363,25 +400,31 @@ module.exports = {
         this._appendConversation(taskId, 'user', userMessage, { target: execAgent, from: fromAgent });
       }
 
-      // 读取对话历史
-      const conversationHistory = this._readConversationHistory(taskId);
+      // 读取上一轮为止的转录（不含当前消息）。runtime 会在本轮调用中把
+      // “用户消息 + 工具轮 + 助手回复”按实际 prompt 格式追加回去，
+      // 下一轮再原样拼接，保证 prompt 前缀稳定、KV 缓存可复用。
+      if (!task.stable_context) {
+        try { task.stable_context = this._buildStableContext(task, userMessage); } catch (e) { /* ignore */ }
+      }
+      task.history_segments = transcript.loadSegments(taskId);
+      task.chat_mode = true;
+      task.record_transcript = true;
 
-      // 更新 task.instruction 为当前问题，确保 Agent 收到正确指令
-      // 并注入团队协作说明：允许模型将问题转交给其他智能体
+      // 当前轮只放原始用户消息。团队协作说明已前移到稳定上下文（ZONE A），
+      // 不再拼在消息尾部，避免每轮改变对话条目、破坏前缀缓存。
       const savedInstruction = task.instruction;
-      const mentionDesc = { claude: 'Claude', kimi: 'Kimi', deepseek: 'DeepSeek', qwen: 'Qwen' };
-      const mentionAngle = { claude: '通用', kimi: '长文本分析', deepseek: '编程实现', qwen: '中文写作' };
-      const mentionAgents = enabledAgents(); // 只列当前已启用模型（吉米 enabled:false 时不出现）
-      const mentionRoleText = (a) => `${a.name}（${mentionDesc[a.model_cli] || a.model_cli}，${mentionAngle[a.model_cli] || ''}）`;
-      const mentionExample = (mentionAgents[0] && mentionAgents[0].name) || '克劳德';
-      const mentionCapability = `\n\n=== 团队协作 ===\n你可以把问题转交给团队中的其他智能体，格式：@智能体名 问题内容（例如：@${mentionExample} 请解释一下这个算法）。可用的智能体：${mentionAgents.map(mentionRoleText).join('、')}。仅当你自己无法可靠回答该问题时才转交，否则请直接回答。`;
-      task.instruction = (userMessage || task.instruction || task.description) + mentionCapability;
+      task.instruction = userMessage || task.instruction || task.description || '';
 
       // 通过指定 Agent 执行（流式：捕获 CLI 增量输出推送到事件总线）
-      const result = await this._streamedExecute(task, taskId, execAgent, conversationHistory);
+      const result = await this._streamedExecute(task, taskId, execAgent, []);
 
       // 恢复原 instruction
       task.instruction = savedInstruction;
+
+      // 用户停止本轮：优雅收尾，不判失败、不继续转交
+      if (this._isCancelled(taskId) || (result && result.status === 'cancelled')) {
+        return this._finishStoppedTurn(task, taskId);
+      }
 
       if (result.status !== 'success') {
         task.status = 'failed';
@@ -394,6 +437,7 @@ module.exports = {
 
       // 检查回复中是否包含 @另一个Agent 的转交请求（最多 3 跳，防死循环）
       const mention = this._extractMentionFromReply(result.content, execAgent);
+      if (this._isCancelled(taskId)) return this._finishStoppedTurn(task, taskId);
       if (mention && hop < 3 && !visited.has(mention.agent)) {
         visited.add(mention.agent);
         // 记录模型A的回复全文 + 转交声明
@@ -433,6 +477,8 @@ module.exports = {
 
       return { task, result };
     } catch (e) {
+      // 用户停止本轮导致的异常：优雅收尾，不把任务判为失败
+      if (this._isCancelled(taskId)) return this._finishStoppedTurn(task, taskId);
       task.status = 'failed';
       task.suspend_reason = e.message;
       task.updated_at = new Date().toISOString();
@@ -474,4 +520,14 @@ module.exports = {
     return null;
   }
 ,
+  /**
+   * 把一轮「用户问题 + 最终答案」写入对话转录。
+   * 仅用于不走聊天主路径的模式（讨论 / 辩论 / 事件驱动协作），
+   * 保证下一次对话仍能看到本轮结论。
+   */
+  _recordTurnToTranscript(taskId, userMessage, agentName, content) {
+    try {
+      transcript.recordTurn(taskId, userMessage, agentName, content);
+    } catch (e) { /* 转录写入失败不影响主流程 */ }
+  }
 };

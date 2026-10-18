@@ -11,6 +11,7 @@ class ConfigLoader {
     this.users = [];
     this.taskDefaults = {};
     this.apiKeys = {};
+    this.context = {};
   }
 
   loadAll() {
@@ -19,6 +20,7 @@ class ConfigLoader {
     this.users = this._loadYaml('config/users.yaml').users || [];
     this.taskDefaults = this._loadYaml('config/task_defaults.yaml').task_defaults || {};
     this.apiKeys = this._loadYaml('config/api_keys.yaml').api_keys || {};
+    this.context = this._loadYaml('config/context.yaml').context || {};
     return this;
   }
 

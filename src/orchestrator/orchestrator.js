@@ -12,7 +12,8 @@ const CollabLogger = require('../utils/collab-logger');
 const skillLoader = require('../skills/loader');
 const sessionMemory = require('../memory/session-memory');
 const memoryManager = require('../memory/memory-manager');
-const { enabledAgentNames } = require('../utils/agent-list');
+const { historyConfig } = require('../prompt/config');
+const { enabledAgents, enabledAgentNames } = require('../utils/agent-list');
 const { TASK_STATUS, TASK_TYPES, genSubTaskId } = require('../engine/events');
 
 const ROOT = path.resolve(__dirname, '..', '..');
@@ -153,8 +154,8 @@ class TaskOrchestrator {
       // skill 的中间产出（各维度调研/初稿/审核）不会写入 conversation.md，
       // 前端流式气泡被清理后内容即消失（2026-08-27 复现）。幂等，仅首次生效。
       this._ensureEventDrivenEngine();
-      // 会话级隔离：标记该对话的 session 活跃（独立 thread/session）
-      sessionManager.get(taskId).touch();
+      // 会话级隔离：标记该对话的 session 活跃（独立 thread/session），复位上一轮取消标志
+      sessionManager.get(taskId).beginTurn();
 
       // 如果用户通过 @mention 指定了 Agent，使用该 Agent（并持久化，后续对话默认由该 Agent 回复）
       if (opts.mentioned_agent && opts.mentioned_agent !== task.executor_agent) {
@@ -181,6 +182,16 @@ class TaskOrchestrator {
           taskDescription: task.description,
         });
       } catch (e) { /* 记忆构建失败不阻塞主流程 */ }
+
+      // ===== 会话级稳定上下文（ZONE A）=====
+      // 团队协作规则 / 会话目标 / 冻结的长期记忆在整个会话内保持不变，
+      // 固定放在 prompt 前缀，保证每轮只有尾部（新对话内容）变化，
+      // 供应商侧 KV 前缀缓存才能生效。
+      try {
+        task.stable_context = this._buildStableContext(task, userMessage);
+        task.chat_mode = true;
+        this._saveTask(task);
+      } catch (e) { /* 稳定上下文构建失败不阻塞主流程 */ }
 
       // 事件驱动协作模式（消息总线 + 黑板 + DAG 编排）
       if (opts.collab_mode === 'event-driven') {
@@ -241,6 +252,8 @@ class TaskOrchestrator {
       //   2. 累积对话内容超过 5K 字节（记录后重置缓冲）
       //   3. 对话结束（terminateTask 里单独触发）
       // 不满足条件时只累积，不触发 subagent 写入
+      // 用户已停止本轮：跳过记忆写入，避免停止后台再次拉起模型调用
+      if (!this._isCancelled(taskId)) {
       try {
         let agentOutput = '';
         if (result) {
@@ -263,7 +276,55 @@ class TaskOrchestrator {
           }
         }
       } catch (e) { /* 忽略 */ }
+      }
     }
+  }
+
+  /**
+   * 构建会话级稳定上下文（ZONE A）。
+   *
+   * 整个会话内逐字节不变，内容包含：
+   *   - 团队协作规则（@转交能力说明）
+   *   - 会话目标（首条用户消息）
+   *   - 冻结的长期记忆（Auto Memory）
+   *
+   * 注意：这里不能放任何“当轮检索”的内容（如按当前输入检索的 top 主题），
+   * 否则每轮都会改变 prompt 前缀，KV 缓存会全部失效。
+   */
+  _buildStableContext(task, userMessage) {
+    const cfg = historyConfig();
+    if (!task.session_goal) {
+      task.session_goal = userMessage || task.description || task.name || '';
+    }
+    if (cfg.freeze_memory_per_session) {
+      if (!task.frozen_memory) task.frozen_memory = task.memory_context || '';
+    } else {
+      task.frozen_memory = task.memory_context || '';
+    }
+
+    const parts = [];
+    parts.push(`## 团队协作\n${this._buildTeamRules()}`);
+    parts.push(`## 会话目标\n${task.session_goal}`);
+
+    const memory = String(task.frozen_memory || '').trim();
+    if (memory) parts.push(`## 长期记忆\n${memory}`);
+
+    return parts.join('\n\n');
+  }
+
+  /** 团队协作规则文本（只列当前已启用的模型） */
+  _buildTeamRules() {
+    const agents = enabledAgents();
+    if (!agents || agents.length < 2) {
+      return '当前没有可转交的其他智能体，请直接回答问题。';
+    }
+    const desc = { claude: 'Claude', kimi: 'Kimi', deepseek: 'DeepSeek', qwen: 'Qwen' };
+    const angle = { claude: '通用', kimi: '长文本分析', deepseek: '编程实现', qwen: '中文写作' };
+    const list = agents
+      .map(a => `${a.name}（${desc[a.model_cli] || a.model_cli}，${angle[a.model_cli] || ''}）`)
+      .join('、');
+    const example = agents[0].name;
+    return `你可以把问题转交给团队中的其他智能体，格式：@智能体名 问题内容（例如：@${example} 请解释一下这个算法）。可用的智能体：${list}。仅当你自己无法可靠回答该问题时才转交，否则请直接回答。`;
   }
 
   /**
@@ -416,12 +477,26 @@ class TaskOrchestrator {
       if (p.taskId === taskId) traces.push(traceId);
     }
     for (const traceId of traces) scheduler.cancelTask(traceId);
-    // 清空该对话的 session 状态
+    // 主动复位运行时 Agent 忙碌状态（不依赖 CLI 进程 promise 自然结束；
+    // 仅释放本对话的调用，其他对话共用的模型不受影响）
+    const released = agentRuntime.forceReleaseTask(taskId);
+    // 标记「本轮已停止」（与「结束对话」区分，编排层据此不再推进后续步骤）
     const s = sessionManager.get(taskId);
-    if (s) { s.busyAgents.clear(); s.traces = []; s.status = 'completed'; }
-    CollabLogger.log('task_stopped', { task_id: taskId, killed_procs: killed, cancelled_traces: traces.length });
-    eventBus.emit('task:stopped', { task_id: taskId, killed_procs: killed });
-    return { task_id: taskId, killed_procs: killed, cancelled_traces: traces.length };
+    if (s) { s.busyAgents.clear(); s.traces = []; s.cancel(); }
+    CollabLogger.log('task_stopped', {
+      task_id: taskId, killed_procs: killed,
+      cancelled_traces: traces.length, released_calls: released,
+    });
+    eventBus.emit('task:stopped', { task_id: taskId, scope: 'turn', killed_procs: killed, released_calls: released });
+    return { task_id: taskId, status: 'stopped', killed_procs: killed, cancelled_traces: traces.length, released_calls: released };
+  }
+
+  /**
+   * 当前对话本轮是否已被用户停止。
+   * 编排层在每个「下一步」前调用，防止停止后继续拉起模型。
+   */
+  _isCancelled(taskId) {
+    return sessionManager.isCancelled(taskId);
   }
 
   /**
@@ -588,7 +663,13 @@ class TaskOrchestrator {
 
   _saveTask(task) {
     const taskPath = path.join(ROOT, 'tasks', task.task_id, 'task.json');
-    fs.writeFileSync(taskPath, JSON.stringify(task, null, 2));
+    // 运行态字段不落盘：stable_context 含记忆正文，history_segments 可能很大，
+    // 它们每轮都会重建，持久化只会让 task.json 膨胀。
+    const {
+      stable_context, history_segments, record_transcript, memory_context,
+      ...persisted
+    } = task;
+    fs.writeFileSync(taskPath, JSON.stringify(persisted, null, 2));
   }
 
   _loadTask(taskId) {

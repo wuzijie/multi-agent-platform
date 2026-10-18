@@ -17,6 +17,7 @@ const config = require('../utils/config');
 const blackboard = require('../blackboard/blackboard');
 const CollabLogger = require('../utils/collab-logger');
 const sessionManager = require('../session/manager');
+const procRegistry = require('../utils/proc-registry');
 const { isFatalError, markAgentFatal, isAgentFatal, fatalAgents } = require('../utils/fatal-errors');
 const {
   EVENTS, TASK_TYPES, SUB_STATUS, TASK_STATUS,
@@ -112,6 +113,7 @@ class Scheduler {
   init({ eventBus, agentRuntime, executor, plannerMode = 'default', timeoutMs, agentsPerTask } = {}) {
     this.eventBus = eventBus;
     this.executor = executor || null;
+    this.agentRuntime = agentRuntime || null;
     this.plannerMode = plannerMode || 'default';
     if (timeoutMs) this.timeoutMs = timeoutMs;
     if (agentsPerTask) this.agentsPerTask = agentsPerTask;
@@ -253,7 +255,7 @@ class Scheduler {
   // ===== 创建顶层任务（方案 §3.1-1）=====
   async createTask(userQuery, opts = {}) {
     const traceId = genTraceId();
-    const { taskId, executorAgent } = opts;
+    const { taskId, executorAgent, previousResult } = opts;
     // 顶层任务写黑板（Hash）
     const mainKey = `blackboard:task:${traceId}:main`;
     blackboard.hset(mainKey, 'trace_id', traceId);
@@ -266,6 +268,8 @@ class Scheduler {
     blackboard.hset(mainKey, 'final_result', '');
     blackboard.hset(mainKey, 'fail_reason', '');
     blackboard.hset(mainKey, 'executor_agent', executorAgent || null);
+    // 上一轮协作结果：供子任务延续上下文（派发时截断注入）
+    blackboard.hset(mainKey, 'previous_result', previousResult || '');
 
     // 触发 TASK_CREATE 事件（自消费）
     const msg = buildMessage({
@@ -296,6 +300,7 @@ class Scheduler {
   // ===== TASK_CREATE → 规划下发（方案 §3.1-2）=====
   async _onTaskCreate(msg) {
     const traceId = msg.msg_meta.trace_id;
+    if (this._isTraceCancelled(traceId)) return; // 创建前已被取消
     const userQuery = (msg.task_context && msg.task_context.task_input && msg.task_context.task_input.user_query) || '';
     const mainKey = `blackboard:task:${traceId}:main`;
     blackboard.hset(mainKey, 'overall_status', TASK_STATUS.RUNNING);
@@ -320,6 +325,8 @@ class Scheduler {
       if (planSource === 'llm') planSource = 'llm_fallback';
       dag = defaultDag(userQuery, traceId);
     }
+    // 规划期间被用户停止：不再写 DAG / 不派发子任务
+    if (this._isTraceCancelled(traceId)) return;
     // 协作日志：记录 DAG 规划（来源 + 子任务 + 依赖）
     CollabLogger.logPlan(traceId, planSource, dag, userQuery);
 
@@ -446,6 +453,7 @@ class Scheduler {
     }
   }
   async _onTimeout(traceId, subId) {
+    if (this._isTraceCancelled(traceId)) return; // 已取消：不再重试/推进
     const subKey = `blackboard:task:${traceId}:sub:${subId}`;
     const sub = blackboard.hgetall(subKey);
     if (!sub || sub.status !== SUB_STATUS.RUNNING) return;
@@ -536,23 +544,57 @@ class Scheduler {
   async _onCancel(msg) {
     const traceId = msg.msg_meta.trace_id;
     const mainKey = `blackboard:task:${traceId}:main`;
+    const externalTaskId = blackboard.hget(mainKey, 'task_id') || traceId;
+
+    // 1) 先把顶层状态置为 CANCELLED（让随后到达的迟到回调/超时检查全部早退）
     blackboard.hset(mainKey, 'overall_status', TASK_STATUS.CANCELLED);
     blackboard.hset(mainKey, 'update_time', Date.now());
-    // 清空运行中标记 + 释放占用的 Agent（busy -> idle）
+
+    // 2) 清理该 trace 下所有子任务的定时器 / 运行中标记 / Agent 占用，
+    //    并把未完成子任务置为 CANCELLED（迟到回调因状态不匹配被忽略）
     const prefix = `blackboard:task:${traceId}:sub:`;
     for (const k of blackboard.keys(prefix)) {
       const sub = blackboard.hgetall(k);
       if (sub && sub.sub_task_id) {
         blackboard.del(`blackboard:running:${sub.sub_task_id}`);
         this._releaseAgents(sub);
-        // 清理该子任务的超时定时器
         if (this._timers.has(sub.sub_task_id)) {
           clearTimeout(this._timers.get(sub.sub_task_id));
           this._timers.delete(sub.sub_task_id);
         }
+        if (![SUB_STATUS.SUCCESS, SUB_STATUS.FAILED, SUB_STATUS.SKIPPED, SUB_STATUS.CANCELLED].includes(sub.status)) {
+          blackboard.hset(k, 'status', SUB_STATUS.CANCELLED);
+          blackboard.hset(k, 'end_time', Date.now());
+          this._emitSubUpdate(traceId, sub, SUB_STATUS.CANCELLED, null);
+        }
       }
     }
+
+    // 3) 杀进程：外部 task_id（子任务调用）+ traceId（规划等以 trace 注册的调用）
+    const killed = procRegistry.killTask(externalTaskId) + procRegistry.killTask(traceId);
+
+    // 4) 复位运行时 Agent 忙碌状态（只释放本对话的调用，不影响其他对话）
+    let released = 0;
+    if (this.agentRuntime && this.agentRuntime.forceReleaseTask) {
+      released = this.agentRuntime.forceReleaseTask(externalTaskId);
+    }
+
+    // 5) 标记会话本轮已停止（编排层据此不再推进后续步骤）
+    sessionManager.cancelTurn(externalTaskId);
+
+    CollabLogger.log('task_cancel_effects', {
+      trace_id: traceId, task_id: externalTaskId,
+      killed_procs: killed, released_calls: released,
+    });
+
     this._resolveTask(traceId, { trace_id: traceId, status: TASK_STATUS.CANCELLED }, null);
+  }
+
+  /** 顶层 trace 是否已取消（供分发/回调路径早退） */
+  _isTraceCancelled(traceId) {
+    if (!traceId) return false;
+    const mainKey = `blackboard:task:${traceId}:main`;
+    return blackboard.hget(mainKey, 'overall_status') === TASK_STATUS.CANCELLED;
   }
 
   /**
