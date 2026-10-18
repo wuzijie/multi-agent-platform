@@ -17,6 +17,7 @@ const agentRuntime = require('../agent/runtime');
 const { enabledAgentNames, enabledAgents } = require('../utils/agent-list');
 const { genTraceId } = require('../engine/events');
 const sessionManager = require('../session/manager');
+const transcript = require('../prompt/transcript');
 
 const ROOT = path.resolve(__dirname, '..', '..');
 
@@ -87,6 +88,17 @@ function parseDiscMsg(content) {
 module.exports = {
 
   // ===== 通用原语 =====
+
+  /**
+   * 用户停止本轮后中止讨论：抛 STOPPED，由各模式的 catch 统一按「已取消」收尾。
+   */
+  _checkDiscCancelled(taskId) {
+    if (sessionManager.isCancelled(taskId)) {
+      const err = new Error('讨论已被用户取消');
+      err.code = 'STOPPED';
+      throw err;
+    }
+  },
 
   /**
    * 初始化讨论元数据到黑板
@@ -261,18 +273,39 @@ module.exports = {
       const msgSeq = this._nextMsgSeq(traceId);
       const ctx = this._buildDiscContext(traceId, t.instruction, t.deps || [], round, mode);
 
+      // 多轮上下文：把往轮对话放在指令尾部，稳定前缀（会话目标/记忆）放 context。
+      // 讨论轮次的材料本身每轮都变，无法完全命中缓存，但同一轮内各模型的
+      // 共同前缀保持一致。
+      let historyText = '';
+      try {
+        historyText = transcript.loadSegments(taskId).join('\n\n');
+      } catch (e) { historyText = ''; }
+      const discTask = this.getTask(taskId) || {};
+      const stableParts = [];
+      if (discTask.session_goal) stableParts.push(`## 会话目标\n${discTask.session_goal}`);
+      if (discTask.frozen_memory) stableParts.push(`## 长期记忆\n${discTask.frozen_memory}`);
+      const stableContext = stableParts.join('\n\n');
+      const tailParts = [];
+      if (historyText) tailParts.push(`## 对话\n${historyText}`);
+      // stableContext 为空时 ctx 只能作为 context；非空时 ctx 作为本轮材料放尾部
+      if (stableContext) tailParts.push(ctx);
+      tailParts.push(t.instruction);
+      const instruction = tailParts.filter(Boolean).join('\n\n');
+
       // 流式事件
       const streamId = uuidv4();
       eventBus.emit('agent:stream:start', { task_id: taskId, agent: t.executor, stream_id: streamId });
 
       try {
         const result = await agentRuntime.executeTaskWithAgent({
-          task_id: `disc_${traceId}_${msgSeq}`,
+          // task_id 用对话 ID（稳定），保证同一轮内各模型共享 prompt 前缀；
+          // 每条讨论消息的序号记录在黑板 msgSeq 中，不影响追踪。
+          task_id: taskId,
           external_task_id: taskId,
           trace_id: traceId,
           role: 'executor',
-          context: ctx,
-          instruction: t.instruction,
+          context: stableContext || ctx,
+          instruction,
           input_files: [],
           disableTools: false, // 允许 fetch_full
         }, [], t.executor, (chunk) => {
@@ -367,6 +400,7 @@ module.exports = {
         const r1 = await this._discRound(traceId, taskId,
           participants.map(a => ({ executor: a, instruction: `基于主题「${topic}」输出你的完整初始观点。包含：核心观点、支撑依据、潜在局限、适用场景。各Agent观点独立，不互相参考。`, deps: [] })),
           1, 'debate');
+        this._checkDiscCancelled(taskId);
         finalSummaries = r1;
 
         // 第二轮：交叉匿名点评（禁止自评）
@@ -380,6 +414,7 @@ module.exports = {
           return { executor: a, instruction: `点评以下观点（来自${target}），指出逻辑漏洞、论据缺陷、对立观点、补充建议。禁止点评自身。`, deps: [targetSeq] };
         });
         const r2 = await this._discRound(traceId, taskId, r2TaskList, 2, 'debate');
+        this._checkDiscCancelled(taskId);
 
         // 第三轮：自我辩解 + 观点初修正
         this._appendConversation(taskId, 'system', `[多方辩论 第3轮] 自我辩解+初修正`);
@@ -391,6 +426,7 @@ module.exports = {
           return { executor: a, instruction: `针对以下点评逐一回应辩解，区分合理建议与无效质疑，吸收有效意见，输出修正版观点。`, deps: reviews };
         });
         const r3 = await this._discRound(traceId, taskId, r3TaskList, 3, 'debate');
+        this._checkDiscCancelled(taskId);
 
         // 第四轮：二次交叉点评（除非分支优化跳过）
         let r4 = [];
@@ -404,6 +440,7 @@ module.exports = {
             return { executor: a, instruction: `针对修正后的新观点（来自${target}）进行二次点评，聚焦残留争议、未解决分歧、新产生的逻辑问题。`, deps: [targetSeq] };
           });
           r4 = await this._discRound(traceId, taskId, r4TaskList, 4, 'debate');
+          this._checkDiscCancelled(taskId);
         } else {
           this._appendConversation(taskId, 'system', `[多方辩论 第4轮] 跳过（观点已统一）`);
         }
@@ -415,6 +452,7 @@ module.exports = {
           return { executor: a, instruction: `整合第二轮和第四轮的全部有效信息，二次修正自身观点。统一输出：全员共识清单、核心分歧清单、未解决争议点、各自立场总结。`, deps: allReviewSeqs };
         });
         const r5 = await this._discRound(traceId, taskId, r5TaskList, 5, 'debate');
+        this._checkDiscCancelled(taskId);
         finalSummaries = r5;
       }
 
@@ -436,6 +474,9 @@ module.exports = {
       task.updated_at = new Date().toISOString();
       this._saveTask(task);
       this._updateIndex(task);
+
+      // 记录本轮问答，供下一轮对话延续上下文
+      this._recordTurnToTranscript(taskId, topic, '多方辩论', allFinal);
 
       return { task, result: { status: 'success', content: allFinal } };
     } catch (e) {
@@ -510,6 +551,7 @@ module.exports = {
         deps: [],
       }));
       const r1 = await this._discRound(traceId, taskId, r1TaskList, 1, 'brainstorm');
+      this._checkDiscCancelled(taskId);
       const r1MsgSeqs = r1.map(s => s.msgSeq);
 
       // 第二轮：分层首次收敛
@@ -534,6 +576,7 @@ module.exports = {
         ], 2, 'brainstorm');
       }
       const r2MsgSeqs = r2.map(s => s.msgSeq);
+      this._checkDiscCancelled(taskId);
 
       // 第三轮：终极二次收敛
       this._appendConversation(taskId, 'system', `[头脑风暴 第3轮] 终极二次收敛`);
@@ -542,6 +585,7 @@ module.exports = {
         instruction: `对以下收敛结果进行合并、去重、补全、择优，输出唯一、完整、可落地的最终综合结论。剔除无效观点、合并重复思路、保留优质创意、补齐逻辑短板。`,
         deps: r2MsgSeqs,
       }], 3, 'brainstorm');
+      this._checkDiscCancelled(taskId);
 
       // 收敛
       const finalContent = r3[0] && r3[0].fullText || '';
@@ -558,6 +602,9 @@ module.exports = {
       task.updated_at = new Date().toISOString();
       this._saveTask(task);
       this._updateIndex(task);
+
+      // 记录本轮问答，供下一轮对话延续上下文
+      this._recordTurnToTranscript(taskId, topic, '头脑风暴', finalContent);
 
       return { task, result: { status: 'success', content: finalContent } };
     } catch (e) {
@@ -625,6 +672,7 @@ module.exports = {
         instruction: `基于主题「${topic}」输出你的核心观点、支撑依据。`,
         deps: [],
       }], 1, 'duel');
+      this._checkDiscCancelled(taskId);
       lastSummaries = r1;
 
       // 交替对抗
@@ -640,6 +688,7 @@ module.exports = {
           deps: [prevSeq],
         }], round, 'duel');
         lastSummaries = r;
+        this._checkDiscCancelled(taskId);
         prevSeq = r[0].msgSeq;
         currentAgent = otherAgent;
 
@@ -663,6 +712,7 @@ module.exports = {
         instruction: `统筹总结双方共识、核心分歧、各自坚守立场、问题最终结论。`,
         deps: allMsgSeqs,
       }], round + 1, 'duel');
+      this._checkDiscCancelled(taskId);
 
       const finalContent = summaryRound[0] && summaryRound[0].fullText || '';
       const summaryText = `### 🤖 助手 - ${new Date().toISOString()}\n\n**一对一辩论结果**\n\n讨论主题：${topic}\n${agentA} vs ${agentB}\n交互轮次：${round}\n\n最终结论：\n${finalContent}\n\n---\n`;
@@ -678,6 +728,9 @@ module.exports = {
       task.updated_at = new Date().toISOString();
       this._saveTask(task);
       this._updateIndex(task);
+
+      // 记录本轮问答，供下一轮对话延续上下文
+      this._recordTurnToTranscript(taskId, topic, '一对一辩论', finalContent);
 
       return { task, result: { status: 'success', content: finalContent } };
     } catch (e) {

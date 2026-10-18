@@ -224,7 +224,7 @@
     // ====== Collab Task Panel（事件驱动协作：右侧任务列表）======
     function CollabTaskPanel({ tasks }) {
       var typeLabel = { PLAN_TASK: '规划', CODE_TASK: '执行', REVIEW_TASK: '评审', SUMMARY_TASK: '汇总', DEBUG_TASK: '调试', RESEARCH_TASK: '调研', FINAL_TASK: '终稿' };
-      var statusLabel = { PENDING: '待执行', RUNNING: '执行中', SUCCESS: '完成', RETRYING: '重试中', TIMEOUT: '超时', FAILED: '失败', SKIPPED: '跳过' };
+      var statusLabel = { PENDING: '待执行', RUNNING: '执行中', SUCCESS: '完成', RETRYING: '重试中', TIMEOUT: '超时', FAILED: '失败', SKIPPED: '跳过', CANCELLED: '已取消' };
       return h('div', { className: 'w-64 flex-shrink-0 border-l border-gray-200 bg-gray-50 p-4 overflow-y-auto' },
         h('div', { className: 'text-xs font-bold text-gray-500 mb-3' }, '任务列表'),
         (!tasks || tasks.length === 0)
@@ -308,15 +308,32 @@
                 var isActive = c.task_id === activeId;
                 var lastMsg = c._lastMessage || '';
                 var statusColor = statusColorMap;
+                // 选择对话：onMouseDown 立即响应（防止点击期间列表刷新导致 click 丢失），
+                // onClick 兜底（键盘 / 触屏 / 辅助技术）
+                var select = function(e) {
+                  if (e && e.button !== undefined && e.button !== 0) return;
+                  if (c.task_id) onSelect(c.task_id);
+                };
                 return h('div', {
                   key: c.task_id,
-                  onClick: function() { onSelect(c.task_id); },
-                  className: 'px-3 py-2.5 mx-2 my-0.5 rounded-lg cursor-pointer transition-colors group ' + (isActive ? 'bg-blue-100 border border-blue-200' : 'hover:bg-gray-100 border border-transparent'),
+                  role: 'button',
+                  tabIndex: 0,
+                  onMouseDown: select,
+                  onClick: select,
+                  onKeyDown: function(e) {
+                    if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); select(); }
+                  },
+                  className: 'px-3 py-2.5 mx-2 my-0.5 rounded-lg cursor-pointer transition-colors group select-none ' + (isActive ? 'bg-blue-100 border border-blue-200' : 'hover:bg-gray-100 border border-transparent'),
                 },
                   h('div', { className: 'flex items-center gap-2' },
                     h('span', { className: 'w-2 h-2 rounded-full flex-shrink-0 ' + (statusColor[c.status] || 'bg-gray-400') }),
                     h('span', { className: 'text-sm font-medium truncate flex-1 ' + (isActive ? 'text-blue-800' : 'text-gray-700') }, c.name || '未命名对话'),
-                    h('button', { onClick: function(e) { e.stopPropagation(); onDelete(c.task_id); }, className: 'opacity-0 group-hover:opacity-100 p-0.5 hover:bg-red-100 rounded transition-all', title: '删除' },
+                    h('button', {
+                      onMouseDown: function(e) { e.stopPropagation(); },
+                      onClick: function(e) { e.stopPropagation(); onDelete(c.task_id); },
+                      className: 'opacity-0 group-hover:opacity-100 p-0.5 hover:bg-red-100 rounded transition-all',
+                      title: '删除'
+                    },
                       h('svg', { className: 'w-3.5 h-3.5 text-red-400', fill:'none', stroke:'currentColor', viewBox:'0 0 24 24' },
                         h('path', { strokeLinecap:'round', strokeLinejoin:'round', strokeWidth:2, d:'M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16' })
                       )
@@ -977,7 +994,7 @@
           // 合并服务器列表与本地状态：WS 已推进的进度（RUNNING/SUCCESS 等）不回退；
           // 同时剔除本地残留的其他回合/其他任务的子任务
           setCollabTasks(function(prev) {
-            var statusRank = { PENDING: 1, RUNNING: 2, RETRYING: 3, TIMEOUT: 4, SUCCESS: 5, FAILED: 6 };
+            var statusRank = { PENDING: 1, RUNNING: 2, RETRYING: 3, TIMEOUT: 4, SUCCESS: 5, FAILED: 6, CANCELLED: 7 };
             var byId = {};
             (cdata.sub_tasks || []).forEach(function(t) { byId[t.sub_task_id] = t; });
             (prev || []).forEach(function(p) {

@@ -20,7 +20,12 @@ function killTask(taskId) {
   let n = 0;
   for (const [proc, info] of _procs) {
     if (info.taskId === taskId) {
-      try { proc.kill('SIGKILL'); n++; } catch (e) { /* 忽略已退出 */ }
+      try {
+        // 标记为用户主动停止：适配器据此返回 cancelled，而不是 timeout/failed
+        proc.__userKilled = true;
+        proc.kill('SIGKILL');
+        n++;
+      } catch (e) { /* 忽略已退出 */ }
       _procs.delete(proc);
     }
   }
@@ -31,10 +36,18 @@ function killTask(taskId) {
 function killAll() {
   const list = Array.from(_procs.values());
   for (const { proc } of list) {
-    try { proc.kill('SIGKILL'); } catch (e) { /* 忽略已退出 */ }
+    try {
+      proc.__userKilled = true;
+      proc.kill('SIGKILL');
+    } catch (e) { /* 忽略已退出 */ }
   }
   _procs.clear();
   return list.length;
+}
+
+/** 进程是否由用户主动停止（供适配器区分 cancelled / timeout） */
+function isUserKilled(proc) {
+  return !!(proc && proc.__userKilled);
 }
 
 /** 当前在跑的进程数 */
@@ -42,4 +55,4 @@ function count() {
   return _procs.size;
 }
 
-module.exports = { register, killTask, killAll, count };
+module.exports = { register, killTask, killAll, isUserKilled, count };

@@ -17,11 +17,38 @@ class Session {
     this.traces = [];          // 该对话活跃的 trace_id（collab / skill）
     this.busyAgents = new Set(); // 该对话当前占用的模型
     this.status = 'idle';      // idle | running | completed
+    this.cancelledTurn = false; // 本轮是否被用户停止（区分「停止本轮」与「结束对话」）
     this.createdAt = Date.now();
     this.lastActiveAt = Date.now();
   }
 
-  touch() { this.lastActiveAt = Date.now(); this.status = 'running'; }
+  touch() {
+    this.lastActiveAt = Date.now();
+    this.status = 'running';
+  }
+
+  /**
+   * 新一轮用户消息开始：复位上一轮的取消标志。
+   * 仅应在收到新消息时调用——occupyAgent/addTrace 等活跃更新不能清取消标志，
+   * 否则「停止后仍有并发调用在收尾」会覆盖掉 cancelledTurn。
+   */
+  beginTurn() {
+    this.cancelledTurn = false;
+    this.touch();
+  }
+
+  /**
+   * 标记「本轮被用户停止」：
+   * 与 markCompleted（结束对话）区分，编排层据此不再推进后续步骤。
+   */
+  cancel() {
+    this.cancelledTurn = true;
+    this.status = 'completed';
+  }
+
+  isCancelled() {
+    return this.cancelledTurn === true;
+  }
 
   addTrace(traceId) {
     if (!this.traces.includes(traceId)) this.traces.push(traceId);
@@ -43,6 +70,7 @@ class Session {
     return {
       task_id: this.taskId,
       status: this.status,
+      cancelled_turn: this.cancelledTurn,
       traces: this.traces,
       busy_agents: Array.from(this.busyAgents),
       created_at: this.createdAt,
@@ -92,6 +120,22 @@ class SessionManager {
     return false;
   }
 
+  /**
+   * 查询某对话本轮是否已被用户停止。
+   * 只查已存在的 session，不创建（避免空 task_id 产生垃圾 session）。
+   */
+  isCancelled(taskId) {
+    const s = this._sessions.get(taskId);
+    return !!(s && s.cancelledTurn);
+  }
+
+  /** 标记「本轮被停止」（不创建 session 时返回 null） */
+  cancelTurn(taskId) {
+    const s = this._sessions.get(taskId);
+    if (s) s.cancel();
+    return s || null;
+  }
+
   /** 当前活跃（running 或有 trace/busyAgent）的会话 */
   activeSessions() {
     return Array.from(this._sessions.values()).filter(s =>
@@ -104,7 +148,7 @@ class SessionManager {
     for (const s of sessions) {
       s.busyAgents.clear();
       s.traces = [];
-      s.status = 'completed';
+      s.cancel(); // 置 cancelledTurn + status=completed
       CollabLogger.log('session_stopped', { task_id: s.taskId, session: s.toJSON() });
     }
     return sessions.length;

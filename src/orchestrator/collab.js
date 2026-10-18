@@ -8,6 +8,8 @@ const blackboard = require('../blackboard/blackboard');
 const agentRuntime = require('../agent/runtime');
 const scheduler = require('../engine/scheduler');
 const skillLoader = require('../skills/loader');
+const transcript = require('../prompt/transcript');
+const { historyConfig } = require('../prompt/config');
 const { enabledAgentNames } = require('../utils/agent-list');
 const { TASK_STATUS, TASK_TYPES, genSubTaskId } = require('../engine/events');
 
@@ -119,6 +121,27 @@ module.exports = {
     // 权威提示：即使 task_planning skill 正文仍列着停用的模型，最终都以当前已启用名单为准，
     // 防止主 agent 给停用模型（如吉米）分配子任务。
     planPrompt += `\n\n重要：当前已启用的可分配执行模型只有：${enabledAgentNames().join('、') || '无'}。子任务的 "agent" 字段只能取上述名单之一，禁止分配给名单外的模型。`;
+
+    // 多轮协作：把往轮对话与上一轮结果注入规划提示词，
+    // 让主 agent 能解析“把刚才的方案改一下”这类指代。
+    // 规划是单次调用，不追求跨轮缓存，因此放在提示词尾部即可。
+    try {
+      const cfg = historyConfig();
+      const externalTaskId = blackboard.hget(`blackboard:task:${traceId}:main`, 'task_id') || '';
+      if (externalTaskId) {
+        const segments = transcript.loadSegments(externalTaskId);
+        const historyText = segments.join('\n\n').slice(-Number(cfg.dag_planner_history_chars));
+        if (historyText) {
+          planPrompt += `\n\n=== 往轮对话（仅用于理解指代，不要重复回答） ===\n${historyText}`;
+        }
+        const prevTask = this.getTask(externalTaskId);
+        const prevResult = (prevTask && prevTask.result) ? String(prevTask.result).slice(-Number(cfg.dag_last_result_chars)) : '';
+        if (prevResult) {
+          planPrompt += `\n\n=== 上一轮协作结果（供延续，不必复述） ===\n${prevResult}`;
+        }
+      }
+    } catch (e) { /* 历史注入失败不影响规划 */ }
+
     planPrompt += '\n\n用户请求：' + userQuery;
 
     try {
@@ -128,6 +151,7 @@ module.exports = {
       eventBus.emit('agent:stream:start', { task_id: externalTaskId, agent: '克劳德', stream_id: streamId });
       const result = await agentRuntime.executeTaskWithAgent({
         task_id: traceId,
+        external_task_id: externalTaskId, // 供进程注册/停止匹配（否则取消时杀不到规划进程）
         role: 'executor',
         context: '任务规划拆解',
         instruction: planPrompt,
@@ -137,6 +161,9 @@ module.exports = {
         eventBus.emit('agent:stream:chunk', { task_id: externalTaskId, agent: '克劳德', chunk, stream_id: streamId });
       });
       eventBus.emit('agent:stream:end', { task_id: externalTaskId, agent: '克劳德', stream_id: streamId });
+
+      // 规划期间被用户停止：不再产出 DAG
+      if (result && result.status === 'cancelled') return null;
 
       const content = (result && result.content) || '';
       const parsed = this._parsePlanOutput(content, userQuery, traceId);
@@ -219,13 +246,30 @@ module.exports = {
       const result = await scheduler.createTask(userMessage, {
         taskId,
         executorAgent: task.executor_agent || '克劳德',
+        // 上一轮协作结果：供各子任务延续上下文（截断后注入）
+        previousResult: task.result || '',
       });
+
+      // 用户停止本轮：不写「协作结果」、不把任务回写成执行中
+      if (result && result.status === TASK_STATUS.CANCELLED) {
+        this._appendConversation(taskId, 'system', '[本轮已停止] 用户停止了本轮协作');
+        task.last_run_status = 'stopped';
+        task.updated_at = new Date().toISOString();
+        this._saveTask(task);
+        this._updateIndex(task);
+        eventBus.emit('task:stopped', { task_id: taskId, scope: 'turn' });
+        return { task, result: '', stopped: true };
+      }
+
       // result: { trace_id, final_result, status }
       const content = (result && result.final_result) || '';
       const succeeded = result && result.status === TASK_STATUS.SUCCESS;
       const traceId = result && result.trace_id;
 
       this._appendConversation(taskId, 'assistant', `**事件驱动协作结果**\n\n${content}`);
+
+      // 记录本轮问答，供下一轮对话延续上下文
+      this._recordTurnToTranscript(taskId, userMessage, task.executor_agent || '克劳德', content);
 
       // 多轮对话：保持任务 executing（不结束），记录最新协作 trace 供右侧任务面板查询
       task.status = 'executing';

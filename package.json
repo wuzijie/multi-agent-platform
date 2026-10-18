@@ -7,7 +7,8 @@
     "start": "node src/index.js",
     "dev": "node --watch src/index.js",
     "build:frontend": "cd frontend-src && npm run build",
-    "test": "node tests/verification.js"
+    "test": "node tests/verification.js",
+    "test:prompt": "node tests/prompt-context.test.js"
   },
   "dependencies": {
     "express": "^4.21.0",

@@ -4,6 +4,7 @@ const path = require('path');
 const fs = require('fs');
 const os = require('os');
 const ModelLogger = require('../utils/model-logger');
+const { buildPrompt } = require('./prompt-template');
 
 const ROOT = path.resolve(__dirname, '..', '..');
 
@@ -245,6 +246,19 @@ class KimiAdapter {
     try {
       const result = await this._runCli(args, fullPrompt, timeoutMs, onChunk, input.external_task_id || input.task_id);
 
+      // 用户主动停止本轮：返回 cancelled（不当作失败/超时，避免上层重试链）
+      if (result.cancelled) {
+        ModelLogger.logResponse(this.name, model, '[用户停止]', {
+          ...meta, request_id: requestId, status: 'cancelled', error_code: 'CANCELLED',
+          error_message: '用户已停止本轮任务', duration_ms: Date.now() - startTime,
+          exit_code: result.exit_code, killed_by_timeout: false, stream_ok: null,
+        });
+        return buildKimiOutput(input.task_id, 'cancelled', result.stdout || '', {
+          error: { code: 'CANCELLED', message: '用户已停止本轮任务' },
+          duration_ms: Date.now() - startTime,
+        });
+      }
+
       if (result.exit_code === 0) {
         // 使用 text 格式，stdout 直接就是内容；仍然尝试 stream-json 解析以兼容
         const content = result.stdout ? this._parseStreamJson(result.stdout) : '';
@@ -302,32 +316,13 @@ class KimiAdapter {
    * 构建提示词
    */
   _buildPrompt(input) {
-    const roleLabel = {
-      'executor': '执行者',
-      'reviewer': '评审者',
-      'guardian': '愿景守护者',
-    }[input.role] || input.role;
-
-    const lines = [
-      `你是一个多智能体协作平台中的${roleLabel}智能体（吉米）。`,
-      '',
-      '## 任务ID',
-      input.task_id,
-      '',
-      '## 任务背景',
-      input.context,
-      '',
-      '## 执行指令',
-      input.instruction,
-      '',
-      '## 要求',
-      '- 请根据以上指令完成你的工作',
-      '- 直接输出结果内容，不需要多余的说明',
-      '- 如果任务涉及代码，请确保代码可以正常运行',
-      '- 如果任务不可行，请明确说明原因',
-    ];
-
-    return lines.join('\n');
+    return buildPrompt({
+      agentLabel: '吉米',
+      role: input.role,
+      taskId: input.task_id,
+      context: input.context,
+      instruction: input.instruction,
+    });
   }
 
   /**
@@ -425,12 +420,14 @@ class KimiAdapter {
       });
 
       proc.on('close', (code) => {
+        const userKilled = procRegistry.isUserKilled(proc);
         resolve({
           exit_code: code,
           stdout: stdout.trim(),
           stderr: stderr.trim(),
-          // code === null 表示被信号杀死（spawn timeout 会 SIGTERM 杀掉进程）
-          killed_by_timeout: code === null || Date.now() - startAt >= (timeoutMs || 120000) - 500,
+          // code === null 表示被信号杀死；用户主动停止不算超时
+          killed_by_timeout: !userKilled && (code === null || Date.now() - startAt >= (timeoutMs || 120000) - 500),
+          cancelled: userKilled,
         });
       });
 
@@ -440,6 +437,7 @@ class KimiAdapter {
           stdout: stdout.trim(),
           stderr: err.message,
           killed_by_timeout: false,
+          cancelled: false,
         });
       });
     });
