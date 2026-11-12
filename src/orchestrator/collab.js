@@ -24,6 +24,17 @@ const COLLAB_TYPE_LABEL = {
   FINAL_TASK: '终稿',
 };
 
+/**
+ * 解析依赖序号：只接受整数或纯数字字符串。
+ * 布尔、小数、对象、负号字符串等一律视为非法。
+ * @returns {number|null}
+ */
+function toDepIndex(value) {
+  if (typeof value === 'number') return Number.isInteger(value) ? value : null;
+  if (typeof value === 'string' && /^\d+$/.test(value.trim())) return parseInt(value.trim(), 10);
+  return null;
+}
+
 module.exports = {
 
   /**
@@ -116,7 +127,7 @@ module.exports = {
     } catch (e) { planPrompt = ''; }
     if (!planPrompt.trim()) {
       const defaultAgent = enabledAgentNames()[0] || '克劳德';
-      planPrompt = `你是一个多智能体协作平台中的主智能体（克劳德），负责把用户的请求拆解为可执行的子任务 DAG（2-5 个子任务，有依赖关系），并为每个子任务指定执行模型（${enabledAgentNames().join('/')}）。输出纯 JSON 数组，格式：[{"type":"PLAN_TASK|CODE_TASK|REVIEW_TASK|SUMMARY_TASK|DEBUG_TASK","instruction":"执行指令","deps":[依赖序号],"agent":"${defaultAgent}"}]，不要任何其他文字。`;
+      planPrompt = `你是一个多智能体协作平台中的主智能体（克劳德），负责把用户的请求拆解为可执行的子任务 DAG（2-5 个子任务，有依赖关系），并为每个子任务指定执行模型（${enabledAgentNames().join('/')}）。输出纯 JSON 数组，格式：[{"type":"PLAN_TASK|CODE_TASK|REVIEW_TASK|SUMMARY_TASK|DEBUG_TASK","instruction":"执行指令","deps":[依赖序号],"agent":"${defaultAgent}"}]，不要任何其他文字。注意：deps 只能引用序号比当前子任务更小的子任务；如果子任务需要某个祖先子任务的原始产出，必须把该祖先也写进 deps，否则只能看到直接上游的输出。`;
     }
     // 权威提示：即使 task_planning skill 正文仍列着停用的模型，最终都以当前已启用名单为准，
     // 防止主 agent 给停用模型（如吉米）分配子任务。
@@ -198,12 +209,38 @@ module.exports = {
     }
     if (!Array.isArray(arr) || arr.length === 0) return null;
 
+    // ===== 依赖合法性校验 =====
+    // deps 同时承担「执行顺序」和「上下文注入」两个语义：
+    //   - 只允许指向序号更小的节点（更早的子任务）
+    //   - 非整数 / 负数 / 越界 / 自依赖 / 前向依赖，一律视为整份规划非法
+    // 由于边只能指向更早节点，环在结构上不可能出现。
+    // 校验失败直接返回 null，由 _planTask 回退默认 DAG，避免调度器永久挂起。
+    const invalidDeps = [];
+    for (let seq = 0; seq < arr.length; seq++) {
+      const item = arr[seq];
+      if (!item || typeof item !== 'object' || Array.isArray(item)) {
+        invalidDeps.push(`sub_${seq}:节点格式非法`);
+        continue;
+      }
+      const rawDeps = Array.isArray(item.deps) ? item.deps : [];
+      for (const d of rawDeps) {
+        const idx = toDepIndex(d);
+        if (idx === null || idx < 0 || idx >= seq) {
+          invalidDeps.push(`sub_${seq}<-${String(d)}`);
+        }
+      }
+    }
+    if (invalidDeps.length > 0) {
+      console.warn(`[EventDriven] 规划依赖非法（越界/自依赖/前向/非整数），回退默认 DAG: ${invalidDeps.join(', ')}`);
+      return null;
+    }
+
     const agentAlias = { claude: '克劳德', kimi: '吉米', deepseek: '迪普斯克', qwen: '钱文' };
     const nodes = arr.map((item, seq) => {
       const type = item.type || TASK_TYPES.CODE;
-      const deps = Array.isArray(item.deps) ? item.deps.map(d => Number(d)) : [];
-      const depsIds = deps
-        .filter(d => Number.isInteger(d) && d >= 0 && d < arr.length && d !== seq)
+      const rawDeps = Array.isArray(item.deps) ? item.deps : [];
+      const depsIds = [...new Set(rawDeps.map(toDepIndex))]
+        .filter(d => d !== null && d >= 0 && d < seq)
         .map(d => genSubTaskId(traceId, d));
       let agent = item.agent || '';
       agent = agentAlias[String(agent).toLowerCase()] || agent;
@@ -242,6 +279,10 @@ module.exports = {
     try {
       // 用户消息补写进对话（其他模式都会记录用户提问，事件驱动模式此前遗漏）
       this._appendConversation(taskId, 'user', userMessage || task.instruction || task.description, { target: task.executor_agent || '克劳德' });
+      // 自动路由进入事件驱动时，给用户一个可见提示（无需手动开开关）
+      if (opts.auto_triggered) {
+        this._appendConversation(taskId, 'system', '[协作模式] 检测到多步骤任务，已自动启用事件驱动（DAG）');
+      }
 
       const result = await scheduler.createTask(userMessage, {
         taskId,
@@ -250,10 +291,12 @@ module.exports = {
         previousResult: task.result || '',
       });
 
-      // 用户停止本轮：不写「协作结果」、不把任务回写成执行中
+      // 用户停止本轮：不写「协作结果」、不结束对话（仍可继续输入）
       if (result && result.status === TASK_STATUS.CANCELLED) {
-        this._appendConversation(taskId, 'system', '[本轮已停止] 用户停止了本轮协作');
+        this._appendConversation(taskId, 'system', '[本轮已停止] 用户停止了本轮协作，对话仍可继续');
+        task.status = 'executing';
         task.last_run_status = 'stopped';
+        delete task.suspend_reason;
         task.updated_at = new Date().toISOString();
         this._saveTask(task);
         this._updateIndex(task);

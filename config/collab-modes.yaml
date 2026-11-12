@@ -1,0 +1,21 @@
+# 固定协作模式注册开关（注销 ≠ 删除）
+#
+# 置 enabled: false 时：
+#   - 关键词意图路由不触发该模式
+#   - API 显式传 collab_mode 时不再进入该模式（按普通对话处理并写系统提示）
+#   - 对应 FC 工具（skills/*.md 的 tool.enabled）需同步关闭
+#
+# 代码实现（src/orchestrator/collab-modes.js、src/skills/*.js）保留，随时可恢复。
+collab_modes:
+  debate:
+    enabled: false
+    label: 多方辩论
+  brainstorm:
+    enabled: false
+    label: 头脑风暴
+  duel:
+    enabled: false
+    label: 一对一辩论
+  discussion:
+    enabled: false
+    label: 多模型循环讨论

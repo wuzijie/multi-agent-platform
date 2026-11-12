@@ -1,0 +1,18 @@
+# @ 触发规则（首行识别）
+mention:
+  # 用户消息首行最多允许的 @ 数量（两个 = 并行回答同一问题）
+  user_max: 2
+  # 模型输出首行最多允许的 @ 数量（超过视为违规，整条转交忽略）
+  model_max: 1
+  # 两个 @ 的执行方式：parallel（并行回答同一问题）| serial
+  mode: parallel
+  # 转交链最大跳数
+  max_hops: 3
+  # 单轮最多 spawn 的 CLI 次数（防爆炸）
+  max_spawns_per_turn: 6
+  # 模型名别名（除中文名外，允许 @claude / @kimi / @deepseek / @qwen）
+  aliases:
+    克劳德: ["claude"]
+    吉米: ["kimi"]
+    迪普斯克: ["deepseek"]
+    钱文: ["qwen"]

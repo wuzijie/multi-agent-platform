@@ -5,6 +5,8 @@ description: 多Agent定向差异化发散 + 分层收敛 + 终极二次收敛�
 enabled: true
 
 tool:
+  # 已注销：不注册为 FC 工具（恢复时改回 true）
+  enabled: false
   name: brainstorm
   description: |
     启动头脑风暴模式（创意产出型）。多Agent按差异化维度并行发散，分层首次收敛，终极二次收敛，共3轮。

@@ -388,6 +388,8 @@
       var messagesEndRef = props.messagesEndRef, hasActiveConversation = props.hasActiveConversation;
       var agents = props.agents || [];
       var streams = props.streams || {};
+      var collabMode = !!props.collabMode;
+      var onToggleCollabMode = props.onToggleCollabMode;
       var inputRef = useRef(null);
       var inputState = useState('');
       var input = inputState[0], setInput = inputState[1];
@@ -472,8 +474,9 @@
           resetAgent = true;
           dismissedRef.current = false;
         }
-        // 传递所有被@的 Agent（1个=普通模式，2个及以上=讨论模式）
-        onSend(cleanMsg, atAgent, resetAgent, atAgents.length >= 2 ? atAgents : null);
+        // 首行 @ 由后端解析（含“最多两个、并行回答”规则）。
+        // 前端不再剥离 @ 文本，也不再传递 discussion_agents；消息原文发给后端。
+        onSend(msg, atAgent, resetAgent, null);
       }
 
       function handleKeyDown(e) {
@@ -535,7 +538,7 @@
       function selectMention(agent) {
         setMentionedAgent(agent);
         setShowMention(false);
-        // Replace @filter with @AgentName in input
+        // 把 @AgentName 插入输入框：首行 @ 由后端识别，因此必须真的写进文本
         var val = input;
         var atPos = val.lastIndexOf('@');
         if (atPos >= 0) {
@@ -545,6 +548,8 @@
           if (spaceIdx >= 0) after = after.substring(spaceIdx);
           else after = '';
           setInput(before + '@' + agent.name + ' ' + after);
+        } else {
+          setInput('@' + agent.name + ' ' + val);
         }
         setTimeout(function() { if (inputRef.current) inputRef.current.focus(); }, 50);
       }
@@ -709,6 +714,19 @@
         h('div', { className: 'px-5 py-3 border-t border-gray-100 bg-white' },
           inputEnabled
             ? h('div', null,
+                // 协作模式开关：事件驱动 = 主 Agent 拆解 DAG，多模型分工执行
+                h('div', { className: 'mb-2 flex items-center gap-2' },
+                  h('span', { className: 'text-xs text-gray-400' }, '协作模式:'),
+                  h('button', {
+                    onClick: onToggleCollabMode,
+                    disabled: loading,
+                    title: '开启后由主 Agent 拆解任务 DAG，多个模型按依赖分工执行（此时 @多模型讨论不生效）；关闭则按自动路由（单 Agent / @多模型讨论 / 关键词协作）',
+                    className: 'text-xs px-2.5 py-1 rounded-full border transition-colors ' + (collabMode
+                      ? 'bg-blue-600 text-white border-blue-600'
+                      : 'bg-white text-gray-500 border-gray-200 hover:border-gray-300') + (loading ? ' opacity-50 cursor-not-allowed' : '')
+                  }, collabMode ? '事件驱动（DAG）' : '自动'),
+                  collabMode && h('span', { className: 'text-xs text-gray-400' }, '将拆解为多个子任务并行执行')
+                ),
                 // @mention selected chip
                 mentionedAgent && h('div', { className: 'mb-2 flex items-center gap-2' },
                   h('span', { className: 'text-xs text-gray-400' }, '回答者:'),
@@ -753,7 +771,9 @@
                   ),
                   h('textarea', {
                     ref: inputRef, value: input,
-                    placeholder: isNewConversation ? '输入你的需求，开始对话... 也可用 @Agent名 指定回答者' : '继续输入... 也可用 @Agent名 指定回答者',
+                    placeholder: collabMode
+                      ? '输入任务，事件驱动模式将拆解为 DAG 并行执行...'
+                      : (isNewConversation ? '输入你的需求，开始对话... 也可用 @Agent名 指定回答者' : '继续输入... 也可用 @Agent名 指定回答者'),
                     rows: 1, disabled: loading,
                     onChange: handleInputChange,
                     onKeyDown: handleKeyDown,
@@ -824,6 +844,10 @@
       // 按对话维度跟踪"正在执行"的任务（多对话并行：A 执行中不影响新开 B）
       var busyTasksState = useState({});   // { taskId: true } + { __new__: true }（新对话发送中）
       var busyTasks = busyTasksState[0], setBusyTasks = busyTasksState[1];
+      // 事件驱动协作开关：开启后每个请求都带 collab_mode='event-driven'
+      // （按请求生效、不持久化；切换对话时保持当前选择）
+      var collabModeState = useState(false);
+      var collabMode = collabModeState[0], setCollabMode = collabModeState[1];
       var globalBusyState = useState(false); // 全局瞬态操作（如 stop-all）
       var globalBusy = globalBusyState[0], setGlobalBusy = globalBusyState[1];
       // 停止中标志：拦截后续 WS 流式事件（kill 进程到 WS 断流有短暂延迟）
@@ -1099,7 +1123,7 @@
           try {
             var discussion = discussAgents && discussAgents.length >= 2 ? discussAgents.map(function(a) { return a.name; }) : null;
             if (activeId) {
-              var res = await api('/tasks/' + activeId + '/chat', { method: 'POST', body: JSON.stringify({ message: message, mentioned_agent: mentionedAgent ? mentionedAgent.name : (resetAgent ? '克劳德' : undefined), model_cli: mentionedAgent ? mentionedAgent.model_cli : undefined, discussion_agents: discussion }) });
+              var res = await api('/tasks/' + activeId + '/chat', { method: 'POST', body: JSON.stringify({ message: message, mentioned_agent: mentionedAgent ? mentionedAgent.name : (resetAgent ? '克劳德' : undefined), model_cli: mentionedAgent ? mentionedAgent.model_cli : undefined, discussion_agents: discussion, collab_mode: collabMode ? 'event-driven' : undefined }) });
               var data = await res.json();
               if (data.task) setActiveTask(data.task);
               fetchConversation(activeId);
@@ -1127,7 +1151,7 @@
                 return n;
               });
 
-              var execRes = await api('/tasks/' + newTask.task_id + '/execute', { method: 'POST', body: JSON.stringify({ message: message, mentioned_agent: agent ? agent.name : undefined, model_cli: agent ? agent.model_cli : undefined, discussion_agents: discussion }) });
+              var execRes = await api('/tasks/' + newTask.task_id + '/execute', { method: 'POST', body: JSON.stringify({ message: message, mentioned_agent: agent ? agent.name : undefined, model_cli: agent ? agent.model_cli : undefined, discussion_agents: discussion, collab_mode: collabMode ? 'event-driven' : undefined }) });
               var execData = await execRes.json();
               if (execData.task) setActiveTask(execData.task);
               fetchConversation(newTask.task_id);
@@ -1276,6 +1300,8 @@
               hasActiveConversation: !!activeId,
               agents: agents,
               streams: streams,
+              collabMode: collabMode,
+              onToggleCollabMode: function() { setCollabMode(function(v) { return !v; }); },
             })
           ),
 

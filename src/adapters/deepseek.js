@@ -5,21 +5,15 @@ const fs = require('fs');
 const os = require('os');
 const ModelLogger = require('../utils/model-logger');
 const { buildPrompt } = require('./prompt-template');
+const capabilities = require('./contract/capabilities');
+const { ERROR_CODE, SESSION_MISSING_PATTERNS } = require('./contract/enums');
+const { validateUnifiedInput: validateInput } = require('./contract/validate');
 
 const ROOT = path.resolve(__dirname, '..', '..');
 
-function validateInput(input) {
-  const required = ['task_id', 'role', 'context', 'instruction'];
-  for (const field of required) {
-    if (!input[field]) {
-      throw new Error(`Missing required field in UnifiedInput: ${field}`);
-    }
-  }
-  if (!['executor', 'reviewer', 'guardian'].includes(input.role)) {
-    throw new Error(`Invalid role: ${input.role}`);
-  }
-  return input;
-}
+/**
+ * 统一输入格式验证（见 contract/validate.js）
+ */
 
 function buildOutput(taskId, status, content, opts = {}) {
   return {
@@ -30,6 +24,7 @@ function buildOutput(taskId, status, content, opts = {}) {
     error: opts.error || null,
     tokens_used: opts.tokens_used || 0,
     duration_ms: opts.duration_ms || 0,
+    session_id: opts.session_id || null,
   };
 }
 
@@ -138,6 +133,8 @@ class DeepSeekAdapter {
   async execute(input, onChunk) {
     validateInput(input);
     const startTime = Date.now();
+    this._capturedSessionId = null;
+    const session = input.session || {};
 
     const prompt = this._buildPrompt(input);
     let fullPrompt = prompt;
@@ -171,7 +168,17 @@ class DeepSeekAdapter {
 
     // 仅走 CLI（不直连 API）：CLI 内部对接对应 API
     try {
-      const result = await this._runCli(['-p', '-o', 'text'], fullPrompt, timeoutMs, model, onChunk, input.external_task_id || input.task_id);
+      // resume 参数统一来自能力声明（deepseek 继承 qwen 的模板）
+      const sessionArgs = (session.enabled === false || !session.id)
+        ? []
+        : capabilities.buildResumeArgs('deepseek', {
+            sessionId: session.id,
+            isFirstCall: !!session.is_first,
+          });
+      const result = await this._runCli([...sessionArgs, '-p', '-o', 'text'], fullPrompt, timeoutMs, model, onChunk, input.external_task_id || input.task_id);
+      if (!this._capturedSessionId) {
+        this._capturedSessionId = this._extractSessionId(result.stdout);
+      }
 
       // 用户主动停止本轮：返回 cancelled（不当作失败/超时，避免上层重试链）
       if (result.cancelled) {
@@ -183,6 +190,7 @@ class DeepSeekAdapter {
         return buildOutput(input.task_id, 'cancelled', result.stdout || '', {
           error: { code: 'CANCELLED', message: '用户已停止本轮任务' },
           duration_ms: Date.now() - startTime,
+          session_id: this._capturedSessionId || session.id || null,
         });
       }
 
@@ -195,6 +203,7 @@ class DeepSeekAdapter {
         return buildOutput(input.task_id, 'success', result.stdout, {
           tokens_used: this._estimateTokens(result.stdout),
           duration_ms: Date.now() - startTime,
+          session_id: this._capturedSessionId || session.id || null,
         });
       } else {
         let errMsg;
@@ -206,6 +215,8 @@ class DeepSeekAdapter {
           errMsg = result.stderr || result.stdout || 'Unknown error';
           if (errMsg.includes('Not logged in') || errMsg.includes('login')) {
             errorCode = 'AUTH_REQUIRED';
+          } else if (SESSION_MISSING_PATTERNS.some(re => re.test(errMsg))) {
+            errorCode = ERROR_CODE.SESSION_NOT_FOUND;
           } else if (errMsg.includes('timeout')) {
             errorCode = 'TIMEOUT';
           }
@@ -219,6 +230,7 @@ class DeepSeekAdapter {
         return buildOutput(input.task_id, 'failed', result.stdout || '', {
           error: { code: errorCode, message: errMsg.substring(0, 500) },
           duration_ms: Date.now() - startTime,
+          session_id: this._capturedSessionId || session.id || null,
         });
       }
     } catch (e) {
@@ -230,8 +242,19 @@ class DeepSeekAdapter {
       return buildOutput(input.task_id, 'failed', '', {
         error: { code: 'EXECUTION_ERROR', message: e.message },
         duration_ms: Date.now() - startTime,
+        session_id: this._capturedSessionId || session.id || null,
       });
     }
+  }
+
+  /** 从 CLI 输出中尽力提取 session_id */
+  _extractSessionId(text) {
+    if (!text) return null;
+    const s = String(text);
+    let m = s.match(/"session_id"\s*:\s*"([^"]+)"/);
+    if (m) return m[1];
+    m = s.match(/"sessionId"\s*:\s*"([^"]+)"/);
+    return m ? m[1] : null;
   }
 
   _buildPrompt(input) {

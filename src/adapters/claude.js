@@ -5,24 +5,15 @@ const fs = require('fs');
 const os = require('os');
 const ModelLogger = require('../utils/model-logger');
 const { buildPrompt } = require('./prompt-template');
+const capabilities = require('./contract/capabilities');
+const { ERROR_CODE, SESSION_MISSING_PATTERNS } = require('./contract/enums');
+const { validateUnifiedInput } = require('./contract/validate');
 
 const ROOT = path.resolve(__dirname, '..', '..');
 
 /**
- * 统一输入格式验证
+ * 统一输入格式验证（见 contract/validate.js，delta 模式允许 context 为空串）
  */
-function validateUnifiedInput(input) {
-  const required = ['task_id', 'role', 'context', 'instruction'];
-  for (const field of required) {
-    if (!input[field]) {
-      throw new Error(`Missing required field in UnifiedInput: ${field}`);
-    }
-  }
-  if (!['executor', 'reviewer', 'guardian'].includes(input.role)) {
-    throw new Error(`Invalid role: ${input.role}`);
-  }
-  return input;
-}
 
 /**
  * 统一输出格式构建
@@ -36,6 +27,7 @@ function buildUnifiedOutput(taskId, status, content, opts = {}) {
     error: opts.error || null,
     tokens_used: opts.tokens_used || 0,
     duration_ms: opts.duration_ms || 0,
+    session_id: opts.session_id || null,
   };
 }
 
@@ -192,6 +184,7 @@ class ClaudeAdapter {
   async execute(input, onChunk) {
     validateUnifiedInput(input);
     const startTime = Date.now();
+    this._capturedSessionId = null;
 
     // 构建提示词
     const prompt = this._buildPrompt(input);
@@ -226,9 +219,20 @@ class ClaudeAdapter {
     // 构建 CLI 参数
     // 注意：text 格式的输出是非流式的（结束才一次性吐出），
     // 因此优先使用 stream-json（需配合 --verbose）实现真流式。
+    // resume 参数统一从能力声明读取（config/cli-profiles.yaml），不在此硬编码。
+    const session = input.session || {};
+    const sessionArgs = (session.enabled === false || !session.id)
+      ? []
+      : capabilities.buildResumeArgs('claude', {
+          sessionId: session.id,
+          isFirstCall: !!session.is_first,
+        });
+
     const baseArgs = [
+      ...sessionArgs,
       '--print',
-      '--permission-mode', 'bypassPermissions',
+      // 执行许可：未授权时用 plan 模式（只读），授权后才允许直接改文件
+      '--permission-mode', (input.permission_mode === 'plan' ? 'plan' : 'bypassPermissions'),
       '--add-dir', ROOT,
       '--bare',
     ];
@@ -256,6 +260,7 @@ class ClaudeAdapter {
         return buildUnifiedOutput(input.task_id, 'cancelled', streamed.text || '', {
           error: { code: 'CANCELLED', message: '用户已停止本轮任务' },
           duration_ms: Date.now() - startTime,
+          session_id: this._capturedSessionId || session.id || null,
         });
       }
 
@@ -268,6 +273,7 @@ class ClaudeAdapter {
         return buildUnifiedOutput(input.task_id, 'success', streamed.text, {
           tokens_used: this._estimateTokens(streamed.text),
           duration_ms: Date.now() - startTime,
+          session_id: this._capturedSessionId || session.id || null,
         });
       }
 
@@ -280,6 +286,7 @@ class ClaudeAdapter {
         return buildUnifiedOutput(input.task_id, 'failed', '', {
           error: { code: 'EMPTY_RESPONSE', message: '模型返回空内容' },
           duration_ms: Date.now() - startTime,
+          session_id: this._capturedSessionId || session.id || null,
         });
       }
 
@@ -294,6 +301,8 @@ class ClaudeAdapter {
           errMsg = streamed.stderr || streamed.text || 'Unknown error';
           if (errMsg.includes('Not logged in')) {
             errorCode = 'AUTH_REQUIRED';
+          } else if (SESSION_MISSING_PATTERNS.some(re => re.test(errMsg))) {
+            errorCode = ERROR_CODE.SESSION_NOT_FOUND;
           } else if (errMsg.includes('timeout')) {
             errorCode = 'TIMEOUT';
           }
@@ -307,6 +316,7 @@ class ClaudeAdapter {
         return buildUnifiedOutput(input.task_id, 'failed', streamed.text || '', {
           error: { code: errorCode, message: errMsg.substring(0, 500) },
           duration_ms: Date.now() - startTime,
+          session_id: this._capturedSessionId || session.id || null,
         });
       }
 
@@ -328,6 +338,7 @@ class ClaudeAdapter {
         return buildUnifiedOutput(input.task_id, 'cancelled', result.stdout || '', {
           error: { code: 'CANCELLED', message: '用户已停止本轮任务' },
           duration_ms: Date.now() - startTime,
+          session_id: this._capturedSessionId || session.id || null,
         });
       }
 
@@ -340,6 +351,7 @@ class ClaudeAdapter {
         return buildUnifiedOutput(input.task_id, 'success', result.stdout, {
           tokens_used: this._estimateTokens(result.stdout),
           duration_ms: Date.now() - startTime,
+          session_id: this._capturedSessionId || session.id || null,
         });
       } else {
         let errMsg;
@@ -351,6 +363,8 @@ class ClaudeAdapter {
           errMsg = result.stderr || result.stdout || 'Unknown error';
           if (errMsg.includes('Not logged in')) {
             errorCode = 'AUTH_REQUIRED';
+          } else if (SESSION_MISSING_PATTERNS.some(re => re.test(errMsg))) {
+            errorCode = ERROR_CODE.SESSION_NOT_FOUND;
           } else if (errMsg.includes('timeout')) {
             errorCode = 'TIMEOUT';
           }
@@ -364,6 +378,7 @@ class ClaudeAdapter {
         return buildUnifiedOutput(input.task_id, 'failed', result.stdout || '', {
           error: { code: errorCode, message: errMsg.substring(0, 500) },
           duration_ms: Date.now() - startTime,
+          session_id: this._capturedSessionId || session.id || null,
         });
       }
     } catch (e) {
@@ -375,6 +390,7 @@ class ClaudeAdapter {
       return buildUnifiedOutput(input.task_id, 'failed', '', {
         error: { code: 'EXECUTION_ERROR', message: e.message },
         duration_ms: Date.now() - startTime,
+        session_id: this._capturedSessionId || session.id || null,
       });
     }
   }
@@ -586,6 +602,13 @@ class ClaudeAdapter {
           return; // 非 JSON 行（警告、进度等），忽略
         }
         parsedAny = true;
+
+        // 捕获会话 id：Claude Code 的 init 事件是唯一可靠来源，供下次 --resume
+        if (json.type === 'system' && json.subtype === 'init' && json.session_id) {
+          this._capturedSessionId = json.session_id;
+        } else if (json.type === 'result' && json.session_id && !this._capturedSessionId) {
+          this._capturedSessionId = json.session_id;
+        }
 
         // 从嵌套对象中安全提取文本内容块
         const extractText = (msg) => {

@@ -9,8 +9,13 @@ const toolRegistry = require('../tools/registry');
 const sessionManager = require('../session/manager');
 const { isFatalError, markAgentFatal, isAgentFatal } = require('../utils/fatal-errors');
 const transcript = require('../prompt/transcript');
-const { buildSegments, truncate } = require('../prompt/history');
+const { buildSegments, truncate, formatEntry } = require('../prompt/history');
 const { historyConfig } = require('../prompt/config');
+const messageLog = require('../messaging/message-log');
+const cursorStore = require('../messaging/cursor-store');
+const capabilities = require('../adapters/contract/capabilities');
+const { STATUS, ERROR_CODE } = require('../adapters/contract/enums');
+const { newSessionId } = require('../adapters/contract/session');
 
 const ROOT = path.resolve(__dirname, '..', '..');
 
@@ -40,6 +45,11 @@ class AgentRuntime {
     for (const agentCfg of agentsConfig) {
       // 跳过 enabled: false 的 Agent（如吉米暂停使用）
       if (agentCfg.enabled === false) continue;
+      // CLI 准入：未通过 resume 准入的模型直接排除（项目策略：不做降级适配）
+      if (capabilities.isResumeRequired() && !capabilities.isSupported(agentCfg.model_cli)) {
+        console.warn(`[AgentRuntime] 排除 Agent "${agentCfg.name}"：CLI ${agentCfg.model_cli} 未通过 resume 准入`);
+        continue;
+      }
       // 启用已配置的 Agent（二期：克劳德、吉米、迪普斯克、钱文）
       if (['克劳德', '吉米', '迪普斯克', '钱文'].includes(agentCfg.name)) {
         this._registerAgent(agentCfg);
@@ -329,17 +339,81 @@ class AgentRuntime {
 
     // ----- ZONE B：历史（只读）-----
     const chatMode = !!task.chat_mode;
-    const historySegments = Array.isArray(task.history_segments)
+    let historySegments = Array.isArray(task.history_segments)
       ? task.history_segments
       : buildSegments(history, cfg);
-    const historyBlock = historySegments.join('\n\n');
+    let historyBlock = historySegments.join('\n\n');
+
+    // ===== resume / 游标：delta 模式只发“游标之后的新消息” =====
+    const cliName = agent.model_cli || null;
+    // 未声明 model_cli 的内部/测试 agent：不做 resume，走 full 模式，不做准入拦截
+    const resumeSupported = cliName ? capabilities.isSupported(cliName) : false;
+    if (cliName && !resumeSupported && capabilities.isResumeRequired()) {
+      return {
+        task_id: task.task_id, status: STATUS.FAILED, content: '',
+        output_files: [],
+        error: { code: ERROR_CODE.FATAL, message: `CLI ${cliName} 未通过 resume 准入，已禁止调度` },
+        tokens_used: 0, duration_ms: 0, session_id: null,
+      };
+    }
+
+    const cursorState = (chatMode && task.task_id) ? cursorStore.get(task.task_id, agentName) : null;
+    const profileVer = cursorStore.profileVersion({
+      cli: cliName,
+      agent: agentName,
+      rules: task.stable_context ? String(task.stable_context).slice(0, 2000) : '',
+    });
+    let sessionId = (cursorState && cursorState.session_id) || null;
+    if (cursorState && cursorState.profile_version && cursorState.profile_version !== profileVer) {
+      sessionId = null;
+      cursorStore.clearSession(task.task_id, agentName, 'profile_changed');
+    }
+    if (resumeSupported && !sessionId && capabilities.needsGeneratedSessionId(cliName)) {
+      sessionId = newSessionId();
+    }
+    const isFirstCall = !(cursorState && cursorState.session_id);
+    const resumeActive = resumeSupported && !isFirstCall && !task.__forceFull;
+
+    let promptMaxSeq = messageLog.maxSeq(task.task_id);
+    let deltaMode = false;
 
     // ----- ZONE C：本轮（可追加）-----
     const rawInstruction = task.instruction || this._buildInstruction(task, []);
     let turnSegment = chatMode ? `[用户] ${rawInstruction}` : rawInstruction;
+
+    if (resumeActive) {
+      const delta = messageLog.since(task.task_id, cursorState.cursor_seq, {
+        excludeSystem: true,
+        excludeAgent: agentName, // 自己的历史已经在 CLI session 里，不再重复发送
+      });
+      if (delta.length > 0) {
+        promptMaxSeq = delta.reduce((m, x) => Math.max(m, x.seq), promptMaxSeq);
+        let lastUserIdx = -1;
+        for (let i = delta.length - 1; i >= 0; i--) {
+          if (delta[i].role === 'user') { lastUserIdx = i; break; }
+        }
+        const prior = lastUserIdx >= 0 ? delta.slice(0, lastUserIdx) : delta;
+        const current = lastUserIdx >= 0 ? delta[lastUserIdx] : null;
+        historyBlock = prior
+          .map(m => formatEntry(m.role, m.content, m.agent))
+          .join('\n\n');
+        if (current) turnSegment = `[用户] ${current.content}`;
+        deltaMode = true;
+      }
+    }
+
     let currentInstruction = chatMode
       ? `## 对话\n${historyBlock ? historyBlock + '\n\n' : ''}${turnSegment}`
       : turnSegment;
+
+    // 执行许可提示：每轮注入（delta/full 都生效），不写进稳定前缀
+    const permissionNotice = task.operator_approved
+      ? '[执行许可] 用户已授权：可以直接修改/创建文件、执行方案与命令。'
+      : '[执行许可] 用户尚未授权：本轮只做分析与方案，禁止修改/创建文件、禁止执行有副作用的命令。';
+    currentInstruction = `${permissionNotice}\n\n${currentInstruction}`;
+
+    // delta 模式下稳定上下文已在 CLI session 内，不再重复注入
+    const effectiveContext = deltaMode ? '' : baseContext;
 
     // 当前轮用户片段先落转录：即使后续调用失败，下一轮仍能拼出严格前缀
     if (chatMode && task.record_transcript && task.task_id) {
@@ -354,6 +428,10 @@ class AgentRuntime {
             `[助手·${agentName}]\n${truncate(String(result.content), cfg.message_max_chars)}`,
           ]);
         }
+      }
+      // 游标推进：只在本轮成功时前移，失败/取消保持原游标，下次重新发送
+      if (result && result.status === STATUS.SUCCESS && cursorState) {
+        cursorStore.advanceCursor(task.task_id, agentName, promptMaxSeq);
       }
       return result;
     };
@@ -370,10 +448,18 @@ class AgentRuntime {
           external_task_id: task.external_task_id || task.task_id, // 对话级 task_id，供进程注册/停止匹配
           trace_id: task.trace_id || '', // 事件驱动协作 trace_id（DAG 编排唯一ID）
           role: task.role || 'executor',
-          context: baseContext,
+          context: effectiveContext,
           instruction: currentInstruction,
           input_files: task.input_files || [],
           max_tokens: task.max_tokens || 4096,
+          // resume 上下文：由能力声明决定是否真正附加参数
+          session: {
+            id: sessionId || null,
+            is_first: isFirstCall,
+            enabled: resumeSupported,
+          },
+          // 执行许可：未授权时用只读的 plan 模式（CLI 侧兜底，防止绕过 prompt 直接改文件）
+          permission_mode: task.operator_approved ? 'bypassPermissions' : 'plan',
           // 请求链路追踪元信息：agent 名 + 工具调用轮次（initial / tool_round_N）
           agent_name: agentName,
           phase: round === 0 ? 'initial' : `tool_round_${round}`,
@@ -381,6 +467,20 @@ class AgentRuntime {
         };
 
         const result = await agent.adapter.execute(baseInput, onChunk);
+
+        // 会话失效（resume 失败）：清空 session，用全量模式重试一次
+        if (result && result.error && result.error.code === ERROR_CODE.SESSION_NOT_FOUND && !task.__forceFull) {
+          cursorStore.clearSession(task.task_id, agentName, 'session_not_found');
+          return this.executeTaskWithAgent(
+            Object.assign({}, task, { __forceFull: true }),
+            history, agentName, onChunk
+          );
+        }
+
+        // 记录/更新 session id，供下次 --resume
+        if (result && result.session_id && cursorState) {
+          cursorStore.setSession(task.task_id, agentName, result.session_id, profileVer);
+        }
 
         // 用户停止/进程被杀：直接返回 cancelled，不解析工具调用、不再发起下一轮
         if (result && result.status === 'cancelled') return result;
