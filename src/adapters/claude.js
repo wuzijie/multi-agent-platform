@@ -28,6 +28,7 @@ function buildUnifiedOutput(taskId, status, content, opts = {}) {
     tokens_used: opts.tokens_used || 0,
     duration_ms: opts.duration_ms || 0,
     session_id: opts.session_id || null,
+    reasoning: opts.reasoning || '',
   };
 }
 
@@ -181,10 +182,13 @@ class ClaudeAdapter {
    * @param {Function} [onChunk] 流式回调：捕获到 CLI 增量输出时调用 onChunk(增量文本)
    * @returns {Promise<Object>} UnifiedOutput
    */
-  async execute(input, onChunk) {
+  async execute(input, onChunk, onReasoning) {
     validateUnifiedInput(input);
     const startTime = Date.now();
     this._capturedSessionId = null;
+    this._capturedReasoning = '';
+    this._reasoningSet = new Set();
+    this._thinkingTokens = 0;
 
     // 构建提示词
     const prompt = this._buildPrompt(input);
@@ -248,7 +252,7 @@ class ClaudeAdapter {
 
     try {
       // 先尝试流式模式
-      const streamed = await this._runStreamingCli(streamArgs, fullPrompt, timeoutMs, onChunk, input.external_task_id || input.task_id);
+      const streamed = await this._runStreamingCli(streamArgs, fullPrompt, timeoutMs, onChunk, input.external_task_id || input.task_id, onReasoning);
 
       // 用户主动停止本轮：返回 cancelled（不当作失败/超时，避免上层重试链）
       if (streamed.cancelled) {
@@ -274,6 +278,7 @@ class ClaudeAdapter {
           tokens_used: this._estimateTokens(streamed.text),
           duration_ms: Date.now() - startTime,
           session_id: this._capturedSessionId || session.id || null,
+          reasoning: this._capturedReasoning,
         });
       }
 
@@ -352,6 +357,7 @@ class ClaudeAdapter {
           tokens_used: this._estimateTokens(result.stdout),
           duration_ms: Date.now() - startTime,
           session_id: this._capturedSessionId || session.id || null,
+          reasoning: this._capturedReasoning,
         });
       } else {
         let errMsg;
@@ -400,7 +406,8 @@ class ClaudeAdapter {
    */
   _buildPrompt(input) {
     return buildPrompt({
-      agentLabel: '克劳德',
+      agentName: input.agent_name || '克劳德',
+      modelCli: 'claude',
       role: input.role,
       taskId: input.task_id,
       context: input.context,
@@ -563,7 +570,7 @@ class ClaudeAdapter {
    *  - text：从事件中提取的完整回答文本
    *  - streamed_ok：是否成功解析到 JSON 事件（false 时调用方应回退 text 模式）
    */
-  _runStreamingCli(args, prompt, timeoutMs, onChunk, taskId) {
+  _runStreamingCli(args, prompt, timeoutMs, onChunk, taskId, onReasoning) {
     return new Promise((resolve) => {
       const startAt = Date.now();
       let stderr = '';
@@ -624,6 +631,32 @@ class ClaudeAdapter {
           return '';
         };
 
+        // 提取思考（thinking）内容块
+        const extractThinking = (msg) => {
+          if (!msg) return '';
+          const content = msg.content;
+          if (Array.isArray(content)) {
+            return content
+              .filter(b => b && b.type === 'thinking' && typeof b.thinking === 'string')
+              .map(b => b.thinking)
+              .join('');
+          }
+          return '';
+        };
+
+        // 累积思考文本（去重：多个 assistant 轮次各自带 thinking）
+        const captureThinking = (msg) => {
+          const t = extractThinking(msg);
+          if (t && !this._reasoningSet.has(t)) {
+            this._reasoningSet.add(t);
+            this._capturedReasoning = this._capturedReasoning ? this._capturedReasoning + '\n\n' + t : t;
+            // 思考块到达时立即回传（先于答案正文输出，供前端独立折叠展示）
+            if (typeof onReasoning === 'function') {
+              try { onReasoning(t); } catch (e) { /* 回调异常不影响主流程 */ }
+            }
+          }
+        };
+
         if (json.type === 'stream_event' && json.event) {
           const ev = json.event;
           if (
@@ -636,18 +669,25 @@ class ClaudeAdapter {
           }
         } else if (json.type === 'assistant' && json.message) {
           // 标准 Claude Code stream-json 汇总事件：补齐尚未推送的尾部文本（去重）
+          captureThinking(json.message);
           const fullText = extractText(json.message);
           if (fullText.length > emittedLen) {
             emit(fullText.slice(emittedLen));
           }
-        } else if (json.type === 'result' && json.message) {
-          // 部分版本/网关用 result 事件包裹最终消息
-          const fullText = extractText(json.message);
-          if (fullText.length > emittedLen) {
-            emit(fullText.slice(emittedLen));
+        } else if (json.type === 'result') {
+          // result 事件：可能包裹 message，也可能只有 usage
+          if (json.message) {
+            captureThinking(json.message);
+            const fullText = extractText(json.message);
+            if (fullText.length > emittedLen) {
+              emit(fullText.slice(emittedLen));
+            }
           }
+          const thinkingTokens = json.usage && json.usage.output_tokens_details && json.usage.output_tokens_details.thinking_tokens;
+          if (typeof thinkingTokens === 'number') this._thinkingTokens = thinkingTokens;
         } else if (json.type === 'message' && json.content) {
           // 兼容直接输出 message 对象的情况
+          captureThinking(json);
           const fullText = extractText(json);
           if (fullText.length > emittedLen) {
             emit(fullText.slice(emittedLen));
@@ -655,16 +695,22 @@ class ClaudeAdapter {
         }
       };
 
-      const finalArgs = prompt ? [...args, prompt] : args;
+      // prompt 通过 stdin 传入（Claude Code 2.x 在 --print 模式优先读 stdin，
+      // 位置参数 prompt 已被降级/忽略）
+      const finalArgs = args;
       const env = this._buildEnv();
 
       const proc = spawn(this.cliCommand, finalArgs, {
         cwd: ROOT,
         env,
         timeout: timeoutMs || 120000,
-        stdio: ['ignore', 'pipe', 'pipe'],
+        stdio: ['pipe', 'pipe', 'pipe'],
       });
       procRegistry.register(proc, taskId);
+      if (prompt) {
+        proc.stdin.write(prompt);
+        proc.stdin.end();
+      }
 
       proc.stdout.on('data', (data) => {
         buf += data.toString();

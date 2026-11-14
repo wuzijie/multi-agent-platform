@@ -25,6 +25,7 @@ function buildOutput(taskId, status, content, opts = {}) {
     tokens_used: opts.tokens_used || 0,
     duration_ms: opts.duration_ms || 0,
     session_id: opts.session_id || null,
+    reasoning: opts.reasoning || '',
   };
 }
 
@@ -134,10 +135,12 @@ class QwenAdapter {
     }
   }
 
-  async execute(input, onChunk) {
+  async execute(input, onChunk, onReasoning) {
     validateInput(input);
     const startTime = Date.now();
     this._capturedSessionId = null;
+    this._capturedReasoning = '';
+    this._reasoningSet = new Set();
     const session = input.session || {};
 
     const prompt = this._buildPrompt(input);
@@ -179,7 +182,43 @@ class QwenAdapter {
             sessionId: session.id,
             isFirstCall: !!session.is_first,
           });
-      const result = await this._runCli([...sessionArgs, '-p', '-o', 'text'], fullPrompt, timeoutMs, model, onChunk, input.external_task_id || input.task_id);
+      const externalTaskId = input.external_task_id || input.task_id;
+
+      // 先试 stream-json：能拿到 thinking 块（与 text 分开）；失败/空则回退 text
+      const streamed = await this._runStreamingCli([...sessionArgs, '-p', '-o', 'stream-json'], fullPrompt, timeoutMs, model, onChunk, externalTaskId, onReasoning);
+      if (!this._capturedSessionId && streamed) {
+        this._capturedSessionId = this._extractSessionId(streamed.text || '');
+      }
+
+      if (streamed && streamed.cancelled) {
+        ModelLogger.logResponse(this.name, model, '[用户停止]', {
+          ...meta, request_id: requestId, status: 'cancelled', error_code: 'CANCELLED',
+          error_message: '用户已停止本轮任务', duration_ms: Date.now() - startTime,
+          exit_code: streamed.exit_code, killed_by_timeout: false, stream_ok: streamed.streamed_ok,
+        });
+        return buildOutput(input.task_id, 'cancelled', streamed.text || '', {
+          error: { code: 'CANCELLED', message: '用户已停止本轮任务' },
+          duration_ms: Date.now() - startTime,
+          session_id: this._capturedSessionId || session.id || null,
+        });
+      }
+
+      if (streamed && streamed.exit_code === 0 && streamed.streamed_ok && streamed.text) {
+        ModelLogger.logResponse(this.name, model, streamed.text, {
+          ...meta, request_id: requestId, status: 'success',
+          duration_ms: Date.now() - startTime, exit_code: streamed.exit_code,
+          killed_by_timeout: false, stream_ok: true,
+        });
+        return buildOutput(input.task_id, 'success', streamed.text, {
+          tokens_used: this._estimateTokens(streamed.text),
+          duration_ms: Date.now() - startTime,
+          session_id: this._capturedSessionId || session.id || null,
+          reasoning: this._capturedReasoning,
+        });
+      }
+
+      // 回退 text 模式
+      const result = await this._runCli([...sessionArgs, '-p', '-o', 'text'], fullPrompt, timeoutMs, model, onChunk, externalTaskId);
       if (!this._capturedSessionId) {
         this._capturedSessionId = this._extractSessionId(result.stdout);
       }
@@ -261,9 +300,148 @@ class QwenAdapter {
     return m ? m[1] : null;
   }
 
+  /**
+   * 执行 CLI（stream-json 模式）：逐行解析 NDJSON，
+   * 把 thinking 块累积到 this._capturedReasoning，text 块推给 onChunk。
+   * qwen/deepseek 的 stream-json 是分阶段缓冲（thinking 一整块 → text 一整块），
+   * 但至少能把思考与正文分开，且能拿到思考全文。
+   */
+  _runStreamingCli(args, prompt, timeoutMs, modelOverride, onChunk, taskId, onReasoning) {
+    return new Promise((resolve) => {
+      const startAt = Date.now();
+      let stderr = '';
+      let buf = '';
+      let streamedText = '';
+      let parsedAny = false;
+      let settled = false;
+
+      const finish = (result) => {
+        if (settled) return;
+        settled = true;
+        resolve(result);
+      };
+
+      const emit = (text) => {
+        streamedText += text;
+        if (typeof onChunk === 'function') {
+          try { onChunk(text); } catch (e) { /* 回调异常不影响主流程 */ }
+        }
+      };
+
+      const handleLine = (line) => {
+        const trimmed = line.trim();
+        if (!trimmed) return;
+        let json;
+        try { json = JSON.parse(trimmed); } catch (e) { return; }
+        parsedAny = true;
+
+        if (json.session_id && !this._capturedSessionId) {
+          this._capturedSessionId = json.session_id;
+        }
+
+        // 从 content[] 里提取指定类型块
+        const extract = (msg, kind) => {
+          if (!msg) return '';
+          const content = msg.content;
+          if (typeof content === 'string') return kind === 'text' ? content : '';
+          if (Array.isArray(content)) {
+            return content
+              .filter(b => b && b.type === kind)
+              .map(b => (kind === 'thinking' ? b.thinking : b.text))
+              .filter(t => typeof t === 'string')
+              .join('');
+          }
+          return '';
+        };
+
+        if (json.type === 'assistant' && json.message) {
+          const thinking = extract(json.message, 'thinking');
+          if (thinking && !this._reasoningSet.has(thinking)) {
+            this._reasoningSet.add(thinking);
+            this._capturedReasoning = this._capturedReasoning ? this._capturedReasoning + '\n\n' + thinking : thinking;
+            // 思考块到达时立即回传（先于答案正文输出）
+            if (typeof onReasoning === 'function') {
+              try { onReasoning(thinking); } catch (e) { /* 回调异常不影响主流程 */ }
+            }
+          }
+          const text = extract(json.message, 'text');
+          if (text) emit(text);
+        } else if (json.type === 'result' && typeof json.result === 'string') {
+          // assistant 未给出完整文本时，用 result 补齐
+          if (json.result.length > streamedText.length) {
+            emit(json.result.slice(streamedText.length));
+          }
+        }
+      };
+
+      // prompt 通过 stdin 传入（qwen-code 0.22 的 stream-json 模式读 stdin，位置参数被忽略）
+      const finalArgs = [];
+      for (let i = 0; i < args.length; i++) {
+        finalArgs.push(args[i]);
+      }
+      const model = modelOverride || this._getModel();
+      if (model && model !== 'qwen-default') finalArgs.push('-m', model);
+
+      const apiKey = this._getApiKey();
+      const baseUrl = this._getBaseUrl();
+      const envVars = { ...process.env, HOME: this.realHome };
+      if (apiKey) envVars.OPENAI_API_KEY = apiKey;
+      if (baseUrl) envVars.OPENAI_BASE_URL = baseUrl;
+
+      const proc = spawn(this.cliCommand, finalArgs, {
+        cwd: ROOT,
+        env: envVars,
+        timeout: timeoutMs || 120000,
+        stdio: ['pipe', 'pipe', 'pipe'],
+      });
+      procRegistry.register(proc, taskId);
+      if (prompt) {
+        proc.stdin.write(prompt);
+        proc.stdin.end();
+      }
+
+      proc.stdout.on('data', (data) => {
+        buf += data.toString();
+        let idx;
+        while ((idx = buf.indexOf('\n')) >= 0) {
+          const line = buf.slice(0, idx);
+          buf = buf.slice(idx + 1);
+          handleLine(line);
+        }
+      });
+
+      proc.stderr.on('data', (d) => { stderr += d.toString(); });
+
+      proc.on('close', (code) => {
+        if (buf.trim()) handleLine(buf);
+        const userKilled = procRegistry.isUserKilled(proc);
+        finish({
+          exit_code: code,
+          text: streamedText,
+          stderr: stderr.trim(),
+          streamed_ok: parsedAny,
+          killed_by_timeout: !userKilled && (code === null || Date.now() - startAt >= (timeoutMs || 120000) - 500),
+          cancelled: userKilled,
+        });
+      });
+
+      proc.on('error', (err) => {
+        finish({
+          exit_code: -1,
+          text: streamedText,
+          stderr: err.message,
+          streamed_ok: parsedAny,
+          killed_by_timeout: false,
+          cancelled: false,
+        });
+      });
+    });
+  }
+
   _buildPrompt(input) {
     return buildPrompt({
-      agentLabel: '钱文',
+      agentName: input.agent_name || '钱文',
+      modelCli: 'qwen',
       role: input.role,
       taskId: input.task_id,
       context: input.context,
