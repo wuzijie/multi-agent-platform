@@ -268,8 +268,9 @@ class AgentRuntime {
    * @param {Array} history - 对话历史
    * @param {string} agentName - Agent 名称，如 '克劳德', '吉米', '迪普斯克', '钱文'
    * @param {Function} [onChunk] 流式输出回调：适配器每次捕获到 CLI 增量输出时调用
+   * @param {Function} [onReasoning] 思考内容回调：适配器解析到 thinking 块时立即调用（先于正文）
    */
-  async executeTaskWithAgent(task, history, agentName, onChunk) {
+  async executeTaskWithAgent(task, history, agentName, onChunk, onReasoning) {
     const externalTaskId = task.external_task_id || task.task_id;
     // 用户已停止本轮：不再发起任何新的模型调用（含回退路径）
     if (sessionManager.isCancelled(externalTaskId)) {
@@ -466,14 +467,14 @@ class AgentRuntime {
           attempt: task.attempt || 1,
         };
 
-        const result = await agent.adapter.execute(baseInput, onChunk);
+        const result = await agent.adapter.execute(baseInput, onChunk, onReasoning);
 
         // 会话失效（resume 失败）：清空 session，用全量模式重试一次
         if (result && result.error && result.error.code === ERROR_CODE.SESSION_NOT_FOUND && !task.__forceFull) {
           cursorStore.clearSession(task.task_id, agentName, 'session_not_found');
           return this.executeTaskWithAgent(
             Object.assign({}, task, { __forceFull: true }),
-            history, agentName, onChunk
+            history, agentName, onChunk, onReasoning
           );
         }
 
@@ -518,7 +519,7 @@ class AgentRuntime {
       }
       // 超过最大轮数，返回最后一次结果
       console.warn('[AgentRuntime] 工具调用轮数超过上限，返回当前结果');
-      const finalResult = await this._executeOnce(agent, task, baseContext, currentInstruction, onChunk, agentName);
+      const finalResult = await this._executeOnce(agent, task, baseContext, currentInstruction, onChunk, agentName, onReasoning);
       return finalize(finalResult);
     } finally {
       this._endCall(agent, callId);
@@ -532,7 +533,7 @@ class AgentRuntime {
   }
 
   /** 单次执行（无工具循环），用于上限兜底 */
-  async _executeOnce(agent, task, context, instruction, onChunk, agentName) {
+  async _executeOnce(agent, task, context, instruction, onChunk, agentName, onReasoning) {
     const baseInput = {
       task_id: task.task_id,
       external_task_id: task.external_task_id || task.task_id,
@@ -547,7 +548,7 @@ class AgentRuntime {
       phase: 'initial',
       attempt: task.attempt || 1,
     };
-    return agent.adapter.execute(baseInput, onChunk);
+    return agent.adapter.execute(baseInput, onChunk, onReasoning);
   }
 
   /**

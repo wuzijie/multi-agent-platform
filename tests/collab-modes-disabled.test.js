@@ -53,7 +53,7 @@ async function newTask(name) {
   await test('显式 collab_mode=duel 被注销 → 按普通对话处理', async () => {
     const tid = await newTask('注销后显式请求');
     let fellThrough = false;
-    orchestrator._executeTurnWithAgents = async () => { fellThrough = true; return { task: orchestrator.getTask(tid), result: { status: 'success', content: 'ok' } }; };
+    orchestrator._executeTurnWithJobs = async () => { fellThrough = true; return { task: orchestrator.getTask(tid), result: { status: 'success', content: 'ok' } }; };
     const task = orchestrator.getTask(tid);
     await orchestrator.executeSimpleTask(tid, '帮我分析一下', { collab_mode: 'duel' });
     assert.strictEqual(fellThrough, true, '应回落到普通对话');
@@ -65,7 +65,7 @@ async function newTask(name) {
     let entered = false;
     orchestrator._executeBrainstormMode = async () => { entered = true; throw new Error('should not enter'); };
     let fellThrough = false;
-    orchestrator._executeTurnWithAgents = async () => { fellThrough = true; return { task: orchestrator.getTask(tid), result: { status: 'success', content: 'ok' } }; };
+    orchestrator._executeTurnWithJobs = async () => { fellThrough = true; return { task: orchestrator.getTask(tid), result: { status: 'success', content: 'ok' } }; };
     await orchestrator.executeSimpleTask(tid, '头脑风暴一下：如何提高效率');
     assert.strictEqual(entered, false, '不应进入头脑风暴模式');
     assert.strictEqual(fellThrough, true, '应按普通对话处理');

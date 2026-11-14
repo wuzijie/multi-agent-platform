@@ -16,7 +16,8 @@ const { historyConfig } = require('../prompt/config');
 const { enabledAgents, enabledAgentNames } = require('../utils/agent-list');
 const { TASK_STATUS, TASK_TYPES, genSubTaskId } = require('../engine/events');
 const messageLog = require('../messaging/message-log');
-const { parseLeadingMentions } = require('../messaging/mention');
+const { parseMentions } = require('../messaging/mention');
+const renderer = require('../prompt/renderer');
 const { isAgentFatal } = require('../utils/fatal-errors');
 const collabModeRegistry = require('./collab-mode-registry');
 
@@ -250,13 +251,13 @@ class TaskOrchestrator {
       // 会话级隔离：标记该对话的 session 活跃（独立 thread/session），复位上一轮取消标志
       sessionManager.get(taskId).beginTurn();
 
-      // ===== 首行 @ 解析 + 承接规则 =====
-      // 1) 首行 @ 1~2 个 → 指定承接（>2 直接拒绝）
+      // ===== 行首 @ 解析（多行）+ 承接规则 =====
+      // 1) 行首 @ 1~2 个（每行各带独立任务）→ 指定承接
       // 2) 无 @ → 最近一次回复的 agent（粘性）
       // 3) 首次无 @ → 默认 agent（克劳德）
       const mentionCfg = config.mention || {};
       const maxUserMentions = Number(mentionCfg.user_max) || 2;
-      const mentionParsed = parseLeadingMentions(userMessage || '', {
+      const mentionParsed = parseMentions(userMessage || '', {
         max: maxUserMentions,
         agents: enabledAgents(),
         aliases: mentionCfg.aliases,
@@ -270,28 +271,37 @@ class TaskOrchestrator {
         };
       }
 
-      let execAgents = (mentionParsed.agents || []).slice(0, maxUserMentions);
+      const hasExplicitMention = (mentionParsed.mentions || []).length > 0;
+      const body = mentionParsed.body || '';
+      // 每个行首 @ 各带独立任务描述；body 是非 @ 的共享正文
+      let jobs = (mentionParsed.mentions || []).map(m => ({
+        agent: m.agent,
+        instruction: body ? `${body}\n\n${m.description}` : m.description,
+      }));
       // 只保留可用 agent（启用 + 在线 + 未熔断）
-      execAgents = execAgents.filter(name => {
-        if (!enabledAgentNames().includes(name)) return false;
-        if (isAgentFatal(name)) return false;
-        const st = agentRuntime.getAgentState(name);
+      jobs = jobs.filter(j => {
+        if (!enabledAgentNames().includes(j.agent)) return false;
+        if (isAgentFatal(j.agent)) return false;
+        const st = agentRuntime.getAgentState(j.agent);
         return !st || st.online !== false;
       });
-      if (execAgents.length === 0) {
+      if (jobs.length === 0) {
+        // 无有效 @ → 最近一次回复的 agent（粘性）→ 默认 agent
+        let fallbackAgent = null;
         const lastAgent = messageLog.latestAssistantAgent(taskId);
         if (lastAgent && enabledAgentNames().includes(lastAgent) && !isAgentFatal(lastAgent)) {
           const st = agentRuntime.getAgentState(lastAgent);
-          if (!st || st.online !== false) execAgents = [lastAgent];
+          if (!st || st.online !== false) fallbackAgent = lastAgent;
         }
-      }
-      if (execAgents.length === 0) {
-        const def = config.getDefaultAgent();
-        execAgents = [def ? def.name : '克劳德'];
+        if (!fallbackAgent) {
+          const def = config.getDefaultAgent();
+          fallbackAgent = def ? def.name : '克劳德';
+        }
+        jobs = [{ agent: fallbackAgent, instruction: userMessage || task.instruction || task.description || '' }];
       }
 
-      const execAgent = execAgents[0];
-      const userRest = mentionParsed.rest || userMessage || task.instruction || task.description || '';
+      const execAgent = jobs[0].agent;
+      const userRest = body || userMessage || task.instruction || task.description || '';
 
       // ===== 执行许可（operator approval）=====
       // 一律以用户消息为准；一旦本会话获得许可，后续轮次直接沿用。
@@ -340,7 +350,11 @@ class TaskOrchestrator {
       // 或消息中出现讨论/辩论/头脑风暴关键词（任意位置）时，都不自动抢路由。
       // 判定逻辑抽到 shouldAutoEventDriven（纯函数，便于测试）。
       const autoRoutingEnabled = !(config.routing && config.routing.auto_event_driven === false);
-      const autoEventDriven = autoRoutingEnabled && shouldAutoEventDriven(userMessage, opts);
+      const autoEventDriven = autoRoutingEnabled && shouldAutoEventDriven(userMessage, {
+        ...opts,
+        // 显式 @ 了 agent 时，自动事件驱动让位
+        mentioned_agent: hasExplicitMention ? execAgent : opts.mentioned_agent,
+      });
 
       // 事件驱动协作模式（消息总线 + 黑板 + DAG 编排）
       if (opts.collab_mode === 'event-driven' || autoEventDriven) {
@@ -406,7 +420,7 @@ class TaskOrchestrator {
         }
       }
 
-      result = await this._executeTurnWithAgents(task, taskId, userMessage, userRest, execAgents);
+      result = await this._executeTurnWithJobs(task, taskId, userMessage, jobs);
       return result;
     } finally {
       // Session Memory 写入条件：
@@ -464,55 +478,22 @@ class TaskOrchestrator {
       task.frozen_memory = task.memory_context || '';
     }
 
-    const parts = [];
-    parts.push(`## 团队协作\n${this._buildTeamRules()}`);
-    parts.push(`## 会话目标\n${task.session_goal}`);
-
-    const memory = String(task.frozen_memory || '').trim();
-    if (memory) parts.push(`## 长期记忆\n${memory}`);
-
-    return parts.join('\n\n');
+    // 团队协作 / @ 规则 / 执行许可 / 承接 / 会话目标 / 长期记忆
+    // 全部由统一渲染器按模板文件生成（不同 Agent 用同一套模板，变量注入差异内容）。
+    return renderer.buildStableContext({
+      mentionMax: Number((config.mention || {}).model_max) || 2,
+      availableAgents: enabledAgents(),
+      sessionGoal: task.session_goal,
+      memory: String(task.frozen_memory || '').trim(),
+    });
   }
 
-  /** 团队协作规则文本（只列当前已启用的模型） */
+  /** 团队协作规则文本（只列当前已启用的模型；统一由模板渲染） */
   _buildTeamRules() {
-    const agents = enabledAgents();
-    if (!agents || agents.length < 2) {
-      return [
-        '## 执行许可规则（必须严格遵守）',
-        '未经用户（operator）明确许可，不得执行方案落地、修改/创建文件、提交代码等有副作用的动作；',
-        '如果用户在本会话中已经明确许可，可以直接执行，无需重复询问。',
-        '没有可转交的其他智能体，请直接回答。',
-      ].join('\n');
-    }
-    const desc = { claude: 'Claude', kimi: 'Kimi', deepseek: 'DeepSeek', qwen: 'Qwen' };
-    const angle = { claude: '通用', kimi: '长文本分析', deepseek: '编程实现', qwen: '中文写作' };
-    const list = agents
-      .map(a => `${a.name}（${desc[a.model_cli] || a.model_cli}，${angle[a.model_cli] || ''}）`)
-      .join('、');
-    return [
-      '## 转交规则（必须严格遵守）',
-      '1. 需要其他智能体参与时，回复的【第一行】必须是：@智能体名 任务描述。',
-      '   一次只允许 @ 一个智能体，禁止在一行内 @ 多个。',
-      '2. @ 只能出现在第一行。第一行之后出现的 @ 视为普通文本，不会触发转交。',
-      '3. 禁止在正文里用「建议交给 XX」「下一棒交给 XX」「请 XX 处理」这类描述代替转交；',
-      '   想转交就必须把 @智能体名 放在第一行，否则视为不转交。',
-      '4. 不得 @ 自己，不得 @ 不存在的智能体。',
-      '5. 不需要转交时直接回答，第一行不要出现任何 @。',
-      '',
-      '## 执行许可规则（必须严格遵守）',
-      '1. 未经用户（operator）明确许可，不得执行方案落地、修改/创建文件、提交代码等有副作用的动作；',
-      '   此阶段只做分析、方案、评审，并把待执行动作列清楚等待许可。',
-      '2. 如果用户在本会话中已经明确许可（例如「可以开始」「按方案执行」「授权」），',
-      '   后续可以直接执行，不要再重复询问，也不要每轮都请求许可。',
-      '3. 判断依据只看用户本人消息；模型之间的建议不构成许可。',
-      '',
-      '## 承接说明',
-      '用户未 @ 任何智能体时，平台会把消息交给最近一次回复的智能体（通常就是你），',
-      '你可以直接在既有上下文里继续，无需重复自我介绍或复述历史。',
-      '',
-      `可用智能体：${list}。`,
-    ].join('\n');
+    return renderer.buildStableContext({
+      mentionMax: Number((config.mention || {}).model_max) || 2,
+      availableAgents: enabledAgents(),
+    });
   }
 
   /**
@@ -940,7 +921,22 @@ class TaskOrchestrator {
       roleLabel = `🤖 ${opts.from}`;
     }
 
-    const entry = `\n### ${roleLabel}${opts.target ? ` @${opts.target}` : ''} - ${timestamp}\n\n${content}\n\n---\n`;
+    // 思考内容只进 conversation.md（展示用，前端渲染为折叠块）；
+    // 不进 messageLog，避免思考文本污染多轮上下文。
+    // [THINKING] 必须插在 "**模型名**" 前缀之后，保持模型名在消息最前，
+    // 否则前端无法识别发送者、方向标签会回退成默认"克劳德"。
+    const reasoning = (opts.reasoning && String(opts.reasoning).trim()) || '';
+    let displayContent = content;
+    if (reasoning && role === 'assistant') {
+      const prefixMatch = String(content || '').match(/^\*\*[^*]+\*\*\s*/);
+      if (prefixMatch) {
+        displayContent = prefixMatch[0] + `[THINKING]\n${reasoning}\n[/THINKING]\n\n` + String(content || '').slice(prefixMatch[0].length);
+      } else {
+        displayContent = `[THINKING]\n${reasoning}\n[/THINKING]\n\n${content}`;
+      }
+    }
+
+    const entry = `\n### ${roleLabel}${opts.target ? ` @${opts.target}` : ''} - ${timestamp}\n\n${displayContent}\n\n---\n`;
     fs.appendFileSync(conversationPath, entry);
 
     // 机器可读日志：游标与增量 prompt 的唯一依据（conversation.md 只用于展示）

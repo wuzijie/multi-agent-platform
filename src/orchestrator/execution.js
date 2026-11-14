@@ -10,7 +10,7 @@ const agentRuntime = require('../agent/runtime');
 const transcript = require('../prompt/transcript');
 const config = require('../utils/config');
 const { enabledAgentNames, enabledAgents } = require('../utils/agent-list');
-const { parseLeadingMentions } = require('../messaging/mention');
+const { parseMentions } = require('../messaging/mention');
 
 const ROOT = path.resolve(__dirname, '..', '..');
 
@@ -336,8 +336,17 @@ module.exports = {
       }
     };
 
+    // 思考块到达时立即推送（先于答案正文），前端独立折叠展示
+    const onReasoning = (chunk) => {
+      if (!chunk) return;
+      eventBus.emit('agent:stream:reasoning', {
+        task_id: taskId, agent: agentName, stream_id: streamId,
+        reasoning: chunk,
+      });
+    };
+
     try {
-      const result = await agentRuntime.executeTaskWithAgent(task, conversationHistory, agentName, onChunk);
+      const result = await agentRuntime.executeTaskWithAgent(task, conversationHistory, agentName, onChunk, onReasoning);
       // 推完剩余缓冲
       if (buffered) {
         eventBus.emit('agent:stream:chunk', { task_id: taskId, agent: agentName, chunk: buffered, stream_id: streamId });
@@ -370,180 +379,60 @@ module.exports = {
       '钱文': '场景适配、中文表达优化、兼容性',
     };
     return angles[agentName] || '多角度综合审视';
-  }
-
-  /**
-   * 执行指定 Agent 并处理模型间 @ 转交
-   *
-   * 规则：
-   *   1. Agent 回复中包含「@另一个Agent名 + 问题」时，平台把问题转交给被@的Agent
-   *   2. 被@的Agent可以继续@第三个Agent（最多 3 跳，防死循环）
-   *   3. 模型间@不改变用户绑定的回复Agent
-   *
-   * @param {string} fromAgent 问题来源（用户或上一个转交的 Agent），用于方向标签
-   */
-,
-
-  /**
-   * 执行指定 Agent 并处理模型间 @ 转交
-   *
-   * 规则：
-   *   1. Agent 回复中包含「@另一个Agent名 + 问题」时，平台把问题转交给被@的Agent
-   *   2. 被@的Agent可以继续@第三个Agent（最多 3 跳，防死循环）
-   *   3. 模型间@不改变用户绑定的回复Agent
-   *
-   * @param {string} fromAgent 问题来源（用户或上一个转交的 Agent），用于方向标签
-   */
-  async _executeAgentWithMentions(task, taskId, userMessage, execAgent, hop, visited, fromAgent) {
-    const startTime = Date.now();
-
-    try {
-      // 记录提问方向：hop 0 是用户提问（用户→@Agent），hop ≥ 1 是模型间转交（模型A→@模型B）
-      if (hop === 0) {
-        this._appendConversation(taskId, 'user', userMessage || task.instruction || task.description, { target: execAgent });
-      } else {
-        this._appendConversation(taskId, 'user', userMessage, { target: execAgent, from: fromAgent });
-      }
-
-      // 读取上一轮为止的转录（不含当前消息）。runtime 会在本轮调用中把
-      // “用户消息 + 工具轮 + 助手回复”按实际 prompt 格式追加回去，
-      // 下一轮再原样拼接，保证 prompt 前缀稳定、KV 缓存可复用。
-      if (!task.stable_context) {
-        try { task.stable_context = this._buildStableContext(task, userMessage); } catch (e) { /* ignore */ }
-      }
-      task.history_segments = transcript.loadSegments(taskId);
-      task.chat_mode = true;
-      task.record_transcript = true;
-
-      // 当前轮只放原始用户消息。团队协作说明已前移到稳定上下文（ZONE A），
-      // 不再拼在消息尾部，避免每轮改变对话条目、破坏前缀缓存。
-      const savedInstruction = task.instruction;
-      task.instruction = userMessage || task.instruction || task.description || '';
-
-      // 通过指定 Agent 执行（流式：捕获 CLI 增量输出推送到事件总线）
-      const result = await this._streamedExecute(task, taskId, execAgent, []);
-
-      // 恢复原 instruction
-      task.instruction = savedInstruction;
-
-      // 用户停止本轮：优雅收尾，不判失败、不继续转交
-      if (this._isCancelled(taskId) || (result && result.status === 'cancelled')) {
-        return this._finishStoppedTurn(task, taskId);
-      }
-
-      if (result.status !== 'success') {
-        task.status = 'failed';
-        task.suspend_reason = result.error ? result.error.message : '执行失败';
-        task.updated_at = new Date().toISOString();
-        this._saveTask(task);
-        this._updateIndex(task);
-        return { task, result };
-      }
-
-      // 检查回复中是否包含 @另一个Agent 的转交请求（最多 3 跳，防死循环）
-      const mention = this._extractMentionFromReply(result.content, execAgent);
-      if (this._isCancelled(taskId)) return this._finishStoppedTurn(task, taskId);
-      if (mention && hop < 3 && !visited.has(mention.agent)) {
-        visited.add(mention.agent);
-        // 记录模型A的回复全文 + 转交声明
-        const forwardMsg = `**${execAgent}**\n\n${result.content || ''}\n\n[转交] @${mention.agent}：${mention.question}`;
-        this._appendConversation(taskId, 'assistant', forwardMsg, { target: mention.agent, from: execAgent });
-        eventBus.emit('task:executing', { task_id: taskId, agent: mention.agent, phase: 'mention' });
-
-        // 转交给被@的Agent：附带转交说明，B 可从对话历史中看到A的完整回复
-        const forwardPrompt = `问题：${mention.question}\n\n（此问题由 ${execAgent} 转交给你回答。请参考对话历史中 ${execAgent} 的回复内容，直接给出你的回答；只有在确实无法回答时才可再次转交。）`;
-
-        return await this._executeAgentWithMentions(task, taskId, forwardPrompt, mention.agent, hop + 1, visited, execAgent);
-      }
-
-      // 最终回复用户，带上执行 Agent 的名称标记
-      const contentWithAgent = `**${execAgent}**\n\n` + (result.content || '');
-      this._appendConversation(taskId, 'assistant', contentWithAgent, { target: '用户' });
-
-      // 保存输出文件
-      if (result.output_files && result.output_files.length > 0) {
-        const outputDir = path.join(ROOT, 'tasks', taskId, 'outputs');
-        for (const file of result.output_files) {
-          const basename = path.basename(file);
-          const dest = path.join(outputDir, basename);
-          if (fs.existsSync(file) && !fs.existsSync(dest)) {
-            fs.copyFileSync(file, dest);
-          }
-        }
-      }
-
-      // 不标记为 completed，保持 executing 状态以支持多轮对话
-      task.progress = Math.min(1.0, (task.progress || 0) + 0.5);
-      task.updated_at = new Date().toISOString();
-      this._saveTask(task);
-      this._updateIndex(task);
-
-      eventBus.emit('task:updated', { task_id: taskId, status: task.status, duration_ms: Date.now() - startTime });
-
-      return { task, result };
-    } catch (e) {
-      // 用户停止本轮导致的异常：优雅收尾，不把任务判为失败
-      if (this._isCancelled(taskId)) return this._finishStoppedTurn(task, taskId);
-      task.status = 'failed';
-      task.suspend_reason = e.message;
-      task.updated_at = new Date().toISOString();
-      this._saveTask(task);
-      this._updateIndex(task);
-
-      this._appendConversation(taskId, 'system', `[错误] ${e.message}`);
-
-      eventBus.emit('task:failed', { task_id: taskId, error: e.message });
-      throw e;
-    }
-  },
-  /**
-   * 从模型回复中提取 @另一个Agent 的转交请求
-   *
-   * 格式要求：「@Agent名 + 具体问题」，问题至少 4 个字符才触发转交，
-   * 避免模型在普通回复中偶然提及 @Agent名 造成误转交。
-   *
-   * @returns {Object|null} { agent, question } 或 null
-   */
-  _extractMentionFromReply(content, currentAgent) {
-    const handoff = this._extractHandoffFromReply(content, currentAgent);
-    if (!handoff || handoff.error || !handoff.agent) return null;
-    return { agent: handoff.agent, question: handoff.rest || '' };
   },
 
   /**
-   * 首行 @ 解析（模型输出，最多 1 个）
-   * @returns {{agent?:string, rest?:string, error?:{code,message}}}
+   * 从模型回复中解析行首 @ 转交请求（多行）。
+   *
+   * 规则：
+   *   - 每个 agent 一次最多 @ 2 个其他 agent，且不能 @ 自己；
+   *   - 每个 @ 必须带任务描述（写在 @ 的下一行）；
+   *   - @ 只能出现在回复最前端或最末端；代码块/表格/引用等非纯文本里的 @ 不识别。
+   *
+   * @param {string} content 模型回复全文
+   * @param {string} currentAgent 当前发言的 agent（排除自己）
+   * @returns {{mentions:Array<{agent:string,description:string}>, body:string, error?:{code:string,message:string}}}
    */
-  _extractHandoffFromReply(content, currentAgent) {
+  _extractMentionsFromReply(content, currentAgent) {
     const cfg = config.mention || {};
-    const parsed = parseLeadingMentions(content || '', {
-      max: Number(cfg.model_max) || 1,
+    return parseMentions(content || '', {
+      max: Number(cfg.model_max) || 2,
       agents: enabledAgents(),
       aliases: cfg.aliases,
+      currentAgent,
     });
-    if (parsed.error) return { error: parsed.error };
-    const target = (parsed.agents || []).find(a => a !== currentAgent) || null;
-    return { agent: target, rest: parsed.rest || '' };
   },
 
   /**
-   * 一轮对话：把用户消息分发给 1~2 个 agent（并行回答同一问题），
-   * 并处理模型首行 @ 的转交链（最多 max_hops 跳）。
+   * 一轮对话：把用户消息分发给 1~2 个 agent（共享同一指令，向后兼容入口），
+   * 并处理模型行首 @ 的转交链（最多 max_hops 跳）。
    */
   async _executeTurnWithAgents(task, taskId, displayMessage, instruction, agents) {
+    return this._executeTurnWithJobs(
+      task, taskId, displayMessage,
+      agents.map(a => ({ agent: a, instruction })),
+    );
+  },
+
+  /**
+   * 一轮对话：按 job 分发（每个 agent 各带独立指令），
+   * 并处理模型行首 @ 的转交链。
+   * @param {Array<{agent:string, instruction:string}>} jobs
+   */
+  async _executeTurnWithJobs(task, taskId, displayMessage, jobs) {
     const cfg = config.mention || {};
     const maxSpawns = Number(cfg.max_spawns_per_turn) || 6;
     const maxHops = Number(cfg.max_hops) || 3;
 
-    this._appendConversation(taskId, 'user', displayMessage || instruction, { target: agents.join('、') });
+    this._appendConversation(taskId, 'user', displayMessage, { target: jobs.map(j => j.agent).join('、') });
 
     const budget = { left: maxSpawns };
-    const visited = new Set(agents);
-    const runOne = (agent, text, hop) => this._runAgentWithHandoff(
-      task, taskId, agent, text, hop, visited, budget, maxHops
+    const visited = new Set(jobs.map(j => j.agent));
+    const runOne = (job, hop) => this._runAgentWithHandoff(
+      task, taskId, job.agent, job.instruction, hop, visited, budget, maxHops
     );
 
-    const settled = await Promise.allSettled(agents.map(a => runOne(a, instruction, 0)));
+    const settled = await Promise.allSettled(jobs.map(j => runOne(j, 0)));
     const results = settled.map(r => (r.status === 'fulfilled'
       ? r.value
       : { ok: false, error: (r.reason && r.reason.message) || '执行失败' }));
@@ -565,7 +454,7 @@ module.exports = {
     task.status = 'executing';
     delete task.suspend_reason;
     task.last_run_status = 'completed';
-    task.executor_agent = agents[agents.length - 1] || agents[0];
+    task.executor_agent = jobs[jobs.length - 1] ? jobs[jobs.length - 1].agent : (jobs[0] && jobs[0].agent);
     task.updated_at = new Date().toISOString();
     this._saveTask(task);
     this._updateIndex(task);
@@ -583,7 +472,7 @@ module.exports = {
   },
 
   /**
-   * 单个 agent 的执行 + 首行 @ 转交链
+   * 单个 agent 的执行 + 行首 @ 转交链（最多 @ 2 个，并行扇出）。
    */
   async _runAgentWithHandoff(task, taskId, agentName, instruction, hop, visited, budget, maxHops) {
     if (this._isCancelled(taskId)) return { ok: false, stopped: true };
@@ -608,26 +497,39 @@ module.exports = {
 
     const content = result.content || '';
     // 落库时记录 agent，游标才能“排除自身输出”
-    this._appendConversation(taskId, 'assistant', `**${agentName}**\n\n${content}`, { agent: agentName });
+    // reasoning 单独传入，只进 conversation.md（前端折叠展示），不进 messageLog
+    this._appendConversation(taskId, 'assistant', `**${agentName}**\n\n${content}`, {
+      agent: agentName,
+      reasoning: result.reasoning || '',
+    });
 
-    // 模型首行 @：最多一个，且只认第一行
-    const handoff = this._extractHandoffFromReply(content, agentName);
-    if (handoff && handoff.error) {
-      this._appendConversation(taskId, 'system', `[违规转交] ${handoff.error.message}（已忽略本次转交）`);
+    // 解析模型输出中的行首 @（最多 2 个，不能 @ 自己，必须带任务描述）
+    const parsed = this._extractMentionsFromReply(content, agentName);
+    if (parsed && parsed.error) {
+      this._appendConversation(taskId, 'system', `[违规转交] ${parsed.error.message}（已忽略本次转交）`);
       return { ok: true, content };
     }
 
-    // 严格按首行 @ 转交：正文里的「交给 XX」视为普通文本，不做兜底识别
-    const target = handoff && handoff.agent;
-    if (target && hop < maxHops && !visited.has(target) && budget.left > 0) {
-      visited.add(target);
-      const nextText = (handoff.rest && handoff.rest.trim()) || '请基于以上对话继续处理。';
-      this._appendConversation(taskId, 'system', `[转交] ${agentName} → ${target}`);
-      const child = await this._runAgentWithHandoff(task, taskId, target, nextText, hop + 1, visited, budget, maxHops);
-      return { ok: true, content: content + (child && child.content ? `\n\n${child.content}` : '') };
-    }
+    // 并行扇出到被 @ 的 agent（每个分支独立 visited，共享 budget 防爆炸）
+    const targets = (parsed && parsed.mentions) || [];
+    const branches = targets
+      .filter(m => hop < maxHops && !visited.has(m.agent) && budget.left > 0)
+      .map(m => {
+        const branchVisited = new Set(visited);
+        branchVisited.add(m.agent);
+        this._appendConversation(taskId, 'system', `[转交] ${agentName} → ${m.agent}`);
+        return this._runAgentWithHandoff(
+          task, taskId, m.agent, m.description || '请基于以上对话继续处理。',
+          hop + 1, branchVisited, budget, maxHops
+        );
+      });
 
-    return { ok: true, content };
+    const settled = await Promise.allSettled(branches);
+    const childContents = settled
+      .map(r => (r.status === 'fulfilled' && r.value && r.value.ok) ? r.value.content : '')
+      .filter(Boolean);
+
+    return { ok: true, content: content + (childContents.length ? '\n\n' + childContents.join('\n\n') : '') };
   }
 ,
   /**

@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * 一轮对话路由测试：双 @ 并行、首行转交、模型多 @ 违规、无 @ 承接
+ * 一轮对话路由测试：双 @ 并行、行首 @ 转交、模型多 @ 扇出、自 @ 排除、缺描述违规、无 @ 承接
  * 用假 _streamedExecute，不调用真实 CLI。
  * 运行：node tests/turn-routing.test.js
  */
@@ -55,8 +55,8 @@ function stubAgent(responses) {
     assert.strictEqual(msgs.filter(m => m.role === 'assistant').length, 2);
   });
 
-  await test('模型首行 @ → 拉起被 @ 的 agent', async () => {
-    const tid = await newTask('首行转交');
+  await test('模型行首内联 @ → 拉起被 @ 的 agent', async () => {
+    const tid = await newTask('行首内联转交');
     const calls = stubAgent((agent) => (agent === '克劳德' ? '@钱文 请补充中文说明' : '钱文补充完成'));
     const task = orchestrator.getTask(tid);
     await orchestrator._executeTurnWithAgents(task, tid, '@克劳德 解释一下', '解释一下', ['克劳德']);
@@ -64,25 +64,48 @@ function stubAgent(responses) {
     assert.ok(calls[1].instruction.includes('请补充中文说明'));
   });
 
-  await test('模型首行 @ 两个 → 忽略转交并记录违规', async () => {
-    const tid = await newTask('模型多@');
-    const calls = stubAgent({ 克劳德: '@钱文 @吉米 你们一起看' });
+  await test('模型多行 @ 两个 agent（各自任务）→ 并行扇出', async () => {
+    const tid = await newTask('多行双@扇出');
+    const calls = stubAgent((agent) => {
+      if (agent === '克劳德') return '这是回答\n\n@迪普斯克\n帮我审代码\n@钱文\n帮我写测试';
+      return `${agent} 已完成`;
+    });
     const task = orchestrator.getTask(tid);
-    await orchestrator._executeTurnWithAgents(task, tid, '@克劳德 看下', '看下', ['克劳德']);
-    assert.strictEqual(calls.length, 1, '违规转交不应拉起任何 agent');
-    const conv = orchestrator.getConversation(tid);
-    assert.ok(conv.includes('违规转交'));
+    await orchestrator._executeTurnWithAgents(task, tid, '@克劳德 出方案', '出方案', ['克劳德']);
+    const agentsCalled = calls.map(c => c.agent);
+    assert.deepStrictEqual(agentsCalled[0], '克劳德');
+    assert.deepStrictEqual(agentsCalled.slice(1).sort(), ['迪普斯克', '钱文'].sort());
+    const qianwenCall = calls.find(c => c.agent === '钱文');
+    assert.ok(qianwenCall.instruction.includes('帮我写测试'));
   });
 
-  await test('非首行 @ 不触发转交', async () => {
-    const tid = await newTask('非首行@');
-    const calls = stubAgent({ 克劳德: '这是回答\n@钱文 后面这行不触发' });
+  await test('模型 @ 自己 → 不拉起（排除自己）', async () => {
+    const tid = await newTask('自@排除');
+    const calls = stubAgent({ 克劳德: '@克劳德\n再检查一遍\n' });
     const task = orchestrator.getTask(tid);
-    await orchestrator._executeTurnWithAgents(task, tid, '@克劳德 回答', '回答', ['克劳德']);
+    await orchestrator._executeTurnWithAgents(task, tid, '@克劳德 看下', '看下', ['克劳德']);
     assert.strictEqual(calls.length, 1);
   });
 
-  await test('正文「建议下一棒交给钱文」→ 不触发转交（严格首行）', async () => {
+  await test('模型 @ 缺描述 → 记录违规，不拉起', async () => {
+    const tid = await newTask('缺描述');
+    const calls = stubAgent({ 克劳德: '@钱文' });
+    const task = orchestrator.getTask(tid);
+    await orchestrator._executeTurnWithAgents(task, tid, '@克劳德 看下', '看下', ['克劳德']);
+    assert.strictEqual(calls.length, 1);
+    assert.ok(orchestrator.getConversation(tid).includes('违规转交'));
+  });
+
+  await test('模型 @ 夹在正文中间 → 违规，不拉起', async () => {
+    const tid = await newTask('中间@');
+    const calls = stubAgent({ 克劳德: '前面正文\n\n@钱文\n任务描述\n\n后面正文' });
+    const task = orchestrator.getTask(tid);
+    await orchestrator._executeTurnWithAgents(task, tid, '@克劳德 看下', '看下', ['克劳德']);
+    assert.strictEqual(calls.length, 1);
+    assert.ok(orchestrator.getConversation(tid).includes('违规转交'));
+  });
+
+  await test('正文「建议下一棒交给钱文」→ 不触发转交', async () => {
     const tid = await newTask('正文转交不触发');
     const calls = stubAgent((agent) => (agent === '克劳德'
       ? '方案已完成。建议下一棒交给钱文，按体系化文档汇总。'
@@ -90,7 +113,14 @@ function stubAgent(responses) {
     const task = orchestrator.getTask(tid);
     await orchestrator._executeTurnWithAgents(task, tid, '@克劳德 出个方案', '出个方案', ['克劳德']);
     assert.deepStrictEqual(calls.map(c => c.agent), ['克劳德'], '正文建议不应拉起其他 agent');
-    assert.ok(!orchestrator.getConversation(tid).includes('[格式纠正]'));
+  });
+
+  await test('代码块里的 @ → 不触发转交', async () => {
+    const tid = await newTask('代码块@');
+    const calls = stubAgent({ 克劳德: '看代码\n```\n@钱文 帮我写测试\n```' });
+    const task = orchestrator.getTask(tid);
+    await orchestrator._executeTurnWithAgents(task, tid, '@克劳德 看下', '看下', ['克劳德']);
+    assert.strictEqual(calls.length, 1);
   });
 
   await test('执行许可关键词识别', async () => {

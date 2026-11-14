@@ -28,6 +28,7 @@ function buildKimiOutput(taskId, status, content, opts = {}) {
     tokens_used: opts.tokens_used || 0,
     duration_ms: opts.duration_ms || 0,
     session_id: opts.session_id || null,
+    reasoning: opts.reasoning || '',
   };
 }
 
@@ -338,7 +339,8 @@ class KimiAdapter {
    */
   _buildPrompt(input) {
     return buildPrompt({
-      agentLabel: '吉米',
+      agentName: input.agent_name || '吉米',
+      modelCli: 'kimi',
       role: input.role,
       taskId: input.task_id,
       context: input.context,
