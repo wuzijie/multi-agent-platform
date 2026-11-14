@@ -1,0 +1,45 @@
+cli_profiles:
+  defaults:
+    require_resume: true
+  profiles:
+    claude:
+      strategy: session_id_then_resume
+      first_call_args:
+        - '--session-id'
+        - '{session_id}'
+      resume_args:
+        - '--resume'
+        - '{session_id}'
+      capture: stream_json_init
+      supported: true
+      probed_at: '2026-11-12T03:26:39.348Z'
+      probe_detail: '{"resume":true,"sessionId":true,"continue":true}'
+    qwen:
+      strategy: resume_only
+      first_call_args: &ref_0 []
+      resume_args: &ref_1
+        - '--resume'
+        - '{session_id}'
+      capture: output_json
+      supported: true
+      probed_at: '2026-11-12T03:26:39.351Z'
+      probe_detail: '{"resume":true,"sessionId":false,"continue":true}'
+    kimi:
+      strategy: resume_only
+      first_call_args: []
+      resume_args:
+        - '--resume'
+        - '{session_id}'
+      capture: output_json
+      supported: false
+      probed_at: '2026-11-12T03:26:39.352Z'
+      probe_detail: '{"resume":false,"sessionId":false,"continue":true}'
+    deepseek:
+      strategy: resume_only
+      first_call_args: *ref_0
+      resume_args: *ref_1
+      capture: output_json
+      supported: true
+      probed_at: '2026-11-12T03:26:39.345Z'
+      inherit_from: qwen
+      probe_detail: 'inherit from qwen: {"resume":true,"sessionId":false,"continue":true}'

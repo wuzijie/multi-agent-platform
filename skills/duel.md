@@ -5,6 +5,8 @@ description: 两个Agent交替对抗辩论，2-5轮可变，轻量化辨析
 enabled: true
 
 tool:
+  # 已注销：不注册为 FC 工具（恢复时改回 true）
+  enabled: false
   name: duel
   description: |
     启动一对一辩论模式（轻量化辨析型）。两个Agent交替输出观点、点评、辩解、修正，2-5轮可变。

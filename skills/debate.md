@@ -5,6 +5,8 @@ description: 多Agent并行观点发散 + 交叉匿名点评 + 自我辩解修�
 enabled: true
 
 tool:
+  # 已注销：不注册为 FC 工具（恢复时改回 true）
+  enabled: false
   name: debate
   description: |
     启动多方辩论模式（严谨论证型）。多个Agent并行输出初始观点、交叉匿名点评、自我辩解修正、二次深度博弈、终修正共识分歧拆解，共6轮可迭代。

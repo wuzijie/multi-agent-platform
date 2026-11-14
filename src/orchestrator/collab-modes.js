@@ -254,7 +254,7 @@ module.exports = {
   async _discRound(traceId, taskId, taskList, round, mode) {
     // 检查是否被取消（stopTask 会设 session.status='completed'）
     const sess = sessionManager.get(taskId);
-    if (sess && sess.status === 'completed') {
+    if (sess && sess.isCancelled()) {
       console.log(`[DiscRound] 任务 ${taskId} 已取消，跳过第${round}轮`);
       return [];
     }
@@ -267,7 +267,7 @@ module.exports = {
     const results = await Promise.allSettled(taskList.map(async (t) => {
       // 子任务执行前再次检查是否被取消
       const s2 = sessionManager.get(taskId);
-      if (s2 && s2.status === 'completed') {
+      if (s2 && s2.isCancelled()) {
         return { msgSeq: 0, executor: t.executor, summary: { status: 'failed', core_view: '已取消' }, fullText: '已取消' };
       }
       const msgSeq = this._nextMsgSeq(traceId);
@@ -483,16 +483,19 @@ module.exports = {
       blackboard.hset(`blackboard:disc:${traceId}:meta`, 'status', 'failed');
       eventBus.emit('disc:failed', { traceId, error: e.message });
       task.status = 'failed';
-    // 被用户取消时不标记 failed，优雅返回
+    // 被用户取消时不标记 failed/completed，优雅返回（对话仍可继续）
     const _sess = sessionManager.get(taskId);
-    if (_sess && _sess.status === 'completed') {
-      this._appendConversation(taskId, 'system', '[讨论已取消]');
+    if (_sess && _sess.isCancelled()) {
+      this._appendConversation(taskId, 'system', '[讨论已取消] 本轮已停止，对话仍可继续');
       blackboard.hset(`blackboard:disc:${traceId}:meta`, 'status', 'cancelled');
       eventBus.emit('disc:end', { traceId, taskId });
-      task.status = 'completed';
+      task.status = 'executing';
+      task.last_run_status = 'stopped';
+      delete task.suspend_reason;
       task.updated_at = new Date().toISOString();
       this._saveTask(task);
       this._updateIndex(task);
+      eventBus.emit('task:stopped', { task_id: taskId, scope: 'turn' });
       return { task, result: { status: 'success', content: '讨论已取消' } };
     }
     task.suspend_reason = e.message;
@@ -611,16 +614,19 @@ module.exports = {
       blackboard.hset(`blackboard:disc:${traceId}:meta`, 'status', 'failed');
       eventBus.emit('disc:failed', { traceId, error: e.message });
       task.status = 'failed';
-    // 被用户取消时不标记 failed，优雅返回
+    // 被用户取消时不标记 failed/completed，优雅返回（对话仍可继续）
     const _sess = sessionManager.get(taskId);
-    if (_sess && _sess.status === 'completed') {
-      this._appendConversation(taskId, 'system', '[讨论已取消]');
+    if (_sess && _sess.isCancelled()) {
+      this._appendConversation(taskId, 'system', '[讨论已取消] 本轮已停止，对话仍可继续');
       blackboard.hset(`blackboard:disc:${traceId}:meta`, 'status', 'cancelled');
       eventBus.emit('disc:end', { traceId, taskId });
-      task.status = 'completed';
+      task.status = 'executing';
+      task.last_run_status = 'stopped';
+      delete task.suspend_reason;
       task.updated_at = new Date().toISOString();
       this._saveTask(task);
       this._updateIndex(task);
+      eventBus.emit('task:stopped', { task_id: taskId, scope: 'turn' });
       return { task, result: { status: 'success', content: '讨论已取消' } };
     }
     task.suspend_reason = e.message;
@@ -737,16 +743,19 @@ module.exports = {
       blackboard.hset(`blackboard:disc:${traceId}:meta`, 'status', 'failed');
       eventBus.emit('disc:failed', { traceId, error: e.message });
       task.status = 'failed';
-    // 被用户取消时不标记 failed，优雅返回
+    // 被用户取消时不标记 failed/completed，优雅返回（对话仍可继续）
     const _sess = sessionManager.get(taskId);
-    if (_sess && _sess.status === 'completed') {
-      this._appendConversation(taskId, 'system', '[讨论已取消]');
+    if (_sess && _sess.isCancelled()) {
+      this._appendConversation(taskId, 'system', '[讨论已取消] 本轮已停止，对话仍可继续');
       blackboard.hset(`blackboard:disc:${traceId}:meta`, 'status', 'cancelled');
       eventBus.emit('disc:end', { traceId, taskId });
-      task.status = 'completed';
+      task.status = 'executing';
+      task.last_run_status = 'stopped';
+      delete task.suspend_reason;
       task.updated_at = new Date().toISOString();
       this._saveTask(task);
       this._updateIndex(task);
+      eventBus.emit('task:stopped', { task_id: taskId, scope: 'turn' });
       return { task, result: { status: 'success', content: '讨论已取消' } };
     }
     task.suspend_reason = e.message;

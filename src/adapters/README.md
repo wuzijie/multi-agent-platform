@@ -7,46 +7,57 @@
 ```json
 {
   "task_id": "uuid",
+  "external_task_id": "对话级 uuid",
   "role": "executor | reviewer | guardian",
-  "context": "任务上下文与背景",
-  "instruction": "具体执行指令",
+  "context": "稳定上下文（delta 模式下为空）",
+  "instruction": "本轮内容",
   "input_files": ["file_paths"],
-  "max_tokens": 4096
+  "max_tokens": 4096,
+  "session": {
+    "id": "uuid | null",
+    "is_first": true,
+    "enabled": true
+  }
 }
 ```
 
-## 统一输出格式 (UnifiedOutput)
+`session.enabled=false` 或 `id` 为空时不下发 resume 参数；`is_first=true` 使用
+`first_call_args`（如 `--session-id`），否则使用 `resume_args`（如 `--resume`）。
+参数模板来自 `config/cli-profiles.yaml`，适配器不得硬编码。
 
-任意模型适配器执行后返回的标准输出结构：
+## 统一输出格式 (UnifiedOutput)
 
 ```json
 {
   "task_id": "uuid",
-  "status": "success | failed | timeout",
+  "status": "success | failed | timeout | cancelled",
   "content": "产出文本内容",
-  "output_files": ["file_paths"],
-  "error": { "code": "xxx", "message": "xxx" },
+  "error": { "code": "CANCELLED | TIMEOUT | SESSION_NOT_FOUND | AUTH_REQUIRED | ..." },
+  "session_id": "本次捕获到的会话 id",
   "tokens_used": 1234,
   "duration_ms": 5000
 }
 ```
 
+`error.code=SESSION_NOT_FOUND` 是 resume 失效的唯一判据，运行时会清空 session
+并用全量模式重试一次。
+
+## 规范事件（contract/events.js）
+
+适配器把各 CLI 原生输出翻译成统一事件，运行时只消费这些事件：
+
+`session.started` / `message.delta` / `message.completed` / `tool.call` /
+`tool.result` / `usage` / `log` / `error` / `done`
+
+新增模型 = 新增 `cli-profiles.yaml` 条目 + 一个翻译器，编排层零改动。
+
 ## 适配器接口 (AdapterInterface)
 
-每个模型 CLI 对应的适配器必须实现以下方法：
-
-- `execute(input: UnifiedInput): Promise<UnifiedOutput>`
-  - 将 UnifiedInput 翻译为对应 CLI 的原生参数格式
-  - 调用 CLI 执行
-  - 将原生输出标准化为 UnifiedOutput
-
-- `healthCheck(): Promise<{ online: boolean, latency_ms: number }>`
-  - 检测模型 CLI 是否可用
-
+- `execute(input, onChunk): Promise<UnifiedOutput>`
+- `healthCheck(): Promise<{ online, latency_ms }>`
 - `getName(): string`
-  - 返回适配器名称
 
-## 一期实现
+## 准入
 
-- 克劳德 (Claude Code CLI) 适配器：仅此一个
-- 其余适配器（吉米 / 迪普斯克 / 钱文）二期开发
+`npm run probe:cli` 探测各 CLI 的 resume 能力并写入 `config/cli-profiles.yaml`。
+`require_resume: true` 时，未通过准入的 CLI 在启动阶段被排除，不做降级适配。

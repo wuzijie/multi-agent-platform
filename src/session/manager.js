@@ -39,11 +39,11 @@ class Session {
 
   /**
    * 标记「本轮被用户停止」：
-   * 与 markCompleted（结束对话）区分，编排层据此不再推进后续步骤。
+   * 只取消当前轮，不结束整个对话；对话结束由 markCompleted（terminateTask）负责。
    */
   cancel() {
     this.cancelledTurn = true;
-    this.status = 'completed';
+    this.status = 'idle';
   }
 
   isCancelled() {
@@ -148,7 +148,7 @@ class SessionManager {
     for (const s of sessions) {
       s.busyAgents.clear();
       s.traces = [];
-      s.cancel(); // 置 cancelledTurn + status=completed
+      s.cancel(); // 只标记本轮取消（cancelledTurn），不把会话判为 completed
       CollabLogger.log('session_stopped', { task_id: s.taskId, session: s.toJSON() });
     }
     return sessions.length;

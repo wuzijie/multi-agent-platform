@@ -15,6 +15,10 @@ const memoryManager = require('../memory/memory-manager');
 const { historyConfig } = require('../prompt/config');
 const { enabledAgents, enabledAgentNames } = require('../utils/agent-list');
 const { TASK_STATUS, TASK_TYPES, genSubTaskId } = require('../engine/events');
+const messageLog = require('../messaging/message-log');
+const { parseLeadingMentions } = require('../messaging/mention');
+const { isAgentFatal } = require('../utils/fatal-errors');
+const collabModeRegistry = require('./collab-mode-registry');
 
 const ROOT = path.resolve(__dirname, '..', '..');
 
@@ -35,17 +39,106 @@ const COLLAB_TYPE_LABEL = {
 function detectCollabMode(msg) {
   if (!msg || typeof msg !== 'string') return null;
   let m;
+  const enabled = (mode) => collabModeRegistry.isEnabled(mode);
   // 匹配触发词（在消息开头）+ 可选的"一下/下/关于" + 剩余部分作为主题
   if (m = msg.match(/^(?:头脑风暴|发散思考|方案征集|创意发散|思路拓展|brainstorm)(?:一下|下|关于)?[\s,，：:]*/i)) {
-    return { mode: 'brainstorm', topic: msg.substring(m[0].length).trim() || msg };
+    return enabled('brainstorm') ? { mode: 'brainstorm', topic: msg.substring(m[0].length).trim() || msg } : null;
   }
-  if (m = msg.match(/^(?:多模型讨论|多方辩论|多Agent讨论|多智能体讨论|多角度论证|方案论证|debate)(?:一下|下|关于)?[\s,，：:]*/i)) {
-    return { mode: 'debate', topic: msg.substring(m[0].length).trim() || msg };
+  if (m = msg.match(/^(?:多模型讨论|多方辩论|多Agent讨论|多智能体讨论|多角度论证|方案论证|debate)(?:一下|下|关于)?[\s,：:]*/i)) {
+    return enabled('debate') ? { mode: 'debate', topic: msg.substring(m[0].length).trim() || msg } : null;
   }
-  if (m = msg.match(/^(?:一对一讨论|一对一辩论|两个模型对一下|正反对抗|duel)(?:一下|下|关于)?[\s,，：:]*/i)) {
-    return { mode: 'duel', topic: msg.substring(m[0].length).trim() || msg };
+  if (m = msg.match(/^(?:一对一讨论|一对一辩论|两个模型对一下|正反对抗|duel)(?:一下|下|关于)?[\s,：:]*/i)) {
+    return enabled('duel') ? { mode: 'duel', topic: msg.substring(m[0].length).trim() || msg } : null;
   }
   return null;
+}
+
+/**
+ * 自动事件驱动意图检测。
+ *
+ * 目标：用户没有显式点“事件驱动”开关时，也能把“多模型分工 / 多步骤拆解”类任务
+ * 自动路由到 DAG 协作。
+ *
+ * 误判防护（项目里踩过触发词过窄、也踩过把知识问答误判）：
+ *   - 纯解释/知识类问句开头直接排除；
+ *   - “多智能体/多 Agent 系统”作为领域名词不算执行意图（要求“多个模型/多个智能体/多模型/团队”）；
+ *   - 多模型路径必须同时出现动作词，并带分工/请求语义；
+ *   - 显式讨论/辩论/头脑风暴关键词由 detectCollabMode 优先，自动路由会让位。
+ *
+ * @param {string} msg
+ * @returns {boolean}
+ */
+function isEventDrivenIntent(msg) {
+  if (!msg || typeof msg !== 'string') return false;
+  const text = msg.trim();
+  if (!text) return false;
+
+  // 纯知识/解释类问句不抢路由（含“如何…”“先解释…”这类咨询式表达）
+  if (/^(解释|介绍|什么是|为什么|如何|讲讲|说明一下|科普|先(解释|说|讲|介绍|说明))/.test(text)) return false;
+
+  const MULTI = /(多个|几个)(模型|智能体|agent)|多模型|团队|几位/i;
+  const COLLAB = /分工|协作|分别|并行|一起|同时|接力|轮流/;
+  const SELF_DECOMPOSE = /拆解|拆成|分成|分为|子任务|多步骤|分步骤|逐步|第一步/;
+  const SEQUENCE = /先.*再|然后|接着|最后/;
+  const ACTION = /调研|分析|实现|开发|编写|写|设计|评审|汇总|总结|落地|报告|方案|对比|排查|完成|给出|产出|处理/;
+  const REQUEST = /帮我|请|帮忙|给我|替我|需要你|完成|实现|产出|做一份|写一份|生成|执行/;
+
+  const hasMulti = MULTI.test(text);
+  const hasCollab = COLLAB.test(text);
+  const hasAction = ACTION.test(text);
+  const hasRequest = REQUEST.test(text);
+
+  // 明确要求“拆解/分成子任务”：本身就是分解意图
+  if (SELF_DECOMPOSE.test(text)) return true;
+  // “先调研，再写方案”这类分步执行意图
+  if (SEQUENCE.test(text) && hasAction) return true;
+  // “多个模型分工/一起做”这类多模型协作意图
+  return hasMulti && hasAction && (hasCollab || hasRequest);
+}
+
+/**
+ * 消息中是否出现三种协作模式的显式关键词（任意位置）。
+ *
+ * 自动事件驱动只应在“用户没有点名任何协作模式”时生效。
+ * detectCollabMode 只匹配消息开头，无法覆盖“帮我用头脑风暴拆解一下”这类
+ * 关键词出现在句中的表达；这里放宽到任意位置，用于让位，不做路由。
+ *
+ * @param {string} msg
+ * @returns {boolean}
+ */
+function hasExplicitCollabModeKeyword(msg) {
+  if (!msg || typeof msg !== 'string') return false;
+  const text = msg.trim();
+  if (!text) return false;
+  // brainstorm
+  if (/头脑风暴|发散思考|方案征集|创意发散|思路拓展|\bbrainstorm\b/i.test(text)) return true;
+  // debate
+  if (/多模型讨论|多方辩论|多Agent讨论|多智能体讨论|多角度论证|方案论证|\bdebate\b/i.test(text)) return true;
+  // duel
+  if (/一对一讨论|一对一辩论|两个模型对一下|正反对抗|\bduel\b/i.test(text)) return true;
+  return false;
+}
+
+/**
+ * 自动事件驱动路由判定（纯函数，便于测试）。
+ *
+ * 显式意图永远优先：
+ *   - 请求里显式指定 collab_mode
+ *   - @了 2 个及以上模型（讨论模式）
+ *   - @了单个模型（用户指定回答者）
+ *   - 消息中出现三种协作模式的关键词（任意位置）
+ *
+ * @param {string} msg
+ * @param {object} opts { collab_mode, discussion_agents, mentioned_agent }
+ * @returns {boolean}
+ */
+function shouldAutoEventDriven(msg, opts = {}) {
+  const hasDiscussion = Array.isArray(opts.discussion_agents) && opts.discussion_agents.length >= 2;
+  const explicit = !!opts.collab_mode ||
+    hasDiscussion ||
+    !!opts.mentioned_agent ||
+    hasExplicitCollabModeKeyword(msg);
+  return !explicit && isEventDrivenIntent(msg);
 }
 
 /**
@@ -157,12 +250,61 @@ class TaskOrchestrator {
       // 会话级隔离：标记该对话的 session 活跃（独立 thread/session），复位上一轮取消标志
       sessionManager.get(taskId).beginTurn();
 
-      // 如果用户通过 @mention 指定了 Agent，使用该 Agent（并持久化，后续对话默认由该 Agent 回复）
-      if (opts.mentioned_agent && opts.mentioned_agent !== task.executor_agent) {
-        task.executor_agent = opts.mentioned_agent;
-        this._appendConversation(taskId, 'system', `[回复Agent] 后续对话由 ${opts.mentioned_agent} 回复`);
+      // ===== 首行 @ 解析 + 承接规则 =====
+      // 1) 首行 @ 1~2 个 → 指定承接（>2 直接拒绝）
+      // 2) 无 @ → 最近一次回复的 agent（粘性）
+      // 3) 首次无 @ → 默认 agent（克劳德）
+      const mentionCfg = config.mention || {};
+      const maxUserMentions = Number(mentionCfg.user_max) || 2;
+      const mentionParsed = parseLeadingMentions(userMessage || '', {
+        max: maxUserMentions,
+        agents: enabledAgents(),
+        aliases: mentionCfg.aliases,
+      });
+      if (mentionParsed.error) {
+        this._appendConversation(taskId, 'system', `[规则提示] ${mentionParsed.error.message}`);
+        return {
+          task,
+          result: { status: 'failed', content: mentionParsed.error.message, error: mentionParsed.error },
+          error: mentionParsed.error.message,
+        };
       }
-      const execAgent = task.executor_agent || '克劳德';
+
+      let execAgents = (mentionParsed.agents || []).slice(0, maxUserMentions);
+      // 只保留可用 agent（启用 + 在线 + 未熔断）
+      execAgents = execAgents.filter(name => {
+        if (!enabledAgentNames().includes(name)) return false;
+        if (isAgentFatal(name)) return false;
+        const st = agentRuntime.getAgentState(name);
+        return !st || st.online !== false;
+      });
+      if (execAgents.length === 0) {
+        const lastAgent = messageLog.latestAssistantAgent(taskId);
+        if (lastAgent && enabledAgentNames().includes(lastAgent) && !isAgentFatal(lastAgent)) {
+          const st = agentRuntime.getAgentState(lastAgent);
+          if (!st || st.online !== false) execAgents = [lastAgent];
+        }
+      }
+      if (execAgents.length === 0) {
+        const def = config.getDefaultAgent();
+        execAgents = [def ? def.name : '克劳德'];
+      }
+
+      const execAgent = execAgents[0];
+      const userRest = mentionParsed.rest || userMessage || task.instruction || task.description || '';
+
+      // ===== 执行许可（operator approval）=====
+      // 一律以用户消息为准；一旦本会话获得许可，后续轮次直接沿用。
+      if (!task.operator_approved && this._detectOperatorApproval(userRest)) {
+        task.operator_approved = true;
+        task.operator_approved_at = new Date().toISOString();
+        this._saveTask(task);
+        this._appendConversation(taskId, 'system', '[执行许可] 用户已授权执行，后续可直接修改文件/实施方案');
+      }
+      if (execAgent !== task.executor_agent) {
+        task.executor_agent = execAgent;
+        this._saveTask(task);
+      }
 
       task.status = 'executing';
       task.updated_at = new Date().toISOString();
@@ -193,18 +335,28 @@ class TaskOrchestrator {
         this._saveTask(task);
       } catch (e) { /* 稳定上下文构建失败不阻塞主流程 */ }
 
+      // ===== 自动事件驱动意图路由 =====
+      // 显式意图永远优先：指定了 collab_mode、@了 2+ 模型讨论、@了单个模型、
+      // 或消息中出现讨论/辩论/头脑风暴关键词（任意位置）时，都不自动抢路由。
+      // 判定逻辑抽到 shouldAutoEventDriven（纯函数，便于测试）。
+      const autoRoutingEnabled = !(config.routing && config.routing.auto_event_driven === false);
+      const autoEventDriven = autoRoutingEnabled && shouldAutoEventDriven(userMessage, opts);
+
       // 事件驱动协作模式（消息总线 + 黑板 + DAG 编排）
-      if (opts.collab_mode === 'event-driven') {
-        result = await this._executeEventDrivenCollaboration(task, taskId, userMessage, opts);
+      if (opts.collab_mode === 'event-driven' || autoEventDriven) {
+        if (autoEventDriven) opts.auto_triggered = true;
+        result = await this._executeEventDrivenCollaboration(task, taskId, userRest, opts);
         return result;
       }
 
-      // 多模型讨论模式：一条消息中 @了 2 个及以上 Agent
-      if (opts.discussion_agents && Array.isArray(opts.discussion_agents)) {
+      // 多模型讨论模式：仅当显式开启且该模式未被注销
+      if (collabModeRegistry.isEnabled('discussion')
+        && opts.discussion_mode === true
+        && opts.discussion_agents && Array.isArray(opts.discussion_agents)) {
         const valid = opts.discussion_agents.filter(n => enabledAgentNames().includes(n)); // 只允许已启用模型参与（吉米 enabled:false 自动排除）
         const unique = [...new Set(valid)];
         if (unique.length >= 2) {
-          result = await this._executeDiscussionMode(task, taskId, userMessage, unique);
+          result = await this._executeDiscussionMode(task, taskId, userRest, unique);
           return result;
         }
       }
@@ -213,17 +365,27 @@ class TaskOrchestrator {
       // 1. 用户明确通过 collab_mode 指定 -> 直接走对应模式
       // 2. 模型自主调用 FC 工具（debate/brainstorm/duel）-> executor 层拦截后转入
       // 3. 关键词意图路由 -> 用户说"头脑风暴一下"/"多模型讨论一下"等自动触发
+      //
+      // 注意：这些模式已通过 config/collab-modes.yaml 注销（enabled: false）。
+      // 代码保留，恢复时把对应开关置 true 即可；注销期间显式请求按普通对话处理。
       if (opts.collab_mode === 'debate' || opts.collab_mode === 'brainstorm' || opts.collab_mode === 'duel') {
-        // 记录用户消息
-        this._appendConversation(taskId, 'user', userMessage || task.instruction || task.description, { target: execAgent });
-        if (opts.collab_mode === 'debate') {
-          result = await this._executeDebateMode(task, taskId, userMessage, opts);
-        } else if (opts.collab_mode === 'brainstorm') {
-          result = await this._executeBrainstormMode(task, taskId, userMessage, opts);
+        if (!collabModeRegistry.isEnabled(opts.collab_mode)) {
+          this._appendConversation(
+            taskId, 'system',
+            `[已停用] 协作模式「${opts.collab_mode}」已注销，本轮按普通对话处理`
+          );
         } else {
-          result = await this._executeDuelMode(task, taskId, userMessage, opts);
+          // 记录用户消息
+          this._appendConversation(taskId, 'user', userMessage || task.instruction || task.description, { target: execAgent });
+          if (opts.collab_mode === 'debate') {
+            result = await this._executeDebateMode(task, taskId, userRest, opts);
+          } else if (opts.collab_mode === 'brainstorm') {
+            result = await this._executeBrainstormMode(task, taskId, userRest, opts);
+          } else {
+            result = await this._executeDuelMode(task, taskId, userRest, opts);
+          }
+          return result;
         }
-        return result;
       }
 
       // 关键词意图路由：用户消息明确包含模式关键词时自动触发
@@ -244,7 +406,7 @@ class TaskOrchestrator {
         }
       }
 
-      result = await this._executeAgentWithMentions(task, taskId, userMessage, execAgent, 0, new Set([execAgent]), null);
+      result = await this._executeTurnWithAgents(task, taskId, userMessage, userRest, execAgents);
       return result;
     } finally {
       // Session Memory 写入条件：
@@ -316,15 +478,41 @@ class TaskOrchestrator {
   _buildTeamRules() {
     const agents = enabledAgents();
     if (!agents || agents.length < 2) {
-      return '当前没有可转交的其他智能体，请直接回答问题。';
+      return [
+        '## 执行许可规则（必须严格遵守）',
+        '未经用户（operator）明确许可，不得执行方案落地、修改/创建文件、提交代码等有副作用的动作；',
+        '如果用户在本会话中已经明确许可，可以直接执行，无需重复询问。',
+        '没有可转交的其他智能体，请直接回答。',
+      ].join('\n');
     }
     const desc = { claude: 'Claude', kimi: 'Kimi', deepseek: 'DeepSeek', qwen: 'Qwen' };
     const angle = { claude: '通用', kimi: '长文本分析', deepseek: '编程实现', qwen: '中文写作' };
     const list = agents
       .map(a => `${a.name}（${desc[a.model_cli] || a.model_cli}，${angle[a.model_cli] || ''}）`)
       .join('、');
-    const example = agents[0].name;
-    return `你可以把问题转交给团队中的其他智能体，格式：@智能体名 问题内容（例如：@${example} 请解释一下这个算法）。可用的智能体：${list}。仅当你自己无法可靠回答该问题时才转交，否则请直接回答。`;
+    return [
+      '## 转交规则（必须严格遵守）',
+      '1. 需要其他智能体参与时，回复的【第一行】必须是：@智能体名 任务描述。',
+      '   一次只允许 @ 一个智能体，禁止在一行内 @ 多个。',
+      '2. @ 只能出现在第一行。第一行之后出现的 @ 视为普通文本，不会触发转交。',
+      '3. 禁止在正文里用「建议交给 XX」「下一棒交给 XX」「请 XX 处理」这类描述代替转交；',
+      '   想转交就必须把 @智能体名 放在第一行，否则视为不转交。',
+      '4. 不得 @ 自己，不得 @ 不存在的智能体。',
+      '5. 不需要转交时直接回答，第一行不要出现任何 @。',
+      '',
+      '## 执行许可规则（必须严格遵守）',
+      '1. 未经用户（operator）明确许可，不得执行方案落地、修改/创建文件、提交代码等有副作用的动作；',
+      '   此阶段只做分析、方案、评审，并把待执行动作列清楚等待许可。',
+      '2. 如果用户在本会话中已经明确许可（例如「可以开始」「按方案执行」「授权」），',
+      '   后续可以直接执行，不要再重复询问，也不要每轮都请求许可。',
+      '3. 判断依据只看用户本人消息；模型之间的建议不构成许可。',
+      '',
+      '## 承接说明',
+      '用户未 @ 任何智能体时，平台会把消息交给最近一次回复的智能体（通常就是你），',
+      '你可以直接在既有上下文里继续，无需重复自我介绍或复述历史。',
+      '',
+      `可用智能体：${list}。`,
+    ].join('\n');
   }
 
   /**
@@ -497,6 +685,27 @@ class TaskOrchestrator {
    */
   _isCancelled(taskId) {
     return sessionManager.isCancelled(taskId);
+  }
+
+  /**
+   * 判断用户消息是否构成“执行许可”。
+   * 只认用户本人消息（调用方传入的是用户原话），模型之间的建议不算。
+   */
+  _detectOperatorApproval(text) {
+    if (!text) return false;
+    const s = String(text).trim();
+    // 问句不算许可（例如「可以开始执行吗？」未被回答前不应视为授权）
+    if (/[吗么]\s*[？?]?\s*$/.test(s) && !/授权/.test(s)) return false;
+    const patterns = [
+      /(可以|允许|同意|批准|授权)(开始|执行|实现|修改|动手|落地|实施|改|做)/,
+      /按(这个|上述|上面的|该|此)?方案(执行|做|改|实施|落地|开始)/,
+      /(开始|直接|马上)(执行|实现|修改|动手|落地|实施)/,
+      /授权/,
+      /(改|做|实现|落地)吧/,
+      /^(好|可以|行|没问题)[，,。！!\s]*(开始|执行|做|改|实施|落地|干)/,
+      /(干吧|上吧|开工|动手)/,
+    ];
+    return patterns.some(re => re.test(s));
   }
 
   /**
@@ -733,6 +942,24 @@ class TaskOrchestrator {
 
     const entry = `\n### ${roleLabel}${opts.target ? ` @${opts.target}` : ''} - ${timestamp}\n\n${content}\n\n---\n`;
     fs.appendFileSync(conversationPath, entry);
+
+    // 机器可读日志：游标与增量 prompt 的唯一依据（conversation.md 只用于展示）
+    try {
+      let agent = opts.agent || null;
+      if (!agent && role === 'assistant') {
+        if (opts.from) agent = opts.from;
+        else {
+          const m = String(content || '').match(/^\*\*(克劳德|吉米|迪普斯克|钱文)\*\*/);
+          if (m) agent = m[1];
+        }
+      }
+      messageLog.append(taskId, {
+        role,
+        agent,
+        kind: opts.kind || 'chat',
+        content: String(content == null ? '' : content),
+      });
+    } catch (e) { /* 日志写入失败不影响对话展示 */ }
   }
 
   _readConversationHistory(taskId) {
@@ -775,3 +1002,7 @@ Object.assign(TaskOrchestrator.prototype, require('./execution'));
 Object.assign(TaskOrchestrator.prototype, require('./collab-modes'));
 
 module.exports = new TaskOrchestrator();
+// 供路由测试直接引用
+module.exports.isEventDrivenIntent = isEventDrivenIntent;
+module.exports.hasExplicitCollabModeKeyword = hasExplicitCollabModeKeyword;
+module.exports.shouldAutoEventDriven = shouldAutoEventDriven;

@@ -30,6 +30,17 @@ async function main() {
   console.log(`[Bootstrap] Loaded ${config.agents.length} agent(s), ${config.users.length} user(s)`);
   console.log(`[Bootstrap] Git repo: ${config.git.default_repo_url}`);
 
+  // 1.1 CLI 准入报告（resume 能力）
+  const capabilities = require('./adapters/contract/capabilities');
+  capabilities.load(true);
+  console.log('[Bootstrap] CLI admission (resume):');
+  for (const a of config.agents) {
+    if (a.enabled === false) continue;
+    const ok = capabilities.isSupported(a.model_cli);
+    const probed = capabilities.getProfile(a.model_cli).probed_at;
+    console.log(`  - ${a.name}(${a.model_cli}): ${ok ? '准入' : '排除'}${probed ? '' : '（未探测，请运行 npm run probe:cli）'}`);
+  }
+
   // 2. 初始化 Agent Runtime
   console.log('[Bootstrap] Initializing agent runtime...');
   await agentRuntime.initialize();

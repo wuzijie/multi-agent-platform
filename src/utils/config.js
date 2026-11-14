@@ -12,6 +12,9 @@ class ConfigLoader {
     this.taskDefaults = {};
     this.apiKeys = {};
     this.context = {};
+    this.routing = {};
+    this.mention = {};
+    this.collabModes = {};
   }
 
   loadAll() {
@@ -21,6 +24,9 @@ class ConfigLoader {
     this.taskDefaults = this._loadYaml('config/task_defaults.yaml').task_defaults || {};
     this.apiKeys = this._loadYaml('config/api_keys.yaml').api_keys || {};
     this.context = this._loadYaml('config/context.yaml').context || {};
+    this.routing = this._loadYaml('config/routing.yaml').routing || {};
+    this.mention = this._loadYaml('config/mention.yaml').mention || {};
+    this.collabModes = this._loadYaml('config/collab-modes.yaml').collab_modes || {};
     return this;
   }
 
