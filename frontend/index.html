@@ -56,6 +56,8 @@
     .stream-cursor::after { content: '▍'; color: #3b82f6; animation: pulse-dot 1s ease-in-out infinite; }
     /* 所有消息正文（用户/模型回复/流式气泡）：限高10行，超出气泡内滚动，气泡尺寸不变 */
     .message-body { max-height: calc(1.625em * 10); overflow-y: auto; line-height: 1.625em; }
+    /* 展开态：取消限高，完整显示（配合「展开全文 / 收起」按钮） */
+    .message-body.expanded { max-height: none; overflow-y: visible; }
     .message-body::-webkit-scrollbar { width: 5px; }
     .message-body::-webkit-scrollbar-track { background: transparent; }
     .message-body::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 3px; }
@@ -154,6 +156,37 @@
         thinking: m[1].trim(),
         body: text.replace(/\[THINKING\][\s\S]*?\[\/THINKING\]\s*/, '').trim(),
       };
+    }
+
+    // ====== CollapsibleBody：气泡正文，超限高时提供「展开全文 / 收起」 ======
+    // 默认限高 10 行（.message-body）；内容溢出时显示切换按钮，
+    // 展开后取消限高完整显示（无需在气泡内滚动），收起恢复原固定大小。
+    function CollapsibleBody(props) {
+      var expandedState = useState(false);
+      var expanded = expandedState[0], setExpanded = expandedState[1];
+      var overflowState = useState(false);
+      var overflow = overflowState[0], setOverflow = overflowState[1];
+      var ref = useRef(null);
+      var contentKey = props.contentKey || '';
+      var autoScroll = !!props.autoScroll;
+      useEffect(function() {
+        var el = ref.current;
+        if (!el) return;
+        // 流式内容自动跟随最新（仅收起态且启用 autoScroll 时）
+        if (autoScroll && !expanded) el.scrollTop = el.scrollHeight;
+        // 收起态下测量是否溢出；展开态保持上次结论（展开后 scrollHeight==clientHeight 无法判断）
+        if (!expanded) setOverflow(el.scrollHeight > el.clientHeight + 4);
+      }, [contentKey, expanded]);
+      return h(Fragment, null,
+        h('div', {
+          ref: ref,
+          className: (props.className || '') + (expanded ? ' expanded' : ''),
+        }, props.children),
+        overflow && h('button', {
+          onClick: function() { setExpanded(!expanded); },
+          className: 'mt-1.5 text-xs font-medium cursor-pointer ' + (props.toggleClass || 'text-gray-400 hover:text-gray-600'),
+        }, expanded ? '收起' : '展开全文')
+      );
     }
 
     // ====== Analytics ======
@@ -740,8 +773,8 @@
                     directionLabel
                   ),
                   isUserBubble
-                    ? h('p', { className: 'text-sm leading-relaxed whitespace-pre-wrap message-body' }, sp.body)
-                    : h('div', { className: 'message-body' }, h(Markdown, null, sp.body))
+                    ? h(CollapsibleBody, { className: 'text-sm leading-relaxed whitespace-pre-wrap message-body', contentKey: sp.body, toggleClass: 'text-blue-200 hover:text-white' }, sp.body)
+                    : h(CollapsibleBody, { className: 'message-body', contentKey: sp.body }, h(Markdown, null, sp.body))
                 )
               )
             );
@@ -772,11 +805,10 @@
                   h('div', { className: 'thinking-body' }, st.reasoning)
                 ) : null,
                 h('div', { className: 'w-fit max-w-full rounded-2xl px-4 py-3 bg-white border border-gray-200 shadow-sm' },
-                  h('div', {
+                  h(CollapsibleBody, {
                     className: 'text-sm whitespace-pre-wrap stream-cursor message-body',
-                    ref: function(el) {
-                      if (el) el.scrollTop = el.scrollHeight; // 自动跟随最新内容（仅气泡内滚动，不影响外层）
-                    },
+                    contentKey: st.text || '',
+                    autoScroll: true, // 自动跟随最新内容（仅气泡内滚动，不影响外层）
                   }, st.text || '')
                 )
               )

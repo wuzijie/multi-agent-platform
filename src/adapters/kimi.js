@@ -287,7 +287,8 @@ class KimiAdapter {
         let errorCode = 'CLI_ERROR';
         if (result.killed_by_timeout) {
           errorCode = 'TIMEOUT';
-          errMsg = `模型调用超时（超过 ${Math.round(timeoutMs / 1000)} 秒无结果，进程已被中断）`;
+          const errTail = result.stderr ? `；stderr: ${String(result.stderr).slice(0, 300)}` : '';
+          errMsg = `模型调用超时（超过 ${Math.round(timeoutMs / 1000)} 秒无结果，进程已被中断${errTail}）`;
         } else {
           errMsg = result.stderr || result.stdout || 'Unknown error';
           if (errMsg.includes('Not logged in') || errMsg.includes('login')) {
