@@ -542,9 +542,8 @@
           resetAgent = true;
           dismissedRef.current = false;
         }
-        // 首行 @ 由后端解析（含“最多两个、并行回答”规则）。
-        // 前端不再剥离 @ 文本，也不再传递 discussion_agents；消息原文发给后端。
-        onSend(msg, atAgent, resetAgent, null);
+        // 首行 @ 由后端解析（含“最多两个、并行回答”规则）；消息原文发给后端。
+        onSend(msg, atAgent, resetAgent);
       }
 
       function handleKeyDown(e) {
@@ -1142,7 +1141,7 @@
         if (messagesEndRef.current) messagesEndRef.current.scrollIntoView({ behavior: 'smooth' });
       }, [conversation, isTaskLoading(activeTask && activeTask.task_id), streams]);
 
-      function handleSend(message, mentionedAgent, resetAgent, discussAgents) {
+      function handleSend(message, mentionedAgent, resetAgent) {
         // 按对话维度标记忙碌（新对话未创建前用 __new__，创建后换成真实 task_id），
         // 避免"对话 A 执行中"把对话 B 的输入也禁掉（多对话并行）
         var sendKey = activeId || '__new__';
@@ -1164,9 +1163,8 @@
         (async function() {
           var newTaskId = null;
           try {
-            var discussion = discussAgents && discussAgents.length >= 2 ? discussAgents.map(function(a) { return a.name; }) : null;
             if (activeId) {
-              var res = await api('/tasks/' + activeId + '/chat', { method: 'POST', body: JSON.stringify({ message: message, mentioned_agent: mentionedAgent ? mentionedAgent.name : (resetAgent ? '克劳德' : undefined), model_cli: mentionedAgent ? mentionedAgent.model_cli : undefined, discussion_agents: discussion }) });
+              var res = await api('/tasks/' + activeId + '/chat', { method: 'POST', body: JSON.stringify({ message: message, mentioned_agent: mentionedAgent ? mentionedAgent.name : (resetAgent ? '克劳德' : undefined), model_cli: mentionedAgent ? mentionedAgent.model_cli : undefined }) });
               var data = await res.json();
               if (data.task) setActiveTask(data.task);
               fetchConversation(activeId);
@@ -1194,7 +1192,7 @@
                 return n;
               });
 
-              var execRes = await api('/tasks/' + newTask.task_id + '/execute', { method: 'POST', body: JSON.stringify({ message: message, mentioned_agent: agent ? agent.name : undefined, model_cli: agent ? agent.model_cli : undefined, discussion_agents: discussion }) });
+              var execRes = await api('/tasks/' + newTask.task_id + '/execute', { method: 'POST', body: JSON.stringify({ message: message, mentioned_agent: agent ? agent.name : undefined, model_cli: agent ? agent.model_cli : undefined }) });
               var execData = await execRes.json();
               if (execData.task) setActiveTask(execData.task);
               fetchConversation(newTask.task_id);

@@ -13,7 +13,6 @@ class ConfigLoader {
     this.apiKeys = {};
     this.context = {};
     this.mention = {};
-    this.collabModes = {};
   }
 
   loadAll() {
@@ -24,7 +23,6 @@ class ConfigLoader {
     this.apiKeys = this._loadYaml('config/api_keys.yaml').api_keys || {};
     this.context = this._loadYaml('config/context.yaml').context || {};
     this.mention = this._loadYaml('config/mention.yaml').mention || {};
-    this.collabModes = this._loadYaml('config/collab-modes.yaml').collab_modes || {};
     return this;
   }
 

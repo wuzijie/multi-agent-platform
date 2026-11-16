@@ -201,11 +201,10 @@ class ApiServer {
         const task = orchestrator.getTask(req.params.taskId);
         if (!task) return res.status(404).json({ error: 'Task not found' });
 
-        // 对话开始时不再评估复杂度，直接执行（@mention 路由 / 多Agent讨论）
+        // 对话开始时不再评估复杂度，直接执行（@mention 路由）
         let result;
         result = await orchestrator.executeSimpleTask(req.params.taskId, req.body.message, {
           mentioned_agent: req.body.mentioned_agent,
-          discussion_agents: req.body.discussion_agents,
           skill: req.body.skill,
         });
         res.json(result);
@@ -224,11 +223,10 @@ class ApiServer {
           return res.status(400).json({ error: `Cannot continue task with status: ${task.status}. 请新建对话。` });
         }
 
-        // 继续对话：默认由任务当前绑定的 Agent 回复，除非用户 @了其他 Agent（或 @多个进入讨论）
+        // 继续对话：默认由任务当前绑定的 Agent 回复，除非用户 @了其他 Agent
         let result;
         result = await orchestrator.executeSimpleTask(req.params.taskId, req.body.message, {
           mentioned_agent: req.body.mentioned_agent,
-          discussion_agents: req.body.discussion_agents,
           skill: req.body.skill,
         });
         res.json(result);

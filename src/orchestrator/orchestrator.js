@@ -16,41 +16,9 @@ const messageLog = require('../messaging/message-log');
 const { parseMentions } = require('../messaging/mention');
 const renderer = require('../prompt/renderer');
 const { isAgentFatal } = require('../utils/fatal-errors');
-const collabModeRegistry = require('./collab-mode-registry');
 const LogStore = require('../utils/log-store');
 
 const ROOT = path.resolve(__dirname, '..', '..');
-
-// 事件驱动协作：任务类型 → 中文标签
-const COLLAB_TYPE_LABEL = {
-  PLAN_TASK: '规划',
-  CODE_TASK: '执行',
-  REVIEW_TASK: '评审',
-  SUMMARY_TASK: '汇总',
-  DEBUG_TASK: '调试',
-  RESEARCH_TASK: '调研',   // 深度调研 Skill：多角度并行调研
-  FINAL_TASK: '终稿',      // 深度调研 Skill：迭代修正终稿
-};
-
-// 三类协作模式意图检测：用户明确指令触发，也可被模型自主 FC 调用
-// 模型也可以向用户确认"要哪种模式"--在工具 description 里已说明
-// 返回 { mode, topic }：mode 为模式名，topic 为去掉触发词后的实际讨论主题
-function detectCollabMode(msg) {
-  if (!msg || typeof msg !== 'string') return null;
-  let m;
-  const enabled = (mode) => collabModeRegistry.isEnabled(mode);
-  // 匹配触发词（在消息开头）+ 可选的"一下/下/关于" + 剩余部分作为主题
-  if (m = msg.match(/^(?:头脑风暴|发散思考|方案征集|创意发散|思路拓展|brainstorm)(?:一下|下|关于)?[\s,，：:]*/i)) {
-    return enabled('brainstorm') ? { mode: 'brainstorm', topic: msg.substring(m[0].length).trim() || msg } : null;
-  }
-  if (m = msg.match(/^(?:多模型讨论|多方辩论|多Agent讨论|多智能体讨论|多角度论证|方案论证|debate)(?:一下|下|关于)?[\s,：:]*/i)) {
-    return enabled('debate') ? { mode: 'debate', topic: msg.substring(m[0].length).trim() || msg } : null;
-  }
-  if (m = msg.match(/^(?:一对一讨论|一对一辩论|两个模型对一下|正反对抗|duel)(?:一下|下|关于)?[\s,：:]*/i)) {
-    return enabled('duel') ? { mode: 'duel', topic: msg.substring(m[0].length).trim() || msg } : null;
-  }
-  return null;
-}
 
 /**
  * 任务编排器 (Task Orchestrator)
@@ -248,63 +216,6 @@ class TaskOrchestrator {
         task.chat_mode = true;
         this._saveTask(task);
       } catch (e) { /* 稳定上下文构建失败不阻塞主流程 */ }
-
-      // 多模型讨论模式：仅当显式开启且该模式未被注销
-      if (collabModeRegistry.isEnabled('discussion')
-        && opts.discussion_mode === true
-        && opts.discussion_agents && Array.isArray(opts.discussion_agents)) {
-        const valid = opts.discussion_agents.filter(n => enabledAgentNames().includes(n)); // 只允许已启用模型参与（吉米 enabled:false 自动排除）
-        const unique = [...new Set(valid)];
-        if (unique.length >= 2) {
-          result = await this._executeDiscussionMode(task, taskId, userRest, unique);
-          return result;
-        }
-      }
-
-      // 三类协作模式（debate / brainstorm / duel）：
-      // 1. 用户明确通过 collab_mode 指定 -> 直接走对应模式
-      // 2. 模型自主调用 FC 工具（debate/brainstorm/duel）-> executor 层拦截后转入
-      // 3. 关键词意图路由 -> 用户说"头脑风暴一下"/"多模型讨论一下"等自动触发
-      //
-      // 注意：这些模式已通过 config/collab-modes.yaml 注销（enabled: false）。
-      // 代码保留，恢复时把对应开关置 true 即可；注销期间显式请求按普通对话处理。
-      if (opts.collab_mode === 'debate' || opts.collab_mode === 'brainstorm' || opts.collab_mode === 'duel') {
-        if (!collabModeRegistry.isEnabled(opts.collab_mode)) {
-          this._appendConversation(
-            taskId, 'system',
-            `[已停用] 协作模式「${opts.collab_mode}」已注销，本轮按普通对话处理`
-          );
-        } else {
-          // 记录用户消息
-          this._appendConversation(taskId, 'user', userMessage || task.instruction || task.description, { target: execAgent });
-          if (opts.collab_mode === 'debate') {
-            result = await this._executeDebateMode(task, taskId, userRest, opts);
-          } else if (opts.collab_mode === 'brainstorm') {
-            result = await this._executeBrainstormMode(task, taskId, userRest, opts);
-          } else {
-            result = await this._executeDuelMode(task, taskId, userRest, opts);
-          }
-          return result;
-        }
-      }
-
-      // 关键词意图路由：用户消息明确包含模式关键词时自动触发
-      {
-        const intent = detectCollabMode(userMessage);
-        if (intent && intent.mode && enabledAgentNames().length >= 2) {
-          const topic = intent.topic || userMessage;
-          this._appendConversation(taskId, 'user', userMessage || task.instruction || task.description, { target: execAgent });
-          this._appendConversation(taskId, 'system', `[协作模式] 检测到意图：${intent.mode}，讨论主题：${topic}`);
-          if (intent.mode === 'debate') {
-            result = await this._executeDebateMode(task, taskId, topic, { topic });
-          } else if (intent.mode === 'brainstorm') {
-            result = await this._executeBrainstormMode(task, taskId, topic, { topic });
-          } else {
-            result = await this._executeDuelMode(task, taskId, topic, { topic });
-          }
-          return result;
-        }
-      }
 
       result = await this._executeTurnWithJobs(task, taskId, userMessage, jobs);
       return result;
@@ -879,6 +790,5 @@ class TaskOrchestrator {
 
 // 从单独文件加载大方法（拆分文件，每个<800行）
 Object.assign(TaskOrchestrator.prototype, require('./execution'));
-Object.assign(TaskOrchestrator.prototype, require('./collab-modes'));
 
 module.exports = new TaskOrchestrator();
