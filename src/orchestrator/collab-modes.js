@@ -15,7 +15,7 @@ const eventBus = require('../eventbus/bus');
 const blackboard = require('../blackboard/blackboard');
 const agentRuntime = require('../agent/runtime');
 const { enabledAgentNames, enabledAgents } = require('../utils/agent-list');
-const { genTraceId } = require('../engine/events');
+const { genTraceId } = require('../utils/ids');
 const sessionManager = require('../session/manager');
 const transcript = require('../prompt/transcript');
 

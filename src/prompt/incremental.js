@@ -43,15 +43,9 @@ function rosterSnapshot(agentRuntime) {
   }
 }
 
-/** 活跃任务快照（调度器中未完成的协作 trace） */
+/** 活跃任务快照（DAG 引擎已移除；保留接口，导航头显示"无"） */
 function activeTasksSnapshot() {
-  try {
-    const scheduler = require('../engine/scheduler');
-    const pending = (scheduler && scheduler._pending) ? Array.from(scheduler._pending.keys()) : [];
-    return pending.slice(0, 5).map((tid) => `协作 trace ${tid}`);
-  } catch (e) {
-    return [];
-  }
+  return [];
 }
 
 /** 最近修改文件（git status --short 限量，30s 缓存） */

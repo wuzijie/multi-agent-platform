@@ -11,9 +11,6 @@ const eventBus = require('../eventbus/bus');
 const worktreeManager = require('../worktree/manager');
 const featureManager = require('../features/manager');
 const config = require('../utils/config');
-const scheduler = require('../engine/scheduler');
-const { AGENT_NAMES } = require('../engine/events');
-const blackboard = require('../blackboard/blackboard');
 const sessionManager = require('../session/manager');
 const LogStore = require('../utils/log-store');
 
@@ -165,47 +162,6 @@ class ApiServer {
       }
     });
 
-    // 获取事件驱动协作的任务列表（黑板子任务状态，供右侧面板展示）
-    api.get('/tasks/:taskId/collab/state', (req, res) => {
-      try {
-        const task = orchestrator.getTask(req.params.taskId);
-        if (!task) return res.status(404).json({ error: 'Task not found' });
-        // 始终扫描黑板取该 task_id 下 create_time 最新的 trace：
-        // task.collab_trace_id 只在回合结束后才更新，执行中的新回合仍指向上一回合，
-        // 若优先用它，右侧面板会被旧回合的任务列表覆盖（表现为新任务逐个出现）
-        let best = null;
-        for (const k of blackboard.keys('blackboard:task:')) {
-          if (!k.endsWith(':main')) continue;
-          const main = blackboard.hgetall(k);
-          if (main && main.task_id === req.params.taskId) {
-            if (!best || (main.create_time || 0) > (best.create_time || 0)) best = main;
-          }
-        }
-        const traceId = (best && best.trace_id) || task.collab_trace_id || null;
-        if (!traceId) return res.json({ trace_id: null, sub_tasks: [] });
-        const state = scheduler.getTaskState(traceId);
-        if (!state) return res.json({ trace_id: traceId, sub_tasks: [] });
-        // 扁平化为前端易用结构（agent_id → 中文名，支持多 Agent 分配）
-        const sub_tasks = (state.sub_tasks || []).map(s => {
-          let agentLabel = '';
-          const ids = Array.isArray(s.agents) && s.agents.length ? s.agents : (s.agent_id ? [s.agent_id] : []);
-          if (ids.length) agentLabel = ids.map(id => AGENT_NAMES[id] || id).join('、');
-          return {
-            sub_task_id: s.sub_task_id,
-            type: s.type || '',
-            status: s.status || 'PENDING',
-            agent: agentLabel,
-            input: s.input || '',
-            output: s.output || '',
-            error_msg: s.error_msg || '',
-          };
-        });
-        res.json({ trace_id: traceId, overall_status: state.overall_status || '', sub_tasks });
-      } catch (e) {
-        res.status(500).json({ error: e.message });
-      }
-    });
-
     // 获取任务对话记录
     api.get('/tasks/:taskId/conversation', (req, res) => {
       try {
@@ -245,12 +201,11 @@ class ApiServer {
         const task = orchestrator.getTask(req.params.taskId);
         if (!task) return res.status(404).json({ error: 'Task not found' });
 
-        // 对话开始时不再评估复杂度，直接执行（@mention 路由 / 多Agent讨论 / 事件驱动协作）
+        // 对话开始时不再评估复杂度，直接执行（@mention 路由 / 多Agent讨论）
         let result;
         result = await orchestrator.executeSimpleTask(req.params.taskId, req.body.message, {
           mentioned_agent: req.body.mentioned_agent,
           discussion_agents: req.body.discussion_agents,
-          collab_mode: req.body.collab_mode,
           skill: req.body.skill,
         });
         res.json(result);
@@ -269,12 +224,11 @@ class ApiServer {
           return res.status(400).json({ error: `Cannot continue task with status: ${task.status}. 请新建对话。` });
         }
 
-        // 继续对话：默认由任务当前绑定的 Agent 回复，除非用户 @了其他 Agent（或 @多个进入讨论 / 事件驱动协作）
+        // 继续对话：默认由任务当前绑定的 Agent 回复，除非用户 @了其他 Agent（或 @多个进入讨论）
         let result;
         result = await orchestrator.executeSimpleTask(req.params.taskId, req.body.message, {
           mentioned_agent: req.body.mentioned_agent,
           discussion_agents: req.body.discussion_agents,
-          collab_mode: req.body.collab_mode,
           skill: req.body.skill,
         });
         res.json(result);

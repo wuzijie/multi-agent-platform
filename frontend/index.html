@@ -239,37 +239,6 @@
     var statusColorMap = { executing:'bg-blue-500', completed:'bg-green-500', failed:'bg-red-500', suspended:'bg-yellow-500', assessing:'bg-purple-500', created:'bg-gray-400' };
     var statusLabel = { executing:'进行中', completed:'已结束', failed:'错误', suspended:'已挂起', assessing:'评估中', created:'新对话' };
 
-    // ====== Collab Task Panel（事件驱动协作：右侧任务列表）======
-    function CollabTaskPanel({ tasks }) {
-      var typeLabel = { PLAN_TASK: '规划', CODE_TASK: '执行', REVIEW_TASK: '评审', SUMMARY_TASK: '汇总', DEBUG_TASK: '调试', RESEARCH_TASK: '调研', FINAL_TASK: '终稿' };
-      var statusLabel = { PENDING: '待执行', RUNNING: '执行中', SUCCESS: '完成', RETRYING: '重试中', TIMEOUT: '超时', FAILED: '失败', SKIPPED: '跳过', CANCELLED: '已取消' };
-      return h('div', { className: 'w-64 flex-shrink-0 border-l border-gray-200 bg-gray-50 p-4 overflow-y-auto' },
-        h('div', { className: 'text-xs font-bold text-gray-500 mb-3' }, '任务列表'),
-        (!tasks || tasks.length === 0)
-          ? h('div', { className: 'text-xs text-gray-300 mt-2' }, '暂无任务（事件驱动协作 / 深度调研时自动生成）')
-          : h('div', { className: 'space-y-2' },
-              tasks.map(function(t) {
-                var done = t.status === 'SUCCESS';
-                var statusCls = t.status === 'FAILED' ? 'text-red-500' : t.status === 'RUNNING' ? 'text-blue-500' : t.status === 'RETRYING' ? 'text-yellow-500' : 'text-gray-400';
-                var desc = (t.description || t.input || '').replace(/\s+/g, ' ').trim();
-                return h('div', { key: t.sub_task_id, className: 'bg-white rounded-lg border border-gray-200 p-2.5' },
-                  h('div', { className: 'flex items-center gap-2' },
-                    h('span', { className: 'text-sm font-bold ' + (done ? 'text-green-600' : 'text-gray-300') }, done ? '✓' : '□'),
-                    h('span', { className: 'text-xs font-medium text-gray-700' }, typeLabel[t.type] || t.type || ''),
-                    h('span', { className: 'ml-auto text-[10px] ' + statusCls }, statusLabel[t.status] || t.status)
-                  ),
-                  desc && h('div', { className: 'mt-1 text-[11px] text-gray-500 leading-snug break-all line-clamp-2' }, desc),
-                  h('div', { className: 'mt-1 flex items-center gap-1 text-[11px]' },
-                    t.agent
-                      ? h('span', { className: 'text-blue-600' }, '接受者: ' + t.agent)
-                      : h('span', { className: 'text-gray-300' }, '未分配')
-                  )
-                );
-              })
-            )
-      );
-    }
-
     // ====== Conversation Sidebar ======
     function ConversationSidebar(props) {
       var conversations = props.conversations, activeId = props.activeId;
@@ -489,8 +458,6 @@
       var messagesEndRef = props.messagesEndRef, hasActiveConversation = props.hasActiveConversation;
       var agents = props.agents || [];
       var streams = props.streams || {};
-      var collabMode = !!props.collabMode;
-      var onToggleCollabMode = props.onToggleCollabMode;
       var inputRef = useRef(null);
       var inputState = useState('');
       var input = inputState[0], setInput = inputState[1];
@@ -836,19 +803,6 @@
         h('div', { className: 'px-5 py-3 border-t border-gray-100 bg-white' },
           inputEnabled
             ? h('div', null,
-                // 协作模式开关：事件驱动 = 主 Agent 拆解 DAG，多模型分工执行
-                h('div', { className: 'mb-2 flex items-center gap-2' },
-                  h('span', { className: 'text-xs text-gray-400' }, '协作模式:'),
-                  h('button', {
-                    onClick: onToggleCollabMode,
-                    disabled: loading,
-                    title: '开启后由主 Agent 拆解任务 DAG，多个模型按依赖分工执行（此时 @多模型讨论不生效）；关闭则按自动路由（单 Agent / @多模型讨论 / 关键词协作）',
-                    className: 'text-xs px-2.5 py-1 rounded-full border transition-colors ' + (collabMode
-                      ? 'bg-blue-600 text-white border-blue-600'
-                      : 'bg-white text-gray-500 border-gray-200 hover:border-gray-300') + (loading ? ' opacity-50 cursor-not-allowed' : '')
-                  }, collabMode ? '事件驱动（DAG）' : '自动'),
-                  collabMode && h('span', { className: 'text-xs text-gray-400' }, '将拆解为多个子任务并行执行')
-                ),
                 // @mention selected chip
                 mentionedAgent && h('div', { className: 'mb-2 flex items-center gap-2' },
                   h('span', { className: 'text-xs text-gray-400' }, '回答者:'),
@@ -893,9 +847,7 @@
                   ),
                   h('textarea', {
                     ref: inputRef, value: input,
-                    placeholder: collabMode
-                      ? '输入任务，事件驱动模式将拆解为 DAG 并行执行...'
-                      : (isNewConversation ? '输入你的需求，开始对话... 也可用 @Agent名 指定回答者' : '继续输入... 也可用 @Agent名 指定回答者'),
+                    placeholder: isNewConversation ? '输入你的需求，开始对话... 也可用 @Agent名 指定回答者' : '继续输入... 也可用 @Agent名 指定回答者',
                     rows: 1, disabled: loading,
                     onChange: handleInputChange,
                     onKeyDown: handleKeyDown,
@@ -971,10 +923,6 @@
       // 按对话维度跟踪"正在执行"的任务（多对话并行：A 执行中不影响新开 B）
       var busyTasksState = useState({});   // { taskId: true } + { __new__: true }（新对话发送中）
       var busyTasks = busyTasksState[0], setBusyTasks = busyTasksState[1];
-      // 事件驱动协作开关：开启后每个请求都带 collab_mode='event-driven'
-      // （按请求生效、不持久化；切换对话时保持当前选择）
-      var collabModeState = useState(false);
-      var collabMode = collabModeState[0], setCollabMode = collabModeState[1];
       var globalBusyState = useState(false); // 全局瞬态操作（如 stop-all）
       var globalBusy = globalBusyState[0], setGlobalBusy = globalBusyState[1];
       // 停止中标志：拦截后续 WS 流式事件（kill 进程到 WS 断流有短暂延迟）
@@ -984,9 +932,6 @@
       var streams = streamsState[0], setStreams = streamsState[1];
       // streams 最新值镜像（供定时器在 setState 提交前同步读取当前气泡状态）
       var streamsRef = useRef({});
-      // 事件驱动协作：右侧任务面板子任务状态
-      var collabTasksState = useState([]); // [{ sub_task_id, type, status, agent, input }]
-      var collabTasks = collabTasksState[0], setCollabTasks = collabTasksState[1];
       var sidebarCollapsedState = useState(false);
       var sidebarCollapsed = sidebarCollapsedState[0], setSidebarCollapsed = sidebarCollapsedState[1];
       var messagesEndRef = useRef(null);
@@ -1056,7 +1001,7 @@
             if (data.event_type === 'agent:stream:end') {
               if (stoppingRef.current) return;
               if (!data.data || !activeIdRef.current || data.data.task_id !== activeIdRef.current) return;
-              // 不立即删除气泡：正文要等 collab:subtask:done -> 写 conversation -> 重新 fetch
+              // 不立即删除气泡：正文要等服务端把输出写入 conversation 后重新 fetch
               // 才出现，立即删除会出现内容"真空期"（并行执行时 fetch 可能延迟数秒，表现为
               // 模型输出消失、其他模型输出完成后才再次出现）。先标记 done 保留展示，
               // 待对话刷新成功（fetchConversation 内清理）后再移除。
@@ -1076,24 +1021,6 @@
                   fetchConversationRef.current(endTaskId);
                 }
               }, 600);
-              return;
-            }
-            // 事件驱动协作：子任务状态更新（右侧任务面板，只接收当前对话任务的事件）
-            if (data.event_type === 'collab:subtask:update') {
-              if (data.data && data.data.sub_task_id && activeIdRef.current && data.data.task_id === activeIdRef.current) {
-                setCollabTasks(function(prev) {
-                  var sub = data.data;
-                  var found = false;
-                  var next = prev.map(function(t) {
-                    if (t.sub_task_id === sub.sub_task_id) { found = true; return Object.assign({}, t, { status: sub.status, agent: sub.agent || t.agent, description: sub.description || t.description || '' }); }
-                    return t;
-                  });
-                  if (!found) {
-                    next = next.concat([{ sub_task_id: sub.sub_task_id, type: sub.type || '', status: sub.status, agent: sub.agent || '', description: sub.description || '', input: '' }]);
-                  }
-                  return next;
-                });
-              }
               return;
             }
             lastMsgState[1](data);
@@ -1154,27 +1081,6 @@
             return changed ? next : prev;
           });
         } catch(e) { console.error(e); }
-        // 拉取事件驱动协作任务列表（右侧面板）
-        try {
-          if (taskId !== activeIdRef.current) return;
-          var cres = await api('/tasks/' + taskId + '/collab/state');
-          var cdata = await cres.json();
-          if (mySeq !== convSeqRef.current) return;
-          // 合并服务器列表与本地状态：WS 已推进的进度（RUNNING/SUCCESS 等）不回退；
-          // 同时剔除本地残留的其他回合/其他任务的子任务
-          setCollabTasks(function(prev) {
-            var statusRank = { PENDING: 1, RUNNING: 2, RETRYING: 3, TIMEOUT: 4, SUCCESS: 5, FAILED: 6, CANCELLED: 7 };
-            var byId = {};
-            (cdata.sub_tasks || []).forEach(function(t) { byId[t.sub_task_id] = t; });
-            (prev || []).forEach(function(p) {
-              var s = byId[p.sub_task_id];
-              if (s && (statusRank[p.status] || 0) > (statusRank[s.status] || 0)) {
-                byId[p.sub_task_id] = Object.assign({}, s, { status: p.status, agent: p.agent || s.agent });
-              }
-            });
-            return Object.keys(byId).map(function(k) { return byId[k]; });
-          });
-        } catch(e) { console.error(e); }
       }, []);
 
       // 供 WS 流结束事件/兜底取用：useCallback 依赖为空，各次渲染返回同一函数，赋一次即可
@@ -1226,12 +1132,6 @@
             fetchConversation(activeId);
           }
         }
-        // 事件驱动协作：拆解完成/子任务完成时刷新对话（展示过程中各模型输出）
-        if (event.event_type === 'collab:planned' || event.event_type === 'collab:subtask:done') {
-          if (activeId && event.data && event.data.task_id === activeId) {
-            fetchConversation(activeId);
-          }
-        }
         if (event.event_type === 'agent:heartbeat') {
           setAgents(event.data || []);
         }
@@ -1247,8 +1147,6 @@
         // 避免"对话 A 执行中"把对话 B 的输入也禁掉（多对话并行）
         var sendKey = activeId || '__new__';
         setBusyTasks(function(prev) { var n = Object.assign({}, prev); n[sendKey] = true; return n; });
-        // 新消息 = 可能触发新的事件驱动回合，先清空右侧任务面板
-        setCollabTasks([]);
         // 新一轮消息：清掉当前对话上一轮残留的"已完成"流式气泡（其正文已随上一轮 fetch
         // 写入对话），避免与新一轮模型的并发输出并存导致重复/错位；仍在流式中的不受影响
         if (activeId) {
@@ -1268,7 +1166,7 @@
           try {
             var discussion = discussAgents && discussAgents.length >= 2 ? discussAgents.map(function(a) { return a.name; }) : null;
             if (activeId) {
-              var res = await api('/tasks/' + activeId + '/chat', { method: 'POST', body: JSON.stringify({ message: message, mentioned_agent: mentionedAgent ? mentionedAgent.name : (resetAgent ? '克劳德' : undefined), model_cli: mentionedAgent ? mentionedAgent.model_cli : undefined, discussion_agents: discussion, collab_mode: collabMode ? 'event-driven' : undefined }) });
+              var res = await api('/tasks/' + activeId + '/chat', { method: 'POST', body: JSON.stringify({ message: message, mentioned_agent: mentionedAgent ? mentionedAgent.name : (resetAgent ? '克劳德' : undefined), model_cli: mentionedAgent ? mentionedAgent.model_cli : undefined, discussion_agents: discussion }) });
               var data = await res.json();
               if (data.task) setActiveTask(data.task);
               fetchConversation(activeId);
@@ -1296,7 +1194,7 @@
                 return n;
               });
 
-              var execRes = await api('/tasks/' + newTask.task_id + '/execute', { method: 'POST', body: JSON.stringify({ message: message, mentioned_agent: agent ? agent.name : undefined, model_cli: agent ? agent.model_cli : undefined, discussion_agents: discussion, collab_mode: collabMode ? 'event-driven' : undefined }) });
+              var execRes = await api('/tasks/' + newTask.task_id + '/execute', { method: 'POST', body: JSON.stringify({ message: message, mentioned_agent: agent ? agent.name : undefined, model_cli: agent ? agent.model_cli : undefined, discussion_agents: discussion }) });
               var execData = await execRes.json();
               if (execData.task) setActiveTask(execData.task);
               fetchConversation(newTask.task_id);
@@ -1325,7 +1223,6 @@
         setActiveTask(null);
         setConversation('');
         convLenRef.current = 0;
-        setCollabTasks([]);
         setStreams({});
         fetchConversation(taskId);
       }
@@ -1346,14 +1243,12 @@
         setActiveTask(null);
         setConversation('');
         convLenRef.current = 0;
-        setCollabTasks([]);
         setStreams({});
       }
 
       async function handleStopTask(taskId) {
         // 立即清空流式气泡 + 设置 stopping 标志拦住后续 WS 流式事件
         setStreams({});
-        setCollabTasks([]);
         stoppingRef.current = true;
         try {
           var res = await api('/tasks/' + taskId + '/stop', { method: 'POST' });
@@ -1506,13 +1401,8 @@
               hasActiveConversation: !!activeId,
               agents: agents,
               streams: streams,
-              collabMode: collabMode,
-              onToggleCollabMode: function() { setCollabMode(function(v) { return !v; }); },
             })
-          ),
-
-          // Far right: Event-driven collab task panel
-          h(CollabTaskPanel, { tasks: collabTasks })
+          )
         )
       );
     }

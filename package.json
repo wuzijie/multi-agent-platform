@@ -12,8 +12,6 @@
     "test:template": "node tests/prompt-template.test.js",
     "test:logs": "node tests/log-store.test.js",
     "test:context": "node tests/context-assembler.test.js",
-    "test:planning": "node tests/task-planning.test.js",
-    "test:routing": "node tests/event-driven-routing.test.js",
     "test:cancel": "node tests/cancel-turn.test.js",
     "test:mention": "node tests/mention.test.js",
     "test:messaging": "node tests/message-log.test.js",

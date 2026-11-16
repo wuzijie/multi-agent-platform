@@ -10,8 +10,6 @@ const path = require('path');
 const ROOT = path.resolve(__dirname, '..');
 const config = require(path.join(ROOT, 'src/utils/config'));
 config.loadAll();
-// 关闭自动 DAG 路由，保证本测试能断言“回落到普通对话”
-config.routing = Object.assign({}, config.routing, { auto_event_driven: false });
 
 const registry = require(path.join(ROOT, 'src/orchestrator/collab-mode-registry'));
 const orchestrator = require(path.join(ROOT, 'src/orchestrator/orchestrator'));

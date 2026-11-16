@@ -12,7 +12,6 @@ const SKIP_PERSIST = new Set([
   'agent:stream:end',
   'agent:stream:reasoning', // 思考内容：不落盘（敏感且体积大）
   'agent:heartbeat',       // 每 5s 一次
-  'collab:subtask:update', // 状态更新频繁
 ]);
 
 /**
