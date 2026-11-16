@@ -1,9 +1,11 @@
 /**
  * Prompt 上下文注入回归测试
  *
- * 核心不变量：
- *   第 N 轮完整 prompt 必须是第 N+1 轮完整 prompt 的严格前缀（纯文本聊天）。
- *   含工具调用的轮次同样成立（工具结果追加在尾部）。
+ * 核心不变量（动态上下文架构下）：
+ *   1) 聊天 prompt 为六段式增量上下文（来源/模式/导航/触发原文/未读历史/系统提示），
+ *      历史通过「未读历史（delivery_cursor）」+「转录历史（history_segments）」投递；
+ *      原「第 N 轮 prompt 是第 N+1 轮严格前缀」不变量已被动态上下文取代。
+ *   2) 同一轮内的工具回灌仍是追加式（不破坏本轮前缀）。
  *
  * 运行：node tests/prompt-context.test.js
  */
@@ -82,8 +84,8 @@ function chatTask(instruction, historySegments) {
   };
 }
 
-async function testChatPrefix() {
-  console.log('\n[1] 纯文本聊天：第二轮 prompt 以第一轮为严格前缀');
+async function testChatIncremental() {
+  console.log('\n[1] 纯文本聊天：六段式增量上下文 + 转录历史投递');
   transcript.clear(TID);
 
   const inputs = installFakeAgent(['第一轮回答：function quickSort(){}']);
@@ -91,19 +93,20 @@ async function testChatPrefix() {
   await runtime.executeTaskWithAgent(chatTask('第一轮：写一个快排'), [], '克劳德');
   const p1 = makePrompt(inputs[0]);
 
+  assert(p1.includes('[来源标识]'), '第一轮 prompt 为六段式（含来源标识）');
+  assert(p1.includes('[未读历史]'), '第一轮 prompt 含未读历史段');
+  assert(p1.includes('[系统提示]'), '第一轮 prompt 含系统提示段');
+  assert(p1.includes('第一轮：写一个快排'), '第一轮 prompt 包含当前问题');
+
   const history1 = transcript.loadSegments(TID);
   assert(history1.length === 2, '第一轮转录写入 2 段（用户 + 助手）', JSON.stringify(history1));
 
   await runtime.executeTaskWithAgent(chatTask('第二轮：把刚才的代码改成 Python', history1), [], '克劳德');
   const p2 = makePrompt(inputs[1]);
 
-  assert(p2.startsWith(p1), '第 2 轮 prompt 以第 1 轮 prompt 为前缀');
+  assert(p2.includes('[转录历史]'), '第 2 轮 prompt 含转录历史段');
   assert(p2.includes('第一轮回答：function quickSort(){}'), '第 2 轮 prompt 包含上一轮回复全文');
   assert(p2.includes('第二轮：把刚才的代码改成 Python'), '第 2 轮 prompt 包含当前问题');
-  if (!p2.startsWith(p1)) {
-    console.error('--- p1 尾部 ---\n' + p1.slice(-200));
-    console.error('--- p2 对应位置 ---\n' + p2.slice(p1.length - 200, p1.length + 200));
-  }
 }
 
 async function testCompaction() {
@@ -217,7 +220,7 @@ async function testStableContext() {
 
 (async () => {
   try {
-    await testChatPrefix();
+    await testChatIncremental();
     await testCompaction();
     await testToolPrefix();
     await testNonChat();

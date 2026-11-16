@@ -26,7 +26,8 @@ echo "正在安装依赖..."
 npm install
 
 # 创建必要的运行时目录
-mkdir -p tasks logs/agents logs/events logs/analytics workspace
+# 日志运行时按「logs/YYYY-MM-DD/<session_id>.log」自动创建日期文件夹，无需预建
+mkdir -p tasks workspace
 
 # 初始化 tasks/index.json
 if [ ! -f tasks/index.json ]; then

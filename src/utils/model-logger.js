@@ -1,46 +1,12 @@
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const LogStore = require('./log-store');
 
 /**
- * 日志根目录候选列表
- * 优先 /Volumes（Write 工具可达），回退项目根目录（VM 可达）
+ * 日志根目录候选列表（与 LogStore 一致：/Volumes 优先，回退项目根）
  */
-function getLogRoots() {
-  const candidates = [
-    '/Volumes/data/we-work/multi-agent-platform',
-    path.resolve(__dirname, '..', '..'),
-  ];
-  const roots = [];
-  const seen = new Set();
-  for (const root of candidates) {
-    if (!seen.has(root)) {
-      seen.add(root);
-      roots.push(root);
-    }
-  }
-  // 兜底：至少保留 __dirname 推导的项目根
-  if (roots.length === 0) {
-    roots.push(path.resolve(__dirname, '..', '..'));
-  }
-  return roots;
-}
-
-const LOG_ROOTS = getLogRoots();
-
-/**
- * 按小时生成日志文件名，如 2026-08-14_02.log
- * 每个文件记录该小时（00:00 - 59:59）内的所有请求和回复
- */
-function hourFileName(date) {
-  const pad = (n) => String(n).padStart(2, '0');
-  return (
-    date.getFullYear() + '-' +
-    pad(date.getMonth() + 1) + '-' +
-    pad(date.getDate()) + '_' +
-    pad(date.getHours()) + '.log'
-  );
-}
+const LOG_ROOTS = LogStore.LOG_ROOTS;
 
 /**
  * 生成全局唯一请求 ID：req_<时间戳36进制>_<4字节随机hex>
@@ -51,16 +17,25 @@ function genRequestId() {
   return 'req_' + Date.now().toString(36) + '_' + crypto.randomBytes(4).toString('hex');
 }
 
+/** 是否为模型请求/响应日志条目（新结构同一会话文件中混有其他类别日志） */
+function isModelEntry(e) {
+  return !!e && (e.log_type === 'model' || e.direction === 'request' || e.direction === 'response');
+}
+
 /**
  * 模型 CLI 请求/响应日志记录器（请求全生命周期版）
  *
- * 日志位置：
- *   1) logs/agent/YYYY-MM-DD_HH.log       —— 按小时滚动的全量请求/响应流（跨任务）
- *   2) logs/requests/<task_id>.jsonl       —— 按任务聚合的单任务完整请求链路（便于异常回溯）
+ * 日志位置（按会话划分，按天收录）：
+ *   logs/YYYY-MM-DD/<session_id>.log  —— 该会话当天的全部日志（JSONL）
+ *     session_id = 对话级 task_id（external_task_id）：
+ *     模型请求/响应、协作链路、事件总线、埋点都写进同一会话文件。
+ *   logs/YYYY-MM-DD/_system.log       —— 无会话归属的日志
  *
  * 条目核心字段：
  * {
  *   "timestamp": "2026-08-12T10:30:00.123Z",
+ *   "log_type": "model",                  // 日志类别（model / collab / event / analytics）
+ *   "session_id": "conv_xxx",             // 会话 ID（对话级 task_id；无会话为空串）
  *   "request_id": "req_xxx",              // 一次 CLI 调用的唯一 ID（请求/响应成对关联）
  *   "task_id": "task_xxx",                // 所属任务（异常回溯入口）
  *   "trace_id": "task_xxx",               // 事件驱动协作的 trace_id（DAG 编排唯一ID；非协作场景为空）
@@ -83,62 +58,18 @@ function genRequestId() {
  *   "content": "..."                       // 请求内容 / 响应内容
  * }
  *
- * 文件聚合规则（异常回溯三种入口）：
- *   1) logs/agent/YYYY-MM-DD_HH.log       —— 按小时全量流（跨任务）
- *   2) logs/requests/<task_id>.jsonl       —— 按任务聚合（task_id / sub_task_id / trace_id）
- *   3) logs/requests/<external_task_id>.jsonl —— 按对话聚合（协作子任务也会写入，方便从会话入口一次回溯全链路）
+ * 旧结构（仅作为历史日志的读取兜底，不再写入）：
+ *   logs/agent/YYYY-MM-DD_HH.log           —— 按小时全量流（跨会话）
+ *   logs/requests/<task_id>.jsonl           —— 按任务聚合
  */
 class ModelLogger {
   /**
-   * 写一条日志：同时写入按小时滚动文件（全部路径）与按任务聚合文件（首个可写路径）
+   * 写一条日志：追加到该条目所属会话的当天日志文件
+   * 会话归属：external_task_id（对话级）优先，其次 task_id；都没有则进 _system.log
    */
-  /**
-   * 追加到某个按任务聚合的 jsonl 文件（写第一个可写根目录，避免重复）
-   * @param {string} fileKey 文件标识（task_id / external_task_id / trace_id）
-   */
-  static _appendToRequests(entry, fileKey) {
-    if (!fileKey) return;
-    const line = JSON.stringify(entry) + '\n';
-    for (const root of LOG_ROOTS) {
-      try {
-        const reqDir = path.join(root, 'logs', 'requests');
-        if (!fs.existsSync(reqDir)) {
-          fs.mkdirSync(reqDir, { recursive: true });
-        }
-        fs.appendFileSync(path.join(reqDir, `${fileKey}.jsonl`), line);
-        return; // 只写第一个可写路径
-      } catch (e) {
-        // 跳过不可写路径，尝试下一个
-      }
-    }
-  }
-
   static _write(entry) {
-    const line = JSON.stringify(entry) + '\n';
-    const now = new Date();
-
-    // 1) 按小时滚动文件（全部可写路径，历史行为保持一致）
-    for (const root of LOG_ROOTS) {
-      try {
-        const logDir = path.join(root, 'logs', 'agent');
-        if (!fs.existsSync(logDir)) {
-          fs.mkdirSync(logDir, { recursive: true });
-        }
-        fs.appendFileSync(path.join(logDir, hourFileName(now)), line);
-      } catch (e) {
-        // 某些路径不可写（如 /Volumes 在 VM 中不可见），静默跳过
-      }
-    }
-
-    // 2) 按任务聚合文件：task_id 文件 + 对话级 external_task_id 文件
-    //    协作子任务 task_id=sub_task_id、external_task_id=对话ID，二者都写，
-    //    保证从「对话」和「子任务」两个入口都能回溯到该次模型调用。
-    if (entry.task_id) {
-      this._appendToRequests(entry, entry.task_id);
-    }
-    if (entry.external_task_id && entry.external_task_id !== entry.task_id) {
-      this._appendToRequests(entry, entry.external_task_id);
-    }
+    const sessionId = entry.external_task_id || entry.task_id || '';
+    LogStore.append(sessionId, Object.assign({ log_type: 'model' }, entry));
   }
 
   /**
@@ -151,7 +82,7 @@ class ModelLogger {
    * @param {string} [meta.request_id] 指定 request_id（缺省自动生成）
    * @param {string} [meta.task_id] 所属任务 ID（协作子任务时为 sub_task_id）
    * @param {string} [meta.trace_id] 事件驱动协作 trace_id（DAG 编排唯一ID）
-   * @param {string} [meta.external_task_id] 对话级 task_id（UI/会话维度聚合）
+   * @param {string} [meta.external_task_id] 对话级 task_id（会话维度聚合）
    * @param {string} [meta.agent_name] Agent 中文名（克劳德/吉米/迪普斯克/钱文）
    * @param {string} [meta.phase] 调用阶段 initial / tool_round_N
    * @param {number} [meta.attempt] 第几次尝试
@@ -215,7 +146,7 @@ class ModelLogger {
   // ==================== 查询 / 诊断 ====================
 
   /**
-   * 读取某个根目录下所有小时文件中的条目（内部）
+   * 读取旧结构某个根目录下所有小时文件中的条目（历史日志兜底）
    */
   static _readEntriesFromRoot(logDir, filterFn) {
     let entries = [];
@@ -241,7 +172,7 @@ class ModelLogger {
   }
 
   /**
-   * 读取某个任务的全量请求链路（logs/requests/<task_id>.jsonl）
+   * 读取旧结构按任务聚合的文件（logs/requests/<task_id>.jsonl，历史日志兜底）
    */
   static _readTaskFile(taskId) {
     for (const root of LOG_ROOTS) {
@@ -261,19 +192,25 @@ class ModelLogger {
     return [];
   }
 
+  /** 旧结构全量扫描（历史日志兜底） */
+  static _readLegacy(filterFn) {
+    let all = [];
+    for (const root of LOG_ROOTS) {
+      all = all.concat(this._readEntriesFromRoot(path.join(root, 'logs', 'agent'), filterFn));
+    }
+    return all;
+  }
+
   /**
-   * 获取最近日志
+   * 获取最近日志（新结构优先，无结果时回退旧结构）
    * @param {number} count 数量上限
    */
   static getRecentLogs(count = 100) {
-    let allEntries = [];
-    for (const root of LOG_ROOTS) {
-      allEntries = allEntries.concat(
-        this._readEntriesFromRoot(path.join(root, 'logs', 'agent'))
-      );
-    }
-    allEntries.sort((a, b) => String(b.timestamp).localeCompare(String(a.timestamp)));
-    return allEntries.slice(0, count);
+    const entries = LogStore.readRecent(isModelEntry, count);
+    if (entries.length > 0) return entries;
+    const legacy = this._readLegacy();
+    legacy.sort((a, b) => String(b.timestamp).localeCompare(String(a.timestamp)));
+    return legacy.slice(0, count);
   }
 
   /**
@@ -293,55 +230,62 @@ class ModelLogger {
   }
 
   /**
-   * 按任务 ID 查询全量请求/响应日志（优先读 per-task 文件）
+   * 按任务 ID 查询全量请求/响应日志
+   *
+   * taskId 为对话级 ID 时直接读该会话文件（含其下所有子任务）；
+   * 为子任务 ID 时全量扫描按 task_id 匹配；仍为空时回退旧结构。
+   *
    * @param {string} taskId
    * @param {number} [count] 数量上限（按时间倒序）
    */
   static getLogsByTaskId(taskId, count = 500) {
-    const taskEntries = this._readTaskFile(taskId);
-    if (taskEntries.length > 0) {
-      taskEntries.sort((a, b) => String(a.timestamp).localeCompare(String(b.timestamp)));
-      return taskEntries.slice(-count);
+    // 1) 会话文件直接命中（taskId 即对话 ID）
+    let entries = LogStore.readSessionEntries(taskId).filter(isModelEntry);
+    // 2) 子任务 ID：全量扫描
+    if (entries.length === 0) {
+      entries = LogStore.scanEntries(
+        e => isModelEntry(e) && (e.task_id === taskId || e.external_task_id === taskId),
+        { limit: 5000 }
+      );
     }
-    // 兜底：扫描全部小时文件
-    const all = this._readEntriesFromRoot(path.join(LOG_ROOTS[0], 'logs', 'agent'),
-      e => e.task_id === taskId);
-    all.sort((a, b) => String(a.timestamp).localeCompare(String(b.timestamp)));
-    return all.slice(-count);
+    // 3) 旧结构兜底
+    if (entries.length === 0) entries = this._readTaskFile(taskId);
+    entries.sort((a, b) => String(a.timestamp).localeCompare(String(b.timestamp)));
+    return entries.slice(-count);
   }
 
   /**
    * 按 request_id 查询（请求 + 响应）
    */
   static getLogsByRequestId(requestId) {
-    const all = this._readEntriesFromRoot(path.join(LOG_ROOTS[0], 'logs', 'agent'),
-      e => e.request_id === requestId);
-    all.sort((a, b) => String(a.timestamp).localeCompare(String(b.timestamp)));
-    return all;
+    let entries = LogStore.scanEntries(e => isModelEntry(e) && e.request_id === requestId);
+    if (entries.length === 0) {
+      entries = this._readLegacy(e => e.request_id === requestId);
+    }
+    entries.sort((a, b) => String(a.timestamp).localeCompare(String(b.timestamp)));
+    return entries;
   }
 
   /**
    * 按对话级 task_id 查询全量请求/响应日志（含协作子任务）
    *
-   * 与 getLogsByTaskId 的区别：getLogsByTaskId 只读 <task_id>.jsonl（协作子任务
-   * 时是 sub_task_id 文件，不含对话下其他子任务）；本方法优先读 <external_task_id>.jsonl
-   * （写入时已聚合该对话下所有子任务的模型调用），实现「一次对话 → 全链路回溯」。
+   * 读取该会话文件（写入时已按会话聚合），实现「一次对话 → 全链路回溯」。
    *
    * @param {string} externalTaskId 对话级 task_id
    * @param {number} [count] 数量上限（按时间倒序）
    */
   static getLogsByExternalTaskId(externalTaskId, count = 500) {
     if (!externalTaskId) return [];
-    const taskEntries = this._readTaskFile(externalTaskId);
-    if (taskEntries.length > 0) {
-      taskEntries.sort((a, b) => String(a.timestamp).localeCompare(String(b.timestamp)));
-      return taskEntries.slice(-count);
+    let entries = LogStore.readSessionEntries(externalTaskId).filter(isModelEntry);
+    if (entries.length === 0) {
+      entries = LogStore.scanEntries(
+        e => isModelEntry(e) && e.external_task_id === externalTaskId,
+        { limit: 5000 }
+      );
     }
-    // 兜底：扫描全部小时文件
-    const all = this._readEntriesFromRoot(path.join(LOG_ROOTS[0], 'logs', 'agent'),
-      e => e.external_task_id === externalTaskId || e.task_id === externalTaskId);
-    all.sort((a, b) => String(a.timestamp).localeCompare(String(b.timestamp)));
-    return all.slice(-count);
+    if (entries.length === 0) entries = this._readTaskFile(externalTaskId);
+    entries.sort((a, b) => String(a.timestamp).localeCompare(String(b.timestamp)));
+    return entries.slice(-count);
   }
 
   /**
@@ -356,11 +300,14 @@ class ModelLogger {
    */
   static getLogsByTraceId(traceId, count = 500) {
     if (!traceId) return [];
-    const all = this._readEntriesFromRoot(path.join(LOG_ROOTS[0], 'logs', 'agent'),
-      e => e.trace_id === traceId || e.task_id === traceId ||
-           (String(e.task_id || '').startsWith(traceId + '__sub_')));
-    all.sort((a, b) => String(a.timestamp).localeCompare(String(b.timestamp)));
-    return all.slice(-count);
+    const match = (e) => isModelEntry(e) && (
+      e.trace_id === traceId || e.task_id === traceId ||
+      String(e.task_id || '').startsWith(traceId + '__sub_')
+    );
+    let entries = LogStore.scanEntries(match);
+    if (entries.length === 0) entries = this._readLegacy(match);
+    entries.sort((a, b) => String(a.timestamp).localeCompare(String(b.timestamp)));
+    return entries.slice(-count);
   }
 
   /**
@@ -373,10 +320,13 @@ class ModelLogger {
    */
   static getFailedLogs(opts = {}) {
     const { count = 100, task_id, agent_name, error_code } = opts;
-    const entries = task_id
-      ? this.getLogsByTaskId(task_id, 2000)
-      : this._readEntriesFromRoot(path.join(LOG_ROOTS[0], 'logs', 'agent'),
-          e => e.direction === 'response');
+    let entries;
+    if (task_id) {
+      entries = this.getLogsByTaskId(task_id, 5000);
+    } else {
+      entries = LogStore.scanEntries(e => isModelEntry(e) && e.direction === 'response');
+      if (entries.length === 0) entries = this._readLegacy(e => e.direction === 'response');
+    }
     return entries
       .filter(e => e.direction === 'response' && (e.status === 'failed' || e.error_code))
       .filter(e => !task_id || e.task_id === task_id)

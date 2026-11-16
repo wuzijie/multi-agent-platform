@@ -18,3 +18,24 @@ context:
     dag_planner_history_chars: 6000
     # DAG 子任务注入的上一轮结果字符上限
     dag_last_result_chars: 2000
+
+  # ===== 动态上下文投递（@ 转交增量上下文）=====
+  # 被 @ 的 agent 收到：来源标识/模式声明/导航头/触发原文/未读历史/系统提示；
+  # 未读历史按 delivery_cursor 增量投递，超出预算从最旧开始丢弃。
+  delivery:
+    # Warm Path 阈值：未读条数 ≤ 且总字符 ≤ 时逐条展开；否则走 Cold Path 简报
+    warm_max_msgs: 12
+    warm_max_chars: 12000
+    # Cold Path 确定性简报的字符上限
+    cold_brief_max_chars: 2500
+    # 是否用轻量模型生成简报（默认关闭，走零成本确定性简报）
+    cold_use_llm: false
+    # 未读历史最多占模型输入预算的比例
+    budget_ratio: 0.5
+    # 模型输入 token 上限默认值（未知 CLI 兜底）
+    model_cap_default: 128000
+    # token → 字符 的保守估算系数（中文为主）
+    chars_per_token: 2
+    # 触发消息原文超长时头尾截断（字符数）
+    trigger_head_chars: 4000
+    trigger_tail_chars: 2000

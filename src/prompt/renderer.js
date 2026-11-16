@@ -21,15 +21,22 @@ const MODEL_LABELS = { claude: 'Claude', kimi: 'Kimi', deepseek: 'DeepSeek', qwe
 
 let _cache = null;
 
-/** 加载全部模板文件（按文件名作为模板名，缓存） */
+/** 加载某个目录下的模板（prefix 用于 context/ 子目录命名） */
+function loadDir(dir, prefix) {
+  for (const f of fs.readdirSync(dir).filter((x) => x.endsWith('.md')).sort()) {
+    const name = (prefix ? prefix + '/' : '') + f.replace(/\.md$/, '');
+    _cache[name] = fs.readFileSync(path.join(dir, f), 'utf8');
+  }
+}
+
+/** 加载全部模板文件（按文件名作为模板名，缓存；含 context/ 子目录） */
 function loadTemplates() {
   if (_cache) return _cache;
   _cache = {};
   if (fs.existsSync(TEMPLATES_DIR)) {
-    for (const f of fs.readdirSync(TEMPLATES_DIR).filter((x) => x.endsWith('.md')).sort()) {
-      const name = f.replace(/\.md$/, '');
-      _cache[name] = fs.readFileSync(path.join(TEMPLATES_DIR, f), 'utf8');
-    }
+    loadDir(TEMPLATES_DIR, '');
+    const ctxDir = path.join(TEMPLATES_DIR, 'context');
+    if (fs.existsSync(ctxDir)) loadDir(ctxDir, 'context');
   }
   return _cache;
 }
@@ -122,6 +129,17 @@ function buildPrompt(vars = {}) {
   return parts.join('\n\n');
 }
 
+/**
+ * 拼接动态上下文分段（assembleIncrementalContext 产出）
+ * sections = [{ title, text }]，空段落自动省略；每个非空段落渲染为 "[标题]\n正文"。
+ */
+function renderContextSections(sections) {
+  return (sections || [])
+    .filter((s) => s && s.text && String(s.text).trim())
+    .map((s) => `[${s.title}]\n${String(s.text).trim()}`)
+    .join('\n\n');
+}
+
 module.exports = {
   render,
   loadTemplates,
@@ -131,4 +149,5 @@ module.exports = {
   buildHeader,
   buildStableContext,
   buildPrompt,
+  renderContextSections,
 };

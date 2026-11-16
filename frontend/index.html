@@ -56,16 +56,18 @@
     .stream-cursor::after { content: '▍'; color: #3b82f6; animation: pulse-dot 1s ease-in-out infinite; }
     /* 所有消息正文（用户/模型回复/流式气泡）：限高10行，超出气泡内滚动，气泡尺寸不变 */
     .message-body { max-height: calc(1.625em * 10); overflow-y: auto; line-height: 1.625em; }
+    /* 展开态：取消限高，完整显示（配合「展开全文 / 收起」按钮） */
+    .message-body.expanded { max-height: none; overflow-y: visible; }
     .message-body::-webkit-scrollbar { width: 5px; }
     .message-body::-webkit-scrollbar-track { background: transparent; }
     .message-body::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 3px; }
-    /* 思考过程折叠块（默认收起，点击展开，灰字小号，与答案正文区分） */
-    .thinking-block { margin-bottom: 8px; border: 1px solid #e5e7eb; border-radius: 8px; background: #f9fafb; }
-    .thinking-summary { cursor: pointer; padding: 6px 10px; font-size: 12px; color: #6b7280; user-select: none; list-style: none; }
+    /* 思考过程折叠块（默认收起，点击展开，灰字小号，无边框只显示文字） */
+    .thinking-block { margin-bottom: 8px; }
+    .thinking-summary { cursor: pointer; font-size: 12px; color: #6b7280; user-select: none; list-style: none; }
     .thinking-summary::-webkit-details-marker { display: none; }
     .thinking-summary::before { content: '▸ '; }
     .thinking-block[open] .thinking-summary::before { content: '▾ '; }
-    .thinking-body { padding: 8px 10px; font-size: 12px; color: #9ca3af; line-height: 1.6; white-space: pre-wrap; max-height: calc(1.6em * 12); overflow-y: auto; border-top: 1px solid #f1f5f9; }
+    .thinking-body { padding-top: 4px; font-size: 12px; color: #9ca3af; line-height: 1.6; white-space: pre-wrap; max-height: calc(1.6em * 12); overflow-y: auto; }
     /* @mention dropdown */
     .mention-dropdown { position: absolute; bottom: 100%; left: 0; margin-bottom: 4px; background: white; border: 1px solid #e2e8f0; border-radius: 12px; box-shadow: 0 10px 25px rgba(0,0,0,0.1); max-height: 200px; overflow-y: auto; min-width: 200px; z-index: 50; }
     .mention-item { padding: 8px 12px; cursor: pointer; display: flex; align-items: center; gap: 8px; transition: background 0.1s; }
@@ -156,6 +158,37 @@
       };
     }
 
+    // ====== CollapsibleBody：气泡正文，超限高时提供「展开全文 / 收起」 ======
+    // 默认限高 10 行（.message-body）；内容溢出时显示切换按钮，
+    // 展开后取消限高完整显示（无需在气泡内滚动），收起恢复原固定大小。
+    function CollapsibleBody(props) {
+      var expandedState = useState(false);
+      var expanded = expandedState[0], setExpanded = expandedState[1];
+      var overflowState = useState(false);
+      var overflow = overflowState[0], setOverflow = overflowState[1];
+      var ref = useRef(null);
+      var contentKey = props.contentKey || '';
+      var autoScroll = !!props.autoScroll;
+      useEffect(function() {
+        var el = ref.current;
+        if (!el) return;
+        // 流式内容自动跟随最新（仅收起态且启用 autoScroll 时）
+        if (autoScroll && !expanded) el.scrollTop = el.scrollHeight;
+        // 收起态下测量是否溢出；展开态保持上次结论（展开后 scrollHeight==clientHeight 无法判断）
+        if (!expanded) setOverflow(el.scrollHeight > el.clientHeight + 4);
+      }, [contentKey, expanded]);
+      return h(Fragment, null,
+        h('div', {
+          ref: ref,
+          className: (props.className || '') + (expanded ? ' expanded' : ''),
+        }, props.children),
+        overflow && h('button', {
+          onClick: function() { setExpanded(!expanded); },
+          className: 'mt-1.5 text-xs font-medium cursor-pointer ' + (props.toggleClass || 'text-gray-400 hover:text-gray-600'),
+        }, expanded ? '收起' : '展开全文')
+      );
+    }
+
     // ====== Analytics ======
     const Analytics = {
       log(type, data) {
@@ -239,43 +272,24 @@
     var statusColorMap = { executing:'bg-blue-500', completed:'bg-green-500', failed:'bg-red-500', suspended:'bg-yellow-500', assessing:'bg-purple-500', created:'bg-gray-400' };
     var statusLabel = { executing:'进行中', completed:'已结束', failed:'错误', suspended:'已挂起', assessing:'评估中', created:'新对话' };
 
-    // ====== Collab Task Panel（事件驱动协作：右侧任务列表）======
-    function CollabTaskPanel({ tasks }) {
-      var typeLabel = { PLAN_TASK: '规划', CODE_TASK: '执行', REVIEW_TASK: '评审', SUMMARY_TASK: '汇总', DEBUG_TASK: '调试', RESEARCH_TASK: '调研', FINAL_TASK: '终稿' };
-      var statusLabel = { PENDING: '待执行', RUNNING: '执行中', SUCCESS: '完成', RETRYING: '重试中', TIMEOUT: '超时', FAILED: '失败', SKIPPED: '跳过', CANCELLED: '已取消' };
-      return h('div', { className: 'w-64 flex-shrink-0 border-l border-gray-200 bg-gray-50 p-4 overflow-y-auto' },
-        h('div', { className: 'text-xs font-bold text-gray-500 mb-3' }, '任务列表'),
-        (!tasks || tasks.length === 0)
-          ? h('div', { className: 'text-xs text-gray-300 mt-2' }, '暂无任务（事件驱动协作 / 深度调研时自动生成）')
-          : h('div', { className: 'space-y-2' },
-              tasks.map(function(t) {
-                var done = t.status === 'SUCCESS';
-                var statusCls = t.status === 'FAILED' ? 'text-red-500' : t.status === 'RUNNING' ? 'text-blue-500' : t.status === 'RETRYING' ? 'text-yellow-500' : 'text-gray-400';
-                var desc = (t.description || t.input || '').replace(/\s+/g, ' ').trim();
-                return h('div', { key: t.sub_task_id, className: 'bg-white rounded-lg border border-gray-200 p-2.5' },
-                  h('div', { className: 'flex items-center gap-2' },
-                    h('span', { className: 'text-sm font-bold ' + (done ? 'text-green-600' : 'text-gray-300') }, done ? '✓' : '□'),
-                    h('span', { className: 'text-xs font-medium text-gray-700' }, typeLabel[t.type] || t.type || ''),
-                    h('span', { className: 'ml-auto text-[10px] ' + statusCls }, statusLabel[t.status] || t.status)
-                  ),
-                  desc && h('div', { className: 'mt-1 text-[11px] text-gray-500 leading-snug break-all line-clamp-2' }, desc),
-                  h('div', { className: 'mt-1 flex items-center gap-1 text-[11px]' },
-                    t.agent
-                      ? h('span', { className: 'text-blue-600' }, '接受者: ' + t.agent)
-                      : h('span', { className: 'text-gray-300' }, '未分配')
-                  )
-                );
-              })
-            )
-      );
-    }
-
     // ====== Conversation Sidebar ======
     function ConversationSidebar(props) {
       var conversations = props.conversations, activeId = props.activeId;
       var onSelect = props.onSelect, onNew = props.onNew, onDelete = props.onDelete;
       var collapsed = props.collapsed, onToggle = props.onToggle;
       var agents = props.agents || [];
+      // 批量管理：勾选删除多个对话（含对应保存的对话文件）
+      var selectionMode = props.selectionMode;
+      var selectedIds = props.selectedIds || {};
+      var onToggleSelectionMode = props.onToggleSelectionMode;
+      var onToggleSelected = props.onToggleSelected;
+      var onDeleteSelected = props.onDeleteSelected;
+      var onToggleSelectAll = props.onToggleSelectAll;
+      var selCount = Object.keys(selectedIds).length;
+      // 全选状态（部分选中时显示为半选样式）
+      var selectableIds = conversations.filter(function(c) { return !!c.task_id; }).map(function(c) { return c.task_id; });
+      var allSelected = selectableIds.length > 0 && selectableIds.every(function(id) { return !!selectedIds[id]; });
+      var someSelected = selectableIds.some(function(id) { return !!selectedIds[id]; });
 
       if (collapsed) {
         return h('div', { className: 'w-12 flex-shrink-0 bg-gray-50 border-r border-gray-200 flex flex-col items-center py-3 gap-3' },
@@ -309,44 +323,115 @@
                 h('path', { strokeLinecap:'round', strokeLinejoin:'round', strokeWidth:2, d:'M15 19l-7-7 7-7' })
               )
             ),
-            h('h2', { className: 'font-semibold text-gray-800 text-sm' }, '对话记录'),
+            h('h2', { className: 'font-semibold text-gray-800 text-sm' }, selectionMode ? ('已选 ' + selCount + ' 个') : '对话记录'),
           ),
-          h('button', { onClick: onNew, className: 'p-1.5 bg-blue-600 text-white rounded-lg hover:bg-blue-700', title: '新对话' },
-            h('svg', { className: 'w-4 h-4', fill:'none', stroke:'currentColor', viewBox:'0 0 24 24' },
-              h('path', { strokeLinecap:'round', strokeLinejoin:'round', strokeWidth:2, d:'M12 4v16m8-8H4' })
-            )
-          )
+          selectionMode
+            ? h('div', { className: 'flex items-center gap-1' },
+                h('button', {
+                  onClick: onDeleteSelected,
+                  disabled: selCount === 0,
+                  className: 'px-2 py-1 rounded-lg text-xs font-medium text-white ' + (selCount > 0 ? 'bg-red-600 hover:bg-red-700' : 'bg-gray-300 cursor-not-allowed'),
+                  title: '删除选中对话'
+                }, '删除' + (selCount > 0 ? '(' + selCount + ')' : '')),
+                h('button', {
+                  onClick: onToggleSelectionMode,
+                  className: 'px-2 py-1 rounded-lg text-xs text-gray-500 hover:bg-gray-200',
+                  title: '退出批量管理'
+                }, '取消')
+              )
+            : h('div', { className: 'flex items-center gap-1' },
+                h('button', { onClick: onToggleSelectionMode, className: 'p-1.5 hover:bg-gray-200 rounded-lg', title: '批量管理（勾选删除对话）' },
+                  h('svg', { className: 'w-4 h-4 text-gray-500', fill:'none', stroke:'currentColor', viewBox:'0 0 24 24' },
+                    h('path', { strokeLinecap:'round', strokeLinejoin:'round', strokeWidth:2, d:'M9 11l3 3L22 4M21 12v7a2 2 0 01-2 2H5a2 2 0 01-2-2V5a2 2 0 012-2h11' })
+                  )
+                ),
+                h('button', { onClick: onNew, className: 'p-1.5 bg-blue-600 text-white rounded-lg hover:bg-blue-700', title: '新对话' },
+                  h('svg', { className: 'w-4 h-4', fill:'none', stroke:'currentColor', viewBox:'0 0 24 24' },
+                    h('path', { strokeLinecap:'round', strokeLinejoin:'round', strokeWidth:2, d:'M12 4v16m8-8H4' })
+                  )
+                )
+              )
         ),
 
         // Conversation items
         h('div', { className: 'flex-1 overflow-y-auto scrollbar-thin py-1' },
+          // 批量模式：全选 / 取消全选（部分选中显示半选）
+          (selectionMode && conversations.length > 0)
+            ? h('div', {
+                role: 'button',
+                tabIndex: 0,
+                onClick: onToggleSelectAll,
+                onKeyDown: function(e) {
+                  if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onToggleSelectAll(); }
+                },
+                className: 'px-3 py-2 mx-2 my-0.5 rounded-lg flex items-center gap-2 cursor-pointer select-none hover:bg-gray-100 border border-transparent transition-colors',
+                title: allSelected ? '取消全选' : '全选',
+              },
+                h('span', { className: 'w-4 h-4 flex items-center justify-center rounded border flex-shrink-0 ' + ((allSelected || someSelected) ? 'bg-blue-600 border-blue-600' : 'border-gray-300 bg-white') },
+                  allSelected
+                    ? h('svg', { className: 'w-3 h-3 text-white', fill:'none', stroke:'currentColor', viewBox:'0 0 24 24' },
+                        h('path', { strokeLinecap:'round', strokeLinejoin:'round', strokeWidth:3, d:'M5 13l4 4L19 7' })
+                      )
+                    : (someSelected
+                        ? h('svg', { className: 'w-3 h-3 text-white', fill:'none', stroke:'currentColor', viewBox:'0 0 24 24' },
+                            h('path', { strokeLinecap:'round', strokeLinejoin:'round', strokeWidth:3, d:'M5 12h14' })
+                          )
+                        : null)
+                ),
+                h('span', { className: 'text-xs font-medium text-gray-600' }, allSelected ? '取消全选' : '全选'),
+                h('span', { className: 'text-xs text-gray-400' }, '（' + selectableIds.length + ' 个对话）')
+              )
+            : null,
           conversations.length === 0
             ? h('div', { className: 'px-4 py-8 text-center text-sm text-gray-400' }, '暂无对话，\n开始你的第一次对话吧')
             : conversations.map(function(c) {
                 var isActive = c.task_id === activeId;
                 var lastMsg = c._lastMessage || '';
                 var statusColor = statusColorMap;
-                // 选择对话：onMouseDown 立即响应（防止点击期间列表刷新导致 click 丢失），
-                // onClick 兜底（键盘 / 触屏 / 辅助技术）
-                var select = function(e) {
-                  if (e && e.button !== undefined && e.button !== 0) return;
-                  if (c.task_id) onSelect(c.task_id);
+                var selected = !!(selectedIds[c.task_id]);
+                // 统一激活：批量管理模式下点击行 = 勾选/取消勾选，不切换当前对话；
+                // 正常模式下 = 切换对话。
+                var activate = function() {
+                  if (!c.task_id) return;
+                  if (selectionMode) onToggleSelected(c.task_id);
+                  else onSelect(c.task_id);
                 };
+                // 选择对话：onMouseDown 立即响应（防止点击期间列表刷新导致 click 丢失）。
+                // 批量模式下同一物理点击会先后触发 mousedown 和 click，
+                // 两次都切换会互相抵消（勾选后立即取消），因此 click 在批量模式下直接忽略。
+                var onRowMouseDown = function(e) {
+                  if (e && e.button !== undefined && e.button !== 0) return;
+                  activate();
+                };
+                var onRowClick = function(e) {
+                  if (e && e.button !== undefined && e.button !== 0) return;
+                  if (selectionMode) return;
+                  activate();
+                };
+                var rowClass = selectionMode
+                  ? (selected ? 'bg-blue-50 border border-blue-300' : 'hover:bg-gray-100 border border-transparent')
+                  : (isActive ? 'bg-blue-100 border border-blue-200' : 'hover:bg-gray-100 border border-transparent');
                 return h('div', {
                   key: c.task_id,
                   role: 'button',
                   tabIndex: 0,
-                  onMouseDown: select,
-                  onClick: select,
+                  onMouseDown: onRowMouseDown,
+                  onClick: onRowClick,
                   onKeyDown: function(e) {
-                    if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); select(); }
+                    if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); activate(); }
                   },
-                  className: 'px-3 py-2.5 mx-2 my-0.5 rounded-lg cursor-pointer transition-colors group select-none ' + (isActive ? 'bg-blue-100 border border-blue-200' : 'hover:bg-gray-100 border border-transparent'),
+                  className: 'px-3 py-2.5 mx-2 my-0.5 rounded-lg cursor-pointer transition-colors group select-none ' + rowClass,
                 },
                   h('div', { className: 'flex items-center gap-2' },
-                    h('span', { className: 'w-2 h-2 rounded-full flex-shrink-0 ' + (statusColor[c.status] || 'bg-gray-400') }),
-                    h('span', { className: 'text-sm font-medium truncate flex-1 ' + (isActive ? 'text-blue-800' : 'text-gray-700') }, c.name || '未命名对话'),
-                    h('button', {
+                    selectionMode
+                      ? h('span', { className: 'w-4 h-4 flex items-center justify-center rounded border flex-shrink-0 ' + (selected ? 'bg-blue-600 border-blue-600' : 'border-gray-300 bg-white') },
+                          selected && h('svg', { className: 'w-3 h-3 text-white', fill:'none', stroke:'currentColor', viewBox:'0 0 24 24' },
+                            h('path', { strokeLinecap:'round', strokeLinejoin:'round', strokeWidth:3, d:'M5 13l4 4L19 7' })
+                          )
+                        )
+                      : h('span', { className: 'w-2 h-2 rounded-full flex-shrink-0 ' + (statusColor[c.status] || 'bg-gray-400') }),
+                    h('span', { className: 'text-sm font-medium truncate flex-1 ' + ((isActive && !selectionMode) ? 'text-blue-800' : 'text-gray-700') }, c.name || '未命名对话'),
+                    !selectionMode && h('button', {
                       onMouseDown: function(e) { e.stopPropagation(); },
                       onClick: function(e) { e.stopPropagation(); onDelete(c.task_id); },
                       className: 'opacity-0 group-hover:opacity-100 p-0.5 hover:bg-red-100 rounded transition-all',
@@ -406,8 +491,6 @@
       var messagesEndRef = props.messagesEndRef, hasActiveConversation = props.hasActiveConversation;
       var agents = props.agents || [];
       var streams = props.streams || {};
-      var collabMode = !!props.collabMode;
-      var onToggleCollabMode = props.onToggleCollabMode;
       var inputRef = useRef(null);
       var inputState = useState('');
       var input = inputState[0], setInput = inputState[1];
@@ -492,9 +575,8 @@
           resetAgent = true;
           dismissedRef.current = false;
         }
-        // 首行 @ 由后端解析（含“最多两个、并行回答”规则）。
-        // 前端不再剥离 @ 文本，也不再传递 discussion_agents；消息原文发给后端。
-        onSend(msg, atAgent, resetAgent, null);
+        // 首行 @ 由后端解析（含“最多两个、并行回答”规则）；消息原文发给后端。
+        onSend(msg, atAgent, resetAgent);
       }
 
       function handleKeyDown(e) {
@@ -672,7 +754,7 @@
               ? (directionLabel || msgSenderLabel || agentLabel(task ? task.executor_agent : 'claude'))
               : null;
             return h('div', { key: i, className: 'flex ' + (isModelToModel ? 'justify-start' : (msg.role === 'user' ? 'justify-end' : 'justify-start')) + ' slide-up' },
-              h('div', { className: 'max-w-[80%] w-full' },
+              h('div', { className: 'max-w-[80%]' },
                 senderLine && h('div', { className: 'text-xs font-medium text-gray-400 mb-1.5' }, senderLine),
                 (isAssistant && sp.thinking)
                   ? h('details', { className: 'thinking-block' },
@@ -680,7 +762,7 @@
                       h('div', { className: 'thinking-body' }, sp.thinking)
                     )
                   : null,
-                h('div', { className: 'rounded-2xl px-4 py-3 ' + (
+                h('div', { className: 'w-fit max-w-full rounded-2xl px-4 py-3 ' + (
                   isUserBubble ? 'bg-blue-600 text-white' :
                   msg.role === 'system' ? 'bg-gray-100 text-gray-600 text-sm' :
                   'bg-white border border-gray-200 shadow-sm'
@@ -691,8 +773,8 @@
                     directionLabel
                   ),
                   isUserBubble
-                    ? h('p', { className: 'text-sm leading-relaxed whitespace-pre-wrap message-body' }, sp.body)
-                    : h('div', { className: 'message-body' }, h(Markdown, null, sp.body))
+                    ? h(CollapsibleBody, { className: 'text-sm leading-relaxed whitespace-pre-wrap message-body', contentKey: sp.body, toggleClass: 'text-blue-200 hover:text-white' }, sp.body)
+                    : h(CollapsibleBody, { className: 'message-body', contentKey: sp.body }, h(Markdown, null, sp.body))
                 )
               )
             );
@@ -706,7 +788,7 @@
             if (!st || !task || st.task_id !== task.task_id) return null;
             if (!st.text && !st.agent) return null;
             return h('div', { key: 'stream-' + sid, className: 'flex justify-start slide-up' },
-              h('div', { className: 'max-w-[80%] w-full' },
+              h('div', { className: 'max-w-[80%]' },
                 h('div', { className: 'text-xs font-medium text-gray-400 mb-1.5 flex items-center gap-2' },
                   agentLabel(st.agent),
                   st.done
@@ -722,12 +804,11 @@
                   h('summary', { className: 'thinking-summary' }, '💭 思考过程'),
                   h('div', { className: 'thinking-body' }, st.reasoning)
                 ) : null,
-                h('div', { className: 'max-w-full rounded-2xl px-4 py-3 bg-white border border-gray-200 shadow-sm' },
-                  h('div', {
+                h('div', { className: 'w-fit max-w-full rounded-2xl px-4 py-3 bg-white border border-gray-200 shadow-sm' },
+                  h(CollapsibleBody, {
                     className: 'text-sm whitespace-pre-wrap stream-cursor message-body',
-                    ref: function(el) {
-                      if (el) el.scrollTop = el.scrollHeight; // 自动跟随最新内容（仅气泡内滚动，不影响外层）
-                    },
+                    contentKey: st.text || '',
+                    autoScroll: true, // 自动跟随最新内容（仅气泡内滚动，不影响外层）
                   }, st.text || '')
                 )
               )
@@ -753,19 +834,6 @@
         h('div', { className: 'px-5 py-3 border-t border-gray-100 bg-white' },
           inputEnabled
             ? h('div', null,
-                // 协作模式开关：事件驱动 = 主 Agent 拆解 DAG，多模型分工执行
-                h('div', { className: 'mb-2 flex items-center gap-2' },
-                  h('span', { className: 'text-xs text-gray-400' }, '协作模式:'),
-                  h('button', {
-                    onClick: onToggleCollabMode,
-                    disabled: loading,
-                    title: '开启后由主 Agent 拆解任务 DAG，多个模型按依赖分工执行（此时 @多模型讨论不生效）；关闭则按自动路由（单 Agent / @多模型讨论 / 关键词协作）',
-                    className: 'text-xs px-2.5 py-1 rounded-full border transition-colors ' + (collabMode
-                      ? 'bg-blue-600 text-white border-blue-600'
-                      : 'bg-white text-gray-500 border-gray-200 hover:border-gray-300') + (loading ? ' opacity-50 cursor-not-allowed' : '')
-                  }, collabMode ? '事件驱动（DAG）' : '自动'),
-                  collabMode && h('span', { className: 'text-xs text-gray-400' }, '将拆解为多个子任务并行执行')
-                ),
                 // @mention selected chip
                 mentionedAgent && h('div', { className: 'mb-2 flex items-center gap-2' },
                   h('span', { className: 'text-xs text-gray-400' }, '回答者:'),
@@ -810,9 +878,7 @@
                   ),
                   h('textarea', {
                     ref: inputRef, value: input,
-                    placeholder: collabMode
-                      ? '输入任务，事件驱动模式将拆解为 DAG 并行执行...'
-                      : (isNewConversation ? '输入你的需求，开始对话... 也可用 @Agent名 指定回答者' : '继续输入... 也可用 @Agent名 指定回答者'),
+                    placeholder: isNewConversation ? '输入你的需求，开始对话... 也可用 @Agent名 指定回答者' : '继续输入... 也可用 @Agent名 指定回答者',
                     rows: 1, disabled: loading,
                     onChange: handleInputChange,
                     onKeyDown: handleKeyDown,
@@ -860,6 +926,11 @@
     function App() {
       var conversationsState = useState([]);
       var conversations = conversationsState[0], setConversations = conversationsState[1];
+      // 对话批量管理：勾选删除（含对应保存的对话文件）
+      var selModeState = useState(false);
+      var selectionMode = selModeState[0], setSelectionMode = selModeState[1];
+      var selIdsState = useState({});
+      var selectedIds = selIdsState[0], setSelectedIds = selIdsState[1];
       var activeIdState = useState(null);
       var activeId = activeIdState[0], setActiveId = activeIdState[1];
       var activeTaskState = useState(null);
@@ -883,10 +954,6 @@
       // 按对话维度跟踪"正在执行"的任务（多对话并行：A 执行中不影响新开 B）
       var busyTasksState = useState({});   // { taskId: true } + { __new__: true }（新对话发送中）
       var busyTasks = busyTasksState[0], setBusyTasks = busyTasksState[1];
-      // 事件驱动协作开关：开启后每个请求都带 collab_mode='event-driven'
-      // （按请求生效、不持久化；切换对话时保持当前选择）
-      var collabModeState = useState(false);
-      var collabMode = collabModeState[0], setCollabMode = collabModeState[1];
       var globalBusyState = useState(false); // 全局瞬态操作（如 stop-all）
       var globalBusy = globalBusyState[0], setGlobalBusy = globalBusyState[1];
       // 停止中标志：拦截后续 WS 流式事件（kill 进程到 WS 断流有短暂延迟）
@@ -896,9 +963,6 @@
       var streams = streamsState[0], setStreams = streamsState[1];
       // streams 最新值镜像（供定时器在 setState 提交前同步读取当前气泡状态）
       var streamsRef = useRef({});
-      // 事件驱动协作：右侧任务面板子任务状态
-      var collabTasksState = useState([]); // [{ sub_task_id, type, status, agent, input }]
-      var collabTasks = collabTasksState[0], setCollabTasks = collabTasksState[1];
       var sidebarCollapsedState = useState(false);
       var sidebarCollapsed = sidebarCollapsedState[0], setSidebarCollapsed = sidebarCollapsedState[1];
       var messagesEndRef = useRef(null);
@@ -968,7 +1032,7 @@
             if (data.event_type === 'agent:stream:end') {
               if (stoppingRef.current) return;
               if (!data.data || !activeIdRef.current || data.data.task_id !== activeIdRef.current) return;
-              // 不立即删除气泡：正文要等 collab:subtask:done -> 写 conversation -> 重新 fetch
+              // 不立即删除气泡：正文要等服务端把输出写入 conversation 后重新 fetch
               // 才出现，立即删除会出现内容"真空期"（并行执行时 fetch 可能延迟数秒，表现为
               // 模型输出消失、其他模型输出完成后才再次出现）。先标记 done 保留展示，
               // 待对话刷新成功（fetchConversation 内清理）后再移除。
@@ -988,24 +1052,6 @@
                   fetchConversationRef.current(endTaskId);
                 }
               }, 600);
-              return;
-            }
-            // 事件驱动协作：子任务状态更新（右侧任务面板，只接收当前对话任务的事件）
-            if (data.event_type === 'collab:subtask:update') {
-              if (data.data && data.data.sub_task_id && activeIdRef.current && data.data.task_id === activeIdRef.current) {
-                setCollabTasks(function(prev) {
-                  var sub = data.data;
-                  var found = false;
-                  var next = prev.map(function(t) {
-                    if (t.sub_task_id === sub.sub_task_id) { found = true; return Object.assign({}, t, { status: sub.status, agent: sub.agent || t.agent, description: sub.description || t.description || '' }); }
-                    return t;
-                  });
-                  if (!found) {
-                    next = next.concat([{ sub_task_id: sub.sub_task_id, type: sub.type || '', status: sub.status, agent: sub.agent || '', description: sub.description || '', input: '' }]);
-                  }
-                  return next;
-                });
-              }
               return;
             }
             lastMsgState[1](data);
@@ -1066,27 +1112,6 @@
             return changed ? next : prev;
           });
         } catch(e) { console.error(e); }
-        // 拉取事件驱动协作任务列表（右侧面板）
-        try {
-          if (taskId !== activeIdRef.current) return;
-          var cres = await api('/tasks/' + taskId + '/collab/state');
-          var cdata = await cres.json();
-          if (mySeq !== convSeqRef.current) return;
-          // 合并服务器列表与本地状态：WS 已推进的进度（RUNNING/SUCCESS 等）不回退；
-          // 同时剔除本地残留的其他回合/其他任务的子任务
-          setCollabTasks(function(prev) {
-            var statusRank = { PENDING: 1, RUNNING: 2, RETRYING: 3, TIMEOUT: 4, SUCCESS: 5, FAILED: 6, CANCELLED: 7 };
-            var byId = {};
-            (cdata.sub_tasks || []).forEach(function(t) { byId[t.sub_task_id] = t; });
-            (prev || []).forEach(function(p) {
-              var s = byId[p.sub_task_id];
-              if (s && (statusRank[p.status] || 0) > (statusRank[s.status] || 0)) {
-                byId[p.sub_task_id] = Object.assign({}, s, { status: p.status, agent: p.agent || s.agent });
-              }
-            });
-            return Object.keys(byId).map(function(k) { return byId[k]; });
-          });
-        } catch(e) { console.error(e); }
       }, []);
 
       // 供 WS 流结束事件/兜底取用：useCallback 依赖为空，各次渲染返回同一函数，赋一次即可
@@ -1138,12 +1163,6 @@
             fetchConversation(activeId);
           }
         }
-        // 事件驱动协作：拆解完成/子任务完成时刷新对话（展示过程中各模型输出）
-        if (event.event_type === 'collab:planned' || event.event_type === 'collab:subtask:done') {
-          if (activeId && event.data && event.data.task_id === activeId) {
-            fetchConversation(activeId);
-          }
-        }
         if (event.event_type === 'agent:heartbeat') {
           setAgents(event.data || []);
         }
@@ -1154,13 +1173,11 @@
         if (messagesEndRef.current) messagesEndRef.current.scrollIntoView({ behavior: 'smooth' });
       }, [conversation, isTaskLoading(activeTask && activeTask.task_id), streams]);
 
-      function handleSend(message, mentionedAgent, resetAgent, discussAgents) {
+      function handleSend(message, mentionedAgent, resetAgent) {
         // 按对话维度标记忙碌（新对话未创建前用 __new__，创建后换成真实 task_id），
         // 避免"对话 A 执行中"把对话 B 的输入也禁掉（多对话并行）
         var sendKey = activeId || '__new__';
         setBusyTasks(function(prev) { var n = Object.assign({}, prev); n[sendKey] = true; return n; });
-        // 新消息 = 可能触发新的事件驱动回合，先清空右侧任务面板
-        setCollabTasks([]);
         // 新一轮消息：清掉当前对话上一轮残留的"已完成"流式气泡（其正文已随上一轮 fetch
         // 写入对话），避免与新一轮模型的并发输出并存导致重复/错位；仍在流式中的不受影响
         if (activeId) {
@@ -1178,9 +1195,8 @@
         (async function() {
           var newTaskId = null;
           try {
-            var discussion = discussAgents && discussAgents.length >= 2 ? discussAgents.map(function(a) { return a.name; }) : null;
             if (activeId) {
-              var res = await api('/tasks/' + activeId + '/chat', { method: 'POST', body: JSON.stringify({ message: message, mentioned_agent: mentionedAgent ? mentionedAgent.name : (resetAgent ? '克劳德' : undefined), model_cli: mentionedAgent ? mentionedAgent.model_cli : undefined, discussion_agents: discussion, collab_mode: collabMode ? 'event-driven' : undefined }) });
+              var res = await api('/tasks/' + activeId + '/chat', { method: 'POST', body: JSON.stringify({ message: message, mentioned_agent: mentionedAgent ? mentionedAgent.name : (resetAgent ? '克劳德' : undefined), model_cli: mentionedAgent ? mentionedAgent.model_cli : undefined }) });
               var data = await res.json();
               if (data.task) setActiveTask(data.task);
               fetchConversation(activeId);
@@ -1208,7 +1224,7 @@
                 return n;
               });
 
-              var execRes = await api('/tasks/' + newTask.task_id + '/execute', { method: 'POST', body: JSON.stringify({ message: message, mentioned_agent: agent ? agent.name : undefined, model_cli: agent ? agent.model_cli : undefined, discussion_agents: discussion, collab_mode: collabMode ? 'event-driven' : undefined }) });
+              var execRes = await api('/tasks/' + newTask.task_id + '/execute', { method: 'POST', body: JSON.stringify({ message: message, mentioned_agent: agent ? agent.name : undefined, model_cli: agent ? agent.model_cli : undefined }) });
               var execData = await execRes.json();
               if (execData.task) setActiveTask(execData.task);
               fetchConversation(newTask.task_id);
@@ -1237,7 +1253,6 @@
         setActiveTask(null);
         setConversation('');
         convLenRef.current = 0;
-        setCollabTasks([]);
         setStreams({});
         fetchConversation(taskId);
       }
@@ -1258,14 +1273,12 @@
         setActiveTask(null);
         setConversation('');
         convLenRef.current = 0;
-        setCollabTasks([]);
         setStreams({});
       }
 
       async function handleStopTask(taskId) {
         // 立即清空流式气泡 + 设置 stopping 标志拦住后续 WS 流式事件
         setStreams({});
-        setCollabTasks([]);
         stoppingRef.current = true;
         try {
           var res = await api('/tasks/' + taskId + '/stop', { method: 'POST' });
@@ -1317,6 +1330,61 @@
         } catch(e) { alert('删除失败: ' + e.message); }
       }
 
+      // ===== 批量管理 =====
+      function handleToggleSelectionMode() {
+        if (selectionMode) setSelectedIds({}); // 退出批量模式时清空勾选
+        setSelectionMode(!selectionMode);
+      }
+
+      function handleToggleSelected(taskId) {
+        if (!taskId) return;
+        setSelectedIds(function(prev) {
+          var n = Object.assign({}, prev);
+          if (n[taskId]) delete n[taskId]; else n[taskId] = true;
+          return n;
+        });
+      }
+
+      // 全选 / 取消全选（已全选时再点 = 清空）
+      function handleToggleSelectAll() {
+        var ids = conversations.filter(function(c) { return !!c.task_id; }).map(function(c) { return c.task_id; });
+        var allSelected = ids.length > 0 && ids.every(function(id) { return !!selectedIds[id]; });
+        if (allSelected) {
+          setSelectedIds({});
+        } else {
+          var next = {};
+          ids.forEach(function(id) { next[id] = true; });
+          setSelectedIds(next);
+        }
+      }
+
+      async function handleDeleteSelected() {
+        var ids = Object.keys(selectedIds);
+        if (ids.length === 0) return;
+        if (!confirm('确定删除选中的 ' + ids.length + ' 个对话吗？\n对话记录及对应保存的对话文件将一并删除，此操作不可恢复。')) return;
+        try {
+          var res = await api('/tasks/batch/delete', { method: 'POST', body: JSON.stringify({ task_ids: ids }) });
+          var result = await res.json();
+          var deletedIds = (result.deleted || []).map(function(d) { return d.task_id; });
+          // 当前打开的对话被删除 → 清空对话视图
+          if (activeId && deletedIds.indexOf(activeId) >= 0) {
+            setActiveId(null);
+            activeIdRef.current = null;
+            setActiveTask(null);
+            setConversation('');
+            convLenRef.current = 0;
+          }
+          if (result.failed && result.failed.length > 0) {
+            alert('部分对话删除失败：\n' + result.failed.map(function(f) {
+              return (f.name || f.task_id) + '：' + f.reason;
+            }).join('\n'));
+          }
+          setSelectedIds({});
+          setSelectionMode(false);
+          fetchConversations();
+        } catch(e) { alert('批量删除失败: ' + e.message); }
+      }
+
       return h('div', { className: 'h-screen flex flex-col' },
         // Top bar
         h('div', { className: 'px-4 py-1.5 bg-white border-b border-gray-200 flex items-center justify-between text-xs' },
@@ -1338,6 +1406,12 @@
             onSelect: handleSelectConversation,
             onNew: handleNewConversation,
             onDelete: handleDeleteConversation,
+            selectionMode: selectionMode,
+            selectedIds: selectedIds,
+            onToggleSelectionMode: handleToggleSelectionMode,
+            onToggleSelected: handleToggleSelected,
+            onDeleteSelected: handleDeleteSelected,
+            onToggleSelectAll: handleToggleSelectAll,
             collapsed: sidebarCollapsed,
             onToggle: function() { setSidebarCollapsed(!sidebarCollapsed); },
             agents: agents,
@@ -1357,13 +1431,8 @@
               hasActiveConversation: !!activeId,
               agents: agents,
               streams: streams,
-              collabMode: collabMode,
-              onToggleCollabMode: function() { setCollabMode(function(v) { return !v; }); },
             })
-          ),
-
-          // Far right: Event-driven collab task panel
-          h(CollabTaskPanel, { tasks: collabTasks })
+          )
         )
       );
     }

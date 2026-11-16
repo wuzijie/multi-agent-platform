@@ -1,0 +1,3 @@
+- 接力棒：{{from_agent}} → 你（第 {{hop}} 跳；链：{{chain}}）
+- 活跃任务：{{active_tasks}}
+- 最近修改文件：{{recent_files}}

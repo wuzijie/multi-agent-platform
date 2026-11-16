@@ -301,7 +301,12 @@ class ClaudeAdapter {
         let errorCode = 'CLI_ERROR';
         if (streamed.killed_by_timeout) {
           errorCode = 'TIMEOUT';
-          errMsg = `模型调用超时（超过 ${Math.round(timeoutMs / 1000)} 秒无结果，进程已被中断）`;
+          // 超时诊断：CLI 是否有任何输出（区分"进程挂起无输出"与"有事件但没等到最终文本"）
+          const seen = streamed.streamed_ok
+            ? `已收到 CLI 事件（${streamed.line_count || 0} 行 stdout）但无完整输出`
+            : `CLI 未输出任何可解析事件（stdout ${streamed.line_count || 0} 行）`;
+          const errTail = streamed.stderr ? `；stderr: ${String(streamed.stderr).slice(0, 300)}` : '';
+          errMsg = `模型调用超时（超过 ${Math.round(timeoutMs / 1000)} 秒无结果，进程已被中断；${seen}${errTail}）`;
         } else {
           errMsg = streamed.stderr || streamed.text || 'Unknown error';
           if (errMsg.includes('Not logged in')) {
@@ -578,6 +583,7 @@ class ClaudeAdapter {
       let streamedText = '';
       let emittedLen = 0;
       let parsedAny = false;
+      let lineCount = 0; // stdout 行数（超时诊断用：区分"CLI 无输出"与"有事件但无文本"）
       let settled = false;
 
       const finish = (result) => {
@@ -718,6 +724,7 @@ class ClaudeAdapter {
         while ((idx = buf.indexOf('\n')) >= 0) {
           const line = buf.slice(0, idx);
           buf = buf.slice(idx + 1);
+          lineCount++;
           handleLine(line);
         }
       });
@@ -727,13 +734,14 @@ class ClaudeAdapter {
       });
 
       proc.on('close', (code) => {
-        if (buf.trim()) handleLine(buf); // 最后一行可能没有换行符
+        if (buf.trim()) { handleLine(buf); lineCount++; } // 最后一行可能没有换行符
         const userKilled = procRegistry.isUserKilled(proc);
         finish({
           exit_code: code,
           text: streamedText,
           stderr: stderr.trim(),
           streamed_ok: parsedAny,
+          line_count: lineCount,
           killed_by_timeout: !userKilled && (code === null || killedByTimeout()),
           cancelled: userKilled,
         });
