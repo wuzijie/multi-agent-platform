@@ -608,14 +608,22 @@ module.exports = {
     // 并行分发时不能修改共享 task.instruction（会互相覆盖），用浅拷贝隔离。
     // 执行许可提示由 runtime 统一注入（delta/full 两种模式都能生效）。
     const taskForAgent = Object.assign({}, task, { instruction });
-    if (incrementalContext) {
-      taskForAgent.incremental_context = incrementalContext;
-    } else if (!fromAgent) {
-      // 用户直呼：交给 runtime 通用增量上下文接管（触发者=用户，触发原文=本轮指令）
-      taskForAgent.trigger_from = '用户';
-      taskForAgent.trigger_content = instruction;
-      taskForAgent.mention_desc = instruction;
-    }
+    // 触发元信息：runtime 在 resume 生效时据此重建 delta 增量内容（只发未读+指令+警告）
+    const pairCountForTask = pairKey ? (turn.pingpong[pairKey] || 0) : 0;
+    taskForAgent.trigger_from = fromAgent || '用户';
+    taskForAgent.trigger_content = (meta && meta.triggerContent) || instruction;
+    taskForAgent.mention_desc = (meta && meta.mentionDesc) || (fromAgent ? '' : instruction);
+    taskForAgent.trigger_chain = chain;
+    taskForAgent.incremental_turn = {
+      summonSeq,
+      hop,
+      pairCount: pairCountForTask,
+      warn: pairCountForTask >= turn.warnThreshold,
+      warnThreshold: turn.warnThreshold,
+      blockThreshold: turn.blockThreshold,
+      modeLabel: (config.mention && config.mention.mode === 'serial') ? '串行接力模式' : '并行接力模式',
+    };
+    if (incrementalContext) taskForAgent.incremental_context = incrementalContext;
 
     let result;
     try {

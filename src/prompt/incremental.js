@@ -93,6 +93,8 @@ function agentModelLabel(agentName) {
  * @param {Array}  [p.chain]       接力链
  * @param {Object} [p.turn]        乒乓/召唤上下文（可选）
  * @param {string} [p.extraHistory] 转录历史（history_segments 拼串，可选）
+ * @param {string} [p.instruction]  本轮指令（delta 模式必发）
+ * @param {boolean} [p.delta]       resume 增量模式：只发未读历史+本轮指令+乒乓警告
  * @returns {{prompt:string, stats:Object, deliveredUpTo:number, ctxTaskId:string, deliveryCursor:number}}
  */
 function buildIncrementalContext(p = {}) {
@@ -109,19 +111,23 @@ function buildIncrementalContext(p = {}) {
   const chain = (Array.isArray(p.chain) && p.chain.length)
     ? p.chain
     : ['用户', ...(fromAgent !== '用户' ? [fromAgent] : [])];
+  // resume delta 模式：只需未读+指令+警告，跳过花名册/活跃任务/最近文件采集
+  const delta = !!p.delta;
 
   const res = assembleIncrementalContext({
     targetAgent: agentName,
     fromAgent,
-    triggerModel: agentModelLabel(fromAgent),
+    triggerModel: delta ? '' : agentModelLabel(fromAgent),
     triggerContent: p.triggerContent || task.instruction || task.description || '',
     mentionDesc: p.mentionDesc || '',
     unread,
-    roster: rosterSnapshot(p.agentRuntime),
-    activeTasks: activeTasksSnapshot(),
-    recentFiles: recentFilesSnapshot(),
+    roster: delta ? [] : rosterSnapshot(p.agentRuntime),
+    activeTasks: delta ? [] : activeTasksSnapshot(),
+    recentFiles: delta ? [] : recentFilesSnapshot(),
     turn: p.turn ? Object.assign({ chain }, p.turn) : { summonSeq: 1, hop: 1, chain },
     extraHistory: p.extraHistory || '',
+    instruction: p.instruction || task.instruction || '',
+    delta,
     maxTokens: task.max_tokens,
   });
 

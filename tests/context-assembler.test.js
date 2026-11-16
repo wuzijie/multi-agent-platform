@@ -126,6 +126,29 @@ test('乒乓警告：warn=true 时注入，warn=false 时不注入', () => {
   assert.ok(!noWarn.prompt.includes('[乒乓警告]'), '未达阈值不注入警告');
 });
 
+test('delta 模式（resume 增量）：只发未读历史+本轮指令+乒乓警告', () => {
+  const r = assembleIncrementalContext(baseInput({
+    delta: true,
+    instruction: '请评审技术风险',
+    turn: { summonSeq: 3, hop: 2, chain: ['用户', '克劳德'], pairCount: 2, warn: true, warnThreshold: 2, blockThreshold: 4 },
+  }));
+  assert.strictEqual(r.stats.mode, 'delta');
+  assert.ok(r.prompt.includes('[未读历史]'), '含未读历史');
+  assert.ok(r.prompt.includes('[本轮指令]'), '含本轮指令段');
+  assert.ok(r.prompt.includes('请评审技术风险'), '含指令内容');
+  assert.ok(r.prompt.includes('[乒乓警告]'), '警告条件注入');
+  for (const t of ['[来源标识]', '[模式声明]', '[导航头]', '[触发消息原文]', '[系统提示]']) {
+    assert.ok(!r.prompt.includes(t), `delta 模式不应包含 ${t}（已在 CLI session 中）`);
+  }
+});
+
+test('delta 模式：无警告、空未读时仍可用', () => {
+  const r = assembleIncrementalContext(baseInput({ delta: true, instruction: '继续', unread: [] }));
+  assert.strictEqual(r.stats.mode, 'delta');
+  assert.ok(r.prompt.includes('（无新消息）'));
+  assert.ok(!r.prompt.includes('[乒乓警告]'));
+});
+
 test('触发原文超长：头尾截断并标注省略', () => {
   const long = '头'.repeat(100) + '中'.repeat(2000) + '尾'.repeat(100);
   const t = truncateTrigger(long, 60, 40);

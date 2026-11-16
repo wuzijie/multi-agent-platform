@@ -372,35 +372,7 @@ class AgentRuntime {
       : buildSegments(history, cfg);
     let historyBlock = historySegments.join('\n\n');
 
-    // ===== 动态上下文（通用）：所有场景默认注入六段式增量上下文 =====
-    // 调用方显式提供 task.incremental_context 时以其为准（如聊天 agent 转交链，
-    // 携带接力链与乒乓计数）；其余场景（用户直呼 / 讨论 / DAG / 规划）在此自动组装。
-    // 转录历史（history_segments）并入组装结果，避免替换历史区后上下文断裂。
-    // 后台维护类调用可用 task.skip_incremental_context 关闭。
-    let autoIncremental = null;
-    const explicitIncremental = (task.incremental_context && String(task.incremental_context).trim())
-      ? String(task.incremental_context).trim()
-      : '';
-    if (!explicitIncremental && !task.skip_incremental_context) {
-      try {
-        autoIncremental = buildIncrementalContext({
-          task,
-          agentName,
-          agentRuntime: this,
-          fromAgent: task.trigger_from || (chatMode ? '用户' : '调度器'),
-          triggerContent: task.trigger_content || task.instruction || task.description || '',
-          mentionDesc: task.mention_desc || '',
-          chain: task.trigger_chain || null,
-          turn: task.incremental_turn || null,
-          extraHistory: historyBlock || '',
-        });
-      } catch (e) {
-        autoIncremental = null;
-        console.warn('[AgentRuntime] 增量上下文组装失败（降级为普通 prompt）:', e.message);
-      }
-    }
-
-    // ===== resume / 游标：delta 模式只发“游标之后的新消息” =====
+    // ===== resume / 游标：CLI 通过 --resume 保存前轮上下文 =====
     const cliName = agent.model_cli || null;
     // 未声明 model_cli 的内部/测试 agent：不做 resume，走 full 模式，不做准入拦截
     const resumeSupported = cliName ? capabilities.isSupported(cliName) : false;
@@ -429,6 +401,60 @@ class AgentRuntime {
     }
     const isFirstCall = !(cursorState && cursorState.session_id);
     const resumeActive = resumeSupported && !isFirstCall && !task.__forceFull;
+
+    // ===== 动态上下文（通用）：所有场景默认注入增量上下文 =====
+    // · resume 生效（第 2 次调用起）：CLI session 已保存前轮上下文（固定规则/系统提示等），
+    //   只发「未读历史 + 本轮指令 + 乒乓警告」的增量内容；
+    // · 首次调用 / 无 resume：发完整六段式（调用方显式 incremental_context 优先）。
+    // 转录历史（history_segments）并入完整版组装，避免替换历史区后上下文断裂。
+    // 后台维护类调用可用 task.skip_incremental_context 关闭。
+    const explicitIncremental = (task.incremental_context && String(task.incremental_context).trim())
+      ? String(task.incremental_context).trim()
+      : '';
+    let autoIncremental = null;
+    let incrementalPrompt = '';
+    if (resumeActive) {
+      try {
+        autoIncremental = buildIncrementalContext({
+          task,
+          agentName,
+          agentRuntime: this,
+          fromAgent: task.trigger_from || (chatMode ? '用户' : '调度器'),
+          triggerContent: task.trigger_content || '',
+          mentionDesc: task.mention_desc || '',
+          chain: task.trigger_chain || null,
+          turn: task.incremental_turn || null,
+          instruction: task.instruction || '',
+          delta: true,
+        });
+        incrementalPrompt = autoIncremental.prompt;
+      } catch (e) {
+        autoIncremental = null;
+        console.warn('[AgentRuntime] 增量上下文（delta）组装失败，回退普通 prompt:', e.message);
+      }
+    }
+    if (!incrementalPrompt && explicitIncremental) {
+      incrementalPrompt = explicitIncremental;
+    }
+    if (!incrementalPrompt && !task.skip_incremental_context) {
+      try {
+        autoIncremental = buildIncrementalContext({
+          task,
+          agentName,
+          agentRuntime: this,
+          fromAgent: task.trigger_from || (chatMode ? '用户' : '调度器'),
+          triggerContent: task.trigger_content || task.instruction || task.description || '',
+          mentionDesc: task.mention_desc || '',
+          chain: task.trigger_chain || null,
+          turn: task.incremental_turn || null,
+          extraHistory: historyBlock || '',
+        });
+        incrementalPrompt = autoIncremental.prompt;
+      } catch (e) {
+        autoIncremental = null;
+        console.warn('[AgentRuntime] 增量上下文组装失败（降级为普通 prompt）:', e.message);
+      }
+    }
 
     let promptMaxSeq = messageLog.maxSeq(task.task_id);
     let deltaMode = false;
@@ -468,9 +494,7 @@ class AgentRuntime {
       : '[执行许可] 用户尚未授权：本轮只做分析与方案，禁止修改/创建文件、禁止执行有副作用的命令。';
     currentInstruction = `${permissionNotice}\n\n${currentInstruction}`;
 
-    // 动态上下文（通用）：显式组装（agent 转交链）或自动组装（其余全部场景）命中时，
-    // 增量上下文（已含触发原文/未读历史/系统提示）附执行许可后直接作为本轮指令。
-    const incrementalPrompt = explicitIncremental || (autoIncremental && autoIncremental.prompt) || '';
+    // 动态上下文命中：增量内容（resume 时为 delta 版）附执行许可后作为本轮指令
     if (incrementalPrompt) {
       currentInstruction = `${permissionNotice}\n\n${incrementalPrompt}`;
     }

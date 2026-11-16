@@ -187,6 +187,36 @@ function formatRoster(roster) {
   }).join('\n') || '（无可用队友）';
 }
 
+/** 可用预算：模型输入上限扣除固定段落与输出预留后，分配给未读历史 */
+function computeUnreadBudget(d, fixedChars, maxTokens) {
+  const capChars = d.modelCap * d.charsPerToken;
+  const usableChars = Math.max(3000, Math.floor(capChars * d.budgetRatio));
+  const outputReserve = (Number(maxTokens) || 4096) * d.charsPerToken;
+  return Math.max(1500, usableChars - fixedChars - outputReserve);
+}
+
+/**
+ * 未读历史段：Warm 逐条展开 / Cold 确定性简报；超预算从最旧丢弃
+ * @returns {{text:string, dropped:number, isWarm:boolean}}
+ */
+function buildUnreadSection(unread, targetAgent, d, budgetChars) {
+  const totalChars = unread.reduce((s, m) => s + String(m.content == null ? '' : m.content).length, 0);
+  const isWarm = unread.length <= d.warmMaxMsgs && totalChars <= d.warmMaxChars;
+  let text = '';
+  let dropped = 0;
+  if (unread.length === 0) {
+    text = '（无新消息）';
+  } else if (isWarm) {
+    const trimmed = trimOldest(unread, budgetChars);
+    dropped = trimmed.dropped;
+    text = formatUnreadWarm(trimmed.kept, targetAgent);
+    if (dropped > 0) text += `\n\n（更早的 ${dropped} 条消息因预算省略）`;
+  } else {
+    text = formatUnreadCold(unread, Math.min(d.coldBriefMaxChars, budgetChars));
+  }
+  return { text, dropped, isWarm };
+}
+
 /**
  * 组装被 @ agent 的增量上下文
  *
@@ -213,6 +243,42 @@ function assembleIncrementalContext(p = {}) {
   const turn = p.turn || {};
   const warn = !!turn.warn;
   const pairCount = Number(turn.pairCount) || 0;
+
+  // ===== resume delta 模式：CLI 已保存前轮上下文，只发增量 =====
+  // 内容 = [未读历史] + [本轮指令] + [乒乓警告]（条件）；
+  // 模式声明/导航头/系统提示/固定规则等首轮已发过，不再重复。
+  if (p.delta) {
+    const instrText = String(p.instruction || '').trim();
+    const warnText = warn ? renderer.render('context/pingpong_warn', {
+      from_agent: fromAgent,
+      pair_count: pairCount,
+      warn_threshold: Number(turn.warnThreshold) || 2,
+      block_threshold: Number(turn.blockThreshold) || 4,
+    }) : '';
+    const fixedChars = instrText.length + warnText.length + 40;
+    const budgetChars = computeUnreadBudget(d, fixedChars, p.maxTokens);
+    const u = buildUnreadSection(unread, targetAgent, d, budgetChars);
+    const sections = [
+      { title: '未读历史', text: u.text },
+      { title: '本轮指令', text: instrText || '（见未读历史）' },
+    ];
+    if (warnText) sections.push({ title: '乒乓警告', text: warnText });
+    return {
+      sections,
+      prompt: renderer.renderContextSections(sections),
+      stats: {
+        mode: 'delta',
+        path: u.isWarm ? 'warm' : 'cold',
+        unread_count: unread.length,
+        unread_chars: u.text.length,
+        dropped_msgs: u.dropped,
+        trimmed: u.dropped > 0,
+        budget_chars: budgetChars,
+        pair_count: pairCount,
+        warn,
+      },
+    };
+  }
 
   // ===== 非未读段落（先构建，用于计算剩余预算）=====
   const sourceSec = {
@@ -268,29 +334,16 @@ function assembleIncrementalContext(p = {}) {
   } : null;
 
   // ===== 预算：模型输入上限扣除固定段落与输出预留，剩余给未读历史 =====
-  const fixedSections = [sourceSec, modeSec, navSec, triggerSec, systemSec, warnSec].filter(Boolean);
-  const fixedChars = fixedSections.reduce((s, x) => s + x.title.length + x.text.length + 4, 0);
-  const capChars = d.modelCap * d.charsPerToken;
-  const usableChars = Math.max(3000, Math.floor(capChars * d.budgetRatio));
-  const outputReserve = (Number(p.maxTokens) || 4096) * d.charsPerToken;
-  const unreadBudget = Math.max(1500, usableChars - fixedChars - outputReserve);
+  const fixedChars = [sourceSec, modeSec, navSec, triggerSec, systemSec, warnSec]
+    .filter(Boolean)
+    .reduce((s, x) => s + x.title.length + x.text.length + 4, 0);
+  const unreadBudget = computeUnreadBudget(d, fixedChars, p.maxTokens);
 
-  // ===== Warm / Cold 判定 =====
-  const totalChars = unread.reduce((s, m) => s + String(m.content == null ? '' : m.content).length, 0);
-  const isWarm = unread.length <= d.warmMaxMsgs && totalChars <= d.warmMaxChars;
-
-  let unreadText = '';
-  let dropped = 0;
-  if (unread.length === 0) {
-    unreadText = '（无新消息）';
-  } else if (isWarm) {
-    const trimmed = trimOldest(unread, unreadBudget);
-    dropped = trimmed.dropped;
-    unreadText = formatUnreadWarm(trimmed.kept, targetAgent);
-    if (dropped > 0) unreadText += `\n\n（更早的 ${dropped} 条消息因预算省略）`;
-  } else {
-    unreadText = formatUnreadCold(unread, Math.min(d.coldBriefMaxChars, unreadBudget));
-  }
+  // ===== Warm / Cold 判定 + 预算裁剪 =====
+  const u = buildUnreadSection(unread, targetAgent, d, unreadBudget);
+  const unreadText = u.text;
+  const dropped = u.dropped;
+  const isWarm = u.isWarm;
 
   const unreadSec = {
     title: '未读历史',
