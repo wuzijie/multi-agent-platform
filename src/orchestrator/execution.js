@@ -11,9 +11,8 @@ const transcript = require('../prompt/transcript');
 const config = require('../utils/config');
 const { enabledAgentNames, enabledAgents } = require('../utils/agent-list');
 const { parseMentions } = require('../messaging/mention');
-const messageLog = require('../messaging/message-log');
+const { buildIncrementalContext } = require('../prompt/incremental');
 const cursorStore = require('../messaging/cursor-store');
-const { assembleIncrementalContext } = require('../prompt/context-assembler');
 const renderer = require('../prompt/renderer');
 const CollabLogger = require('../utils/collab-logger');
 
@@ -246,6 +245,10 @@ module.exports = {
     task.instruction = instruction;
     // 内部调用（讨论各阶段）禁用工具循环，防止递归调用工具导致流式气泡嵌套乱序
     task.disableTools = true;
+    // 动态上下文：触发者标记为协作流程（runtime 通用增量上下文自动组装）
+    task.trigger_from = '协作流程';
+    task.trigger_content = instruction;
+    task.mention_desc = '';
     try {
       const result = await this._streamedExecute(task, taskId, agentName, []);
       if (result.status !== 'success') {
@@ -255,6 +258,9 @@ module.exports = {
     } finally {
       task.instruction = savedInstruction;
       task.disableTools = savedDisableTools;
+      delete task.trigger_from;
+      delete task.trigger_content;
+      delete task.mention_desc;
     }
   }
 
@@ -554,25 +560,21 @@ module.exports = {
       ? meta.chain
       : (fromAgent ? ['用户', fromAgent] : ['用户']);
 
-    // ===== 增量上下文（agent → agent 转交时）=====
+    // ===== 增量上下文（agent → agent 转交时显式组装，携带接力链与乒乓计数）=====
+    // 用户直呼等其余场景由 runtime 通用入口自动组装（见 runtime.executeTaskWithAgent）。
     let incrementalContext = '';
     let deliveredUpTo = 0;
     if (fromAgent && meta && meta.triggerContent) {
-      const deliveryCursor = cursorStore.get(taskId, agentName).delivery_cursor || 0;
-      const unread = messageLog.unread(taskId, { cursorSeq: deliveryCursor, agent: agentName });
-      deliveredUpTo = unread.length ? unread[unread.length - 1].seq : deliveryCursor;
       const pairCount = pairKey ? (turn.pingpong[pairKey] || 0) : 0;
       try {
-        const ctxResult = assembleIncrementalContext({
-          targetAgent: agentName,
+        const ctxResult = buildIncrementalContext({
+          task,
+          agentName,
+          agentRuntime,
           fromAgent,
-          triggerModel: this._agentModelLabel(fromAgent),
           triggerContent: meta.triggerContent,
           mentionDesc: meta.mentionDesc,
-          unread,
-          roster: this._buildRosterSnapshot(),
-          activeTasks: this._buildActiveTasksSnapshot(),
-          recentFiles: this._getRecentFiles(turn),
+          chain,
           turn: {
             summonSeq,
             hop,
@@ -583,9 +585,9 @@ module.exports = {
             blockThreshold: turn.blockThreshold,
             modeLabel: (config.mention && config.mention.mode === 'serial') ? '串行接力模式' : '并行接力模式',
           },
-          maxTokens: task.max_tokens,
         });
         incrementalContext = ctxResult.prompt;
+        deliveredUpTo = ctxResult.deliveredUpTo;
         CollabLogger.log('delivery', {
           task_id: taskId, trace_id: task.trace_id || '',
           from: fromAgent, to: agentName,
@@ -606,7 +608,14 @@ module.exports = {
     // 并行分发时不能修改共享 task.instruction（会互相覆盖），用浅拷贝隔离。
     // 执行许可提示由 runtime 统一注入（delta/full 两种模式都能生效）。
     const taskForAgent = Object.assign({}, task, { instruction });
-    if (incrementalContext) taskForAgent.incremental_context = incrementalContext;
+    if (incrementalContext) {
+      taskForAgent.incremental_context = incrementalContext;
+    } else if (!fromAgent) {
+      // 用户直呼：交给 runtime 通用增量上下文接管（触发者=用户，触发原文=本轮指令）
+      taskForAgent.trigger_from = '用户';
+      taskForAgent.trigger_content = instruction;
+      taskForAgent.mention_desc = instruction;
+    }
 
     let result;
     try {
@@ -669,53 +678,6 @@ module.exports = {
       .filter(Boolean);
 
     return { ok: true, content: content + (childContents.length ? '\n\n' + childContents.join('\n\n') : '') };
-  },
-
-  /** 队友花名册快照（动态上下文导航用） */
-  _buildRosterSnapshot() {
-    try {
-      const agents = enabledAgents();
-      return agents.map(a => {
-        const st = agentRuntime.getAgentState ? agentRuntime.getAgentState(a.name) : null;
-        return {
-          name: a.name,
-          model_cli: a.model_cli,
-          strengths: a.strengths || [],
-          busy: !!(st && st.busy),
-          online: st ? !!st.online : true,
-        };
-      });
-    } catch (e) { return []; }
-  },
-
-  /** 活跃任务快照（导航头用：调度器中未完成的协作 trace） */
-  _buildActiveTasksSnapshot() {
-    try {
-      const scheduler = require('../engine/scheduler');
-      const pending = (scheduler && scheduler._pending) ? Array.from(scheduler._pending.keys()) : [];
-      return pending.slice(0, 5).map(tid => `协作 trace ${tid}`);
-    } catch (e) { return []; }
-  },
-
-  /** 最近修改文件（每轮只采样一次 git status） */
-  _getRecentFiles(turn) {
-    if (turn && Array.isArray(turn.recentFiles)) return turn.recentFiles;
-    let files = [];
-    try {
-      const { execSync } = require('child_process');
-      const out = execSync('git status --short', { cwd: ROOT, timeout: 2000, encoding: 'utf8' });
-      files = String(out).split('\n').map(l => l.trim()).filter(Boolean).slice(0, 10);
-    } catch (e) { files = []; }
-    if (turn) turn.recentFiles = files;
-    return files;
-  },
-
-  /** agent → 模型展示名（来源标识用） */
-  _agentModelLabel(agentName) {
-    try {
-      const profile = renderer.agentProfile(agentName);
-      return renderer.modelLabel(profile.model_cli || '');
-    } catch (e) { return ''; }
   }
 ,
   /**

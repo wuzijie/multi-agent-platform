@@ -168,6 +168,9 @@ module.exports = {
         instruction: planPrompt,
         input_files: [],
         disableTools: true, // 规划调用不启用工具循环（规划本身就是产出）
+        // 动态上下文：规划调用由调度器触发
+        trigger_from: '调度器',
+        trigger_content: planPrompt,
       }, [], '克劳德', (chunk) => {
         eventBus.emit('agent:stream:chunk', { task_id: externalTaskId, agent: '克劳德', chunk, stream_id: streamId });
       });

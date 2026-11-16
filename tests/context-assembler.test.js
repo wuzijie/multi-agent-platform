@@ -16,12 +16,15 @@ const assert = require('assert');
 const fs = require('fs');
 const path = require('path');
 const { assembleIncrementalContext, trimOldest, truncateTrigger, deliveryConfig } = require('../src/prompt/context-assembler');
+const { buildIncrementalContext } = require('../src/prompt/incremental');
 const messageLog = require('../src/messaging/message-log');
 const cursorStore = require('../src/messaging/cursor-store');
 
 const ROOT = path.resolve(__dirname, '..');
 const TASK_ID = `test_ctx_${Date.now()}`;
+const TASK_ID_UNIVERSAL = `${TASK_ID}_u`;
 const TASK_DIR = path.join(ROOT, 'tasks', TASK_ID);
+const TASK_DIR_UNIVERSAL = path.join(ROOT, 'tasks', TASK_ID_UNIVERSAL);
 
 function msg(seq, role, agent, content, extra = {}) {
   return Object.assign({ seq, ts: new Date().toISOString(), role, agent, kind: 'chat', content }, extra);
@@ -57,6 +60,7 @@ function test(name, fn) {
 
 function cleanup() {
   try { fs.rmSync(TASK_DIR, { recursive: true, force: true }); } catch (e) { /* 忽略 */ }
+  try { fs.rmSync(TASK_DIR_UNIVERSAL, { recursive: true, force: true }); } catch (e) { /* 忽略 */ }
 }
 
 console.log('\n【动态上下文组装】');
@@ -158,6 +162,23 @@ test('messageLog.unread：whisper 对名单内 agent 可见', () => {
   messageLog.append(TASK_ID, { role: 'user', agent: '钱文', kind: 'whisper', visible_to: ['迪普斯克'], content: '给迪普斯克的私语' });
   const list = messageLog.unread(TASK_ID, { cursorSeq: 3, agent: '迪普斯克' });
   assert.ok(list.some(m => m.content === '给迪普斯克的私语'), 'whisper 名单内应可见');
+});
+
+test('buildIncrementalContext：通用入口自动取会话未读并组装六段', () => {
+  fs.mkdirSync(TASK_DIR_UNIVERSAL, { recursive: true });
+  messageLog.append(TASK_ID_UNIVERSAL, { role: 'user', content: '帮我分析日志方案' });
+  messageLog.append(TASK_ID_UNIVERSAL, { role: 'assistant', agent: '克劳德', content: '方案如下……' });
+  const r = buildIncrementalContext({
+    task: { task_id: TASK_ID_UNIVERSAL },
+    agentName: '迪普斯克',
+    fromAgent: '用户',
+    triggerContent: '帮我分析日志方案',
+  });
+  assert.ok(r.prompt.includes('[来源标识]'), '含来源标识');
+  assert.ok(r.prompt.includes('[未读历史]'), '含未读历史');
+  assert.ok(r.prompt.includes('[#1 用户]'), '自动取到会话未读');
+  assert.strictEqual(r.ctxTaskId, TASK_ID_UNIVERSAL, '会话键取 task_id');
+  assert.strictEqual(r.deliveredUpTo, 2, 'deliveredUpTo 应为最后一条未读 seq');
 });
 
 cleanup();

@@ -201,6 +201,7 @@ function formatRoster(roster) {
  * @param {Array}  [p.activeTasks]    活跃任务摘要（字符串数组）
  * @param {Array}  [p.recentFiles]    最近修改文件（字符串数组）
  * @param {Object} [p.turn]           { summonSeq, hop, chain, pairCount, warn, modeLabel }
+ * @param {string} [p.extraHistory]   转录历史（history_segments 拼串；增量上下文替换历史区时并入）
  * @param {number} [p.maxTokens]      预留输出 tokens
  * @returns {{sections: Array<{title:string,text:string}>, prompt: string, stats: Object}}
  */
@@ -296,7 +297,16 @@ function assembleIncrementalContext(p = {}) {
     text: unreadText,
   };
 
-  const sections = [sourceSec, modeSec, navSec, triggerSec, unreadSec, systemSec];
+  // 转录历史（history_segments）：增量上下文替换了运行时默认的历史区，
+  // 若调用方另有转录历史（讨论/DAG 等），并入未读历史之后，避免上下文断裂。
+  const extraSec = (p.extraHistory && String(p.extraHistory).trim()) ? {
+    title: '转录历史',
+    text: String(p.extraHistory).trim(),
+  } : null;
+
+  const sections = [sourceSec, modeSec, navSec, triggerSec, unreadSec];
+  if (extraSec) sections.push(extraSec);
+  sections.push(systemSec);
   if (warnSec) sections.push(warnSec);
 
   const prompt = renderer.renderContextSections(sections);

@@ -116,6 +116,9 @@ module.exports = {
       context: `任务ID: ${traceId}\n子任务: ${sub.sub_task_id}\n类型: ${sub.type}\n原始请求: ${userQuery}\n参与模型: ${agentNames.join('、')}${upstreamContext}${prevContext}`,
       instruction: sub.input || '',
       input_files: [],
+      // 动态上下文：DAG 子任务的触发者是调度器（runtime 通用增量上下文自动组装）
+      trigger_from: '调度器',
+      trigger_content: sub.input || '',
     };
 
     // 协作日志：记录下发（模型分配 + 注入的上游模型输出 = 模型间消息传递）

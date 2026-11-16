@@ -13,6 +13,7 @@ const { buildSegments, truncate, formatEntry } = require('../prompt/history');
 const { historyConfig } = require('../prompt/config');
 const messageLog = require('../messaging/message-log');
 const cursorStore = require('../messaging/cursor-store');
+const { buildIncrementalContext } = require('../prompt/incremental');
 const capabilities = require('../adapters/contract/capabilities');
 const { STATUS, ERROR_CODE } = require('../adapters/contract/enums');
 const { newSessionId } = require('../adapters/contract/session');
@@ -221,13 +222,34 @@ class AgentRuntime {
     sessionManager.get(task.task_id) && sessionManager.get(task.task_id).occupyAgent('克劳德');
 
     try {
+      // 动态上下文（通用）：所有场景默认注入六段式增量上下文；调用方显式提供时以其为准，
+      // 后台维护类调用可用 task.skip_incremental_context 关闭。
+      let autoCtx = null;
+      if (!task.skip_incremental_context && !(task.incremental_context && String(task.incremental_context).trim())) {
+        try {
+          autoCtx = buildIncrementalContext({
+            task,
+            agentName: '克劳德',
+            agentRuntime: this,
+            fromAgent: task.trigger_from || '用户',
+            triggerContent: task.trigger_content || task.instruction || task.description || '',
+            mentionDesc: task.mention_desc || '',
+            chain: task.trigger_chain || null,
+            turn: task.incremental_turn || null,
+          });
+        } catch (e) {
+          autoCtx = null;
+          console.warn('[AgentRuntime] 增量上下文组装失败（降级为普通 prompt）:', e.message);
+        }
+      }
+
       const input = {
         task_id: task.task_id,
         external_task_id: task.external_task_id || task.task_id,
         trace_id: task.trace_id || '',
         role: 'executor',
-        context: `任务名称: ${task.name}\n任务描述: ${task.description || '无'}\n难度等级: ${task.difficulty || '未知'}\n任务类型: ${task.task_type || 'development'}`,
-        instruction: this._buildInstruction(task, conversationHistory),
+        context: autoCtx ? '' : `任务名称: ${task.name}\n任务描述: ${task.description || '无'}\n难度等级: ${task.difficulty || '未知'}\n任务类型: ${task.task_type || 'development'}`,
+        instruction: autoCtx ? autoCtx.prompt : this._buildInstruction(task, conversationHistory),
         input_files: task.input_files || [],
         max_tokens: task.max_tokens || 4096,
         // 请求链路追踪元信息
@@ -237,11 +259,16 @@ class AgentRuntime {
       };
 
       // 记忆上下文（Session + Auto Memory）注入
-      if (task.memory_context && typeof task.memory_context === 'string' && task.memory_context.trim()) {
+      if (!autoCtx && task.memory_context && typeof task.memory_context === 'string' && task.memory_context.trim()) {
         input.context = `[系统记忆上下文]\n${task.memory_context.trim()}\n\n${input.context}`;
       }
 
       const result = await agent.adapter.execute(input, onChunk);
+
+      // 投递成功：推进投递游标（失败/取消不推进）
+      if (autoCtx && result && result.status === 'success' && autoCtx.deliveredUpTo > 0) {
+        try { cursorStore.advanceDeliveryCursor(autoCtx.ctxTaskId, '克劳德', autoCtx.deliveredUpTo); } catch (e) { /* 游标失败不影响主流程 */ }
+      }
       return result;
     } finally {
       this._endCall(agent, callId);
@@ -345,6 +372,34 @@ class AgentRuntime {
       : buildSegments(history, cfg);
     let historyBlock = historySegments.join('\n\n');
 
+    // ===== 动态上下文（通用）：所有场景默认注入六段式增量上下文 =====
+    // 调用方显式提供 task.incremental_context 时以其为准（如聊天 agent 转交链，
+    // 携带接力链与乒乓计数）；其余场景（用户直呼 / 讨论 / DAG / 规划）在此自动组装。
+    // 转录历史（history_segments）并入组装结果，避免替换历史区后上下文断裂。
+    // 后台维护类调用可用 task.skip_incremental_context 关闭。
+    let autoIncremental = null;
+    const explicitIncremental = (task.incremental_context && String(task.incremental_context).trim())
+      ? String(task.incremental_context).trim()
+      : '';
+    if (!explicitIncremental && !task.skip_incremental_context) {
+      try {
+        autoIncremental = buildIncrementalContext({
+          task,
+          agentName,
+          agentRuntime: this,
+          fromAgent: task.trigger_from || (chatMode ? '用户' : '调度器'),
+          triggerContent: task.trigger_content || task.instruction || task.description || '',
+          mentionDesc: task.mention_desc || '',
+          chain: task.trigger_chain || null,
+          turn: task.incremental_turn || null,
+          extraHistory: historyBlock || '',
+        });
+      } catch (e) {
+        autoIncremental = null;
+        console.warn('[AgentRuntime] 增量上下文组装失败（降级为普通 prompt）:', e.message);
+      }
+    }
+
     // ===== resume / 游标：delta 模式只发“游标之后的新消息” =====
     const cliName = agent.model_cli || null;
     // 未声明 model_cli 的内部/测试 agent：不做 resume，走 full 模式，不做准入拦截
@@ -413,11 +468,11 @@ class AgentRuntime {
       : '[执行许可] 用户尚未授权：本轮只做分析与方案，禁止修改/创建文件、禁止执行有副作用的命令。';
     currentInstruction = `${permissionNotice}\n\n${currentInstruction}`;
 
-    // 动态上下文：agent 间 @ 转交时，由 execution 层组装的增量上下文（六段式）
-    // 替换默认的"历史 + 本轮"拼接——增量上下文已包含触发原文、未读历史与系统提示，
-    // 附执行许可后直接作为本轮指令发送。
-    if (chatMode && task.incremental_context && String(task.incremental_context).trim()) {
-      currentInstruction = `${permissionNotice}\n\n${String(task.incremental_context).trim()}`;
+    // 动态上下文（通用）：显式组装（agent 转交链）或自动组装（其余全部场景）命中时，
+    // 增量上下文（已含触发原文/未读历史/系统提示）附执行许可后直接作为本轮指令。
+    const incrementalPrompt = explicitIncremental || (autoIncremental && autoIncremental.prompt) || '';
+    if (incrementalPrompt) {
+      currentInstruction = `${permissionNotice}\n\n${incrementalPrompt}`;
     }
 
     // delta 模式下稳定上下文已在 CLI session 内，不再重复注入
@@ -440,6 +495,10 @@ class AgentRuntime {
       // 游标推进：只在本轮成功时前移，失败/取消保持原游标，下次重新发送
       if (result && result.status === STATUS.SUCCESS && cursorState) {
         cursorStore.advanceCursor(task.task_id, agentName, promptMaxSeq);
+      }
+      // 投递游标（通用增量上下文）：仅成功时推进，失败/取消下次重发未读
+      if (result && result.status === STATUS.SUCCESS && autoIncremental && autoIncremental.deliveredUpTo > 0) {
+        try { cursorStore.advanceDeliveryCursor(autoIncremental.ctxTaskId, agentName, autoIncremental.deliveredUpTo); } catch (e) { /* 游标失败不影响主流程 */ }
       }
       return result;
     };

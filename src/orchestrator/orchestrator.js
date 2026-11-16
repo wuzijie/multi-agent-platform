@@ -518,6 +518,7 @@ class TaskOrchestrator {
             instruction: prompt,
             input_files: [],
             disableTools: true,
+            skip_incremental_context: true, // 后台维护调用：不注入对话增量上下文
           }, [], agentName || '克劳德'),
           new Promise((_, reject) => setTimeout(() => reject(new Error('记忆摘要超时')), 60000)),
         ]);
@@ -567,6 +568,7 @@ class TaskOrchestrator {
               instruction: prompt,
               input_files: [],
               disableTools: true,
+              skip_incremental_context: true, // 后台维护调用：不注入对话增量上下文
             }, [], agentName || '克劳德'),
             new Promise((_, reject) => setTimeout(() => reject(new Error('记忆提炼超时')), 60000)),
           ]);

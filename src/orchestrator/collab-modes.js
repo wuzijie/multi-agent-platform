@@ -308,6 +308,9 @@ module.exports = {
           instruction,
           input_files: [],
           disableTools: false, // 允许 fetch_full
+          // 动态上下文：讨论轮次由协作流程触发
+          trigger_from: '协作流程',
+          trigger_content: instruction,
         }, [], t.executor, (chunk) => {
           eventBus.emit('agent:stream:chunk', { task_id: taskId, agent: t.executor, chunk, stream_id: streamId });
         });
