@@ -40,6 +40,7 @@ module.exports = {
       console.warn(`[Scheduler] ${reason}`);
       CollabLogger.log('sub_fail', {
         trace_id: traceId, sub_task_id: sub.sub_task_id,
+        task_id: blackboard.hget(`blackboard:task:${traceId}:main`, 'task_id') || traceId,
         error: reason, fatal: fatalAgents(),
       });
       const subKey = `blackboard:task:${traceId}:sub:${sub.sub_task_id}`;
@@ -118,7 +119,7 @@ module.exports = {
     };
 
     // 协作日志：记录下发（模型分配 + 注入的上游模型输出 = 模型间消息传递）
-    CollabLogger.logDispatch(traceId, sub, agentNames, upstreamSummary);
+    CollabLogger.logDispatch(traceId, sub, agentNames, upstreamSummary, externalTaskId);
 
     // 超时监控
     const timer = setTimeout(() => {
@@ -151,12 +152,12 @@ module.exports = {
       if (r.status === 'fulfilled' && r.value && r.value.content && !(r.value.status === 'failed' || r.value.error)) {
         okResults.push({ agent: n, content: r.value.content, duration: r.value.duration_ms || 0 });
         outputsMap[agentId] = r.value.content;
-        CollabLogger.logAgentResult(traceId, sub.sub_task_id, n, true, r.value.content, r.value.duration_ms || 0);
+        CollabLogger.logAgentResult(traceId, sub.sub_task_id, n, true, r.value.content, r.value.duration_ms || 0, externalTaskId);
       } else {
         const err = (r.reason && r.reason.message) || (r.value && r.value.error && r.value.error.message) || 'Agent 执行失败';
         failResults.push({ agent: n, error: err });
         outputsMap[agentId] = { error: err };
-        CollabLogger.logAgentResult(traceId, sub.sub_task_id, n, false, err, (r.value && r.value.duration_ms) || 0);
+        CollabLogger.logAgentResult(traceId, sub.sub_task_id, n, false, err, (r.value && r.value.duration_ms) || 0, externalTaskId);
         // 致命错误（402/鉴权/Invalid role 等）：熔断该模型，后续派发自动跳过
         if (isFatalError(err)) markAgentFatal(n);
       }
@@ -248,6 +249,9 @@ module.exports = {
     if (timer) { clearTimeout(timer); this._timers.delete(subId); }
     blackboard.del(`blackboard:running:${subId}`);
 
+    // 会话 ID（对话级 task_id）：协作日志按会话文件收录
+    const externalTaskId = blackboard.hget(`blackboard:task:${traceId}:main`, 'task_id') || traceId;
+
     // 释放该子任务占用的所有 Agent
     this._releaseAgents(sub);
 
@@ -270,7 +274,7 @@ module.exports = {
         blackboard.hset(subKey, 'status', SUB_STATUS.FAILED);
         blackboard.hset(subKey, 'error_msg', `${errorMsg}（致命错误，已跳过重试）`);
         blackboard.hset(subKey, 'end_time', Date.now());
-        CollabLogger.logSubFail(traceId, subId, `${errorMsg} [FATAL no-retry]`);
+        CollabLogger.logSubFail(traceId, subId, `${errorMsg} [FATAL no-retry]`, externalTaskId);
         this._emitSubUpdate(traceId, sub, SUB_STATUS.FAILED, agentLabel);
         this._dispatchReady(traceId);
         return;
@@ -282,7 +286,7 @@ module.exports = {
         blackboard.hset(subKey, 'error_msg', errorMsg);
         this._emitSubUpdate(traceId, sub, SUB_STATUS.RETRYING, agentLabel);
         const backoff = BACKOFF_MS[Math.min(retryCount, BACKOFF_MS.length - 1)] || 1000;
-        CollabLogger.logRetry(traceId, subId, retryCount, maxRetry, backoff, errorMsg);
+        CollabLogger.logRetry(traceId, subId, retryCount, maxRetry, backoff, errorMsg, externalTaskId);
         const retryMsg = buildMessage({
           traceId, subTaskId: subId,
           msgType: EVENTS.SUB_TASK_RETRY,
@@ -300,7 +304,7 @@ module.exports = {
       blackboard.hset(subKey, 'status', SUB_STATUS.FAILED);
       blackboard.hset(subKey, 'error_msg', errorMsg);
       blackboard.hset(subKey, 'end_time', Date.now());
-      CollabLogger.logSubFail(traceId, subId, errorMsg);
+      CollabLogger.logSubFail(traceId, subId, errorMsg, externalTaskId);
       this._emitSubUpdate(traceId, sub, SUB_STATUS.FAILED, agentLabel);
     }
 

@@ -20,6 +20,7 @@ const { parseMentions } = require('../messaging/mention');
 const renderer = require('../prompt/renderer');
 const { isAgentFatal } = require('../utils/fatal-errors');
 const collabModeRegistry = require('./collab-mode-registry');
+const LogStore = require('../utils/log-store');
 
 const ROOT = path.resolve(__dirname, '..', '..');
 
@@ -813,6 +814,8 @@ class TaskOrchestrator {
         if (indexEntry) {
           const dir = path.join(ROOT, 'tasks', taskId);
           if (fs.existsSync(dir)) fs.rmSync(dir, { recursive: true, force: true });
+          // 连带删除该会话的日志文件（logs/<日期>/<task_id>.log）
+          LogStore.deleteSessionLogs(taskId);
           deleted.push({ task_id: taskId, name: indexEntry.name || '未命名对话', residual: true });
           eventBus.emit('task:deleted', { task_id: taskId });
           continue;
@@ -834,6 +837,8 @@ class TaskOrchestrator {
       if (fs.existsSync(taskDir)) {
         fs.rmSync(taskDir, { recursive: true, force: true });
       }
+      // 连带删除该会话的日志文件（logs/<日期>/<task_id>.log）
+      LogStore.deleteSessionLogs(taskId);
 
       deleted.push({ task_id: taskId, name: task.name });
       eventBus.emit('task:deleted', { task_id: taskId });
@@ -954,6 +959,9 @@ class TaskOrchestrator {
         agent,
         kind: opts.kind || 'chat',
         content: String(content == null ? '' : content),
+        visible_to: opts.visible_to || null,
+        turn_id: opts.turn_id || null,
+        from_agent: opts.from_agent || null,
       });
     } catch (e) { /* 日志写入失败不影响对话展示 */ }
   }

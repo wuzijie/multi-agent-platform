@@ -6,10 +6,16 @@ mention:
   model_max: 2
   # 两个 @ 的执行方式：parallel（并行回答同一问题）| serial
   mode: parallel
-  # 转交链最大跳数
-  max_hops: 3
+  # 转交链最大跳数（硬上限兜底；宽于乒乓阈值，允许同一对 agent 来回若干次）
+  max_hops: 6
   # 单轮最多 spawn 的 CLI 次数（防爆炸）
   max_spawns_per_turn: 6
+  # 同一 agent 单轮最多被召唤次数（超过则阻断，与乒乓计数互补）
+  summon_max_per_agent: 4
+  # 乒乓治理：同一对 agent 本轮来回次数达到阈值时警告/阻断
+  pingpong:
+    warn_threshold: 2   # ≥2 次：在 prompt 注入乒乓警告，要求收敛
+    block_threshold: 4  # ≥4 次：阻断该 @ 边，不再拉起模型
   # 模型名别名（除中文名外，允许 @claude / @kimi / @deepseek / @qwen）
   aliases:
     克劳德: ["claude"]

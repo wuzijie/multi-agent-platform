@@ -11,6 +11,11 @@ const transcript = require('../prompt/transcript');
 const config = require('../utils/config');
 const { enabledAgentNames, enabledAgents } = require('../utils/agent-list');
 const { parseMentions } = require('../messaging/mention');
+const messageLog = require('../messaging/message-log');
+const cursorStore = require('../messaging/cursor-store');
+const { assembleIncrementalContext } = require('../prompt/context-assembler');
+const renderer = require('../prompt/renderer');
+const CollabLogger = require('../utils/collab-logger');
 
 const ROOT = path.resolve(__dirname, '..', '..');
 
@@ -422,14 +427,30 @@ module.exports = {
   async _executeTurnWithJobs(task, taskId, displayMessage, jobs) {
     const cfg = config.mention || {};
     const maxSpawns = Number(cfg.max_spawns_per_turn) || 6;
-    const maxHops = Number(cfg.max_hops) || 3;
+    const maxHops = Number(cfg.max_hops) || 6;
+    const ppCfg = cfg.pingpong || {};
 
-    this._appendConversation(taskId, 'user', displayMessage, { target: jobs.map(j => j.agent).join('、') });
+    // 本轮上下文：召唤序号 / 每个 agent 的召唤次数 / 乒乓计数（pairKey → 往返次数）
+    const turnCtx = {
+      turnId: 'turn_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 8),
+      summonSeq: 0,
+      summonCount: {},
+      pingpong: {},
+      warnThreshold: Number(ppCfg.warn_threshold) || 2,
+      blockThreshold: Number(ppCfg.block_threshold) || 4,
+      summonMaxPerAgent: Number(cfg.summon_max_per_agent) || 4,
+      recentFiles: null, // 每轮只采样一次
+    };
+
+    this._appendConversation(taskId, 'user', displayMessage, {
+      target: jobs.map(j => j.agent).join('、'),
+      turn_id: turnCtx.turnId,
+    });
 
     const budget = { left: maxSpawns };
-    const visited = new Set(jobs.map(j => j.agent));
+    // 不再使用 visited 集合：同一 agent 可被多次召唤，由乒乓计数 + 召唤上限治理
     const runOne = (job, hop) => this._runAgentWithHandoff(
-      task, taskId, job.agent, job.instruction, hop, visited, budget, maxHops
+      task, taskId, job.agent, job.instruction, hop, budget, maxHops, turnCtx, null
     );
 
     const settled = await Promise.allSettled(jobs.map(j => runOne(j, 0)));
@@ -462,7 +483,7 @@ module.exports = {
 
     if (okResults.length < results.length) {
       const failed = results.filter(r => r && !r.ok && r.error).map(r => r.error);
-      this._appendConversation(taskId, 'system', `[部分失败] ${failed.join('; ')}`);
+      if (failed.length) this._appendConversation(taskId, 'system', `[部分失败] ${failed.join('; ')}`);
     }
 
     return {
@@ -473,15 +494,120 @@ module.exports = {
 
   /**
    * 单个 agent 的执行 + 行首 @ 转交链（最多 @ 2 个，并行扇出）。
+   *
+   * 动态上下文（agent → agent 转交时）：
+   *   - assembleIncrementalContext 组装六段式增量上下文（来源/模式/导航/触发原文/未读/系统提示）
+   *   - 乒乓治理：同一对 agent 本轮来回 ≥ warn_threshold 注入警告，≥ block_threshold 阻断
+   *   - delivery_cursor：成功后推进，失败/阻断不推进
+   *
+   * @param {Object} turnCtx 本轮上下文（召唤计数/乒乓计数）
+   * @param {Object|null} meta { fromAgent, triggerContent, mentionDesc, chain }
    */
-  async _runAgentWithHandoff(task, taskId, agentName, instruction, hop, visited, budget, maxHops) {
+  async _runAgentWithHandoff(task, taskId, agentName, instruction, hop, budget, maxHops, turnCtx, meta) {
     if (this._isCancelled(taskId)) return { ok: false, stopped: true };
     if (budget.left <= 0) return { ok: false, error: `已达到单轮 spawn 上限（${agentName}）` };
+
+    const turn = turnCtx || {
+      turnId: 'turn_adhoc', summonSeq: 0, summonCount: {}, pingpong: {},
+      warnThreshold: 2, blockThreshold: 4, summonMaxPerAgent: 4, recentFiles: null,
+    };
+    const fromAgent = (meta && meta.fromAgent) || null;
+    const pairKey = fromAgent ? [fromAgent, agentName].sort().join('|') : null;
+
+    // ===== 乒乓治理：同一对 agent 的往返计数（仅 agent → agent 转交计入）=====
+    if (pairKey) {
+      const nextPair = (turn.pingpong[pairKey] || 0) + 1;
+      if (nextPair >= turn.blockThreshold) {
+        turn.pingpong[pairKey] = nextPair;
+        const blockText = renderer.render('context/pingpong_block', {
+          from_agent: fromAgent,
+          target_agent: agentName,
+          pair_count: nextPair,
+          block_threshold: turn.blockThreshold,
+        });
+        this._appendConversation(taskId, 'system', blockText.trim());
+        CollabLogger.log('pingpong_block', {
+          task_id: taskId, trace_id: task.trace_id || '',
+          from: fromAgent, to: agentName,
+          pair_count: nextPair, threshold: turn.blockThreshold,
+        });
+        return { ok: false, blocked: true };
+      }
+      turn.pingpong[pairKey] = nextPair;
+    }
+
+    // ===== 每个 agent 单轮召唤上限（与乒乓计数互补，防稀疏星形爆炸）=====
+    const nextSummonCount = (turn.summonCount[agentName] || 0) + 1;
+    if (nextSummonCount > turn.summonMaxPerAgent) {
+      this._appendConversation(taskId, 'system',
+        `[召唤上限] ${agentName} 本轮已被召唤 ${nextSummonCount - 1} 次（上限 ${turn.summonMaxPerAgent}），已阻断本次转交`);
+      return { ok: false, blocked: true };
+    }
+    turn.summonCount[agentName] = nextSummonCount;
+    turn.summonSeq += 1;
+    const summonSeq = turn.summonSeq;
+
     budget.left -= 1;
+
+    // 接力链（用户 → … → 触发者），供导航头与后续分支使用
+    const chain = (meta && Array.isArray(meta.chain) && meta.chain.length)
+      ? meta.chain
+      : (fromAgent ? ['用户', fromAgent] : ['用户']);
+
+    // ===== 增量上下文（agent → agent 转交时）=====
+    let incrementalContext = '';
+    let deliveredUpTo = 0;
+    if (fromAgent && meta && meta.triggerContent) {
+      const deliveryCursor = cursorStore.get(taskId, agentName).delivery_cursor || 0;
+      const unread = messageLog.unread(taskId, { cursorSeq: deliveryCursor, agent: agentName });
+      deliveredUpTo = unread.length ? unread[unread.length - 1].seq : deliveryCursor;
+      const pairCount = pairKey ? (turn.pingpong[pairKey] || 0) : 0;
+      try {
+        const ctxResult = assembleIncrementalContext({
+          targetAgent: agentName,
+          fromAgent,
+          triggerModel: this._agentModelLabel(fromAgent),
+          triggerContent: meta.triggerContent,
+          mentionDesc: meta.mentionDesc,
+          unread,
+          roster: this._buildRosterSnapshot(),
+          activeTasks: this._buildActiveTasksSnapshot(),
+          recentFiles: this._getRecentFiles(turn),
+          turn: {
+            summonSeq,
+            hop,
+            chain,
+            pairCount,
+            warn: pairCount >= turn.warnThreshold,
+            warnThreshold: turn.warnThreshold,
+            blockThreshold: turn.blockThreshold,
+            modeLabel: (config.mention && config.mention.mode === 'serial') ? '串行接力模式' : '并行接力模式',
+          },
+          maxTokens: task.max_tokens,
+        });
+        incrementalContext = ctxResult.prompt;
+        CollabLogger.log('delivery', {
+          task_id: taskId, trace_id: task.trace_id || '',
+          from: fromAgent, to: agentName,
+          path: ctxResult.stats.path,
+          unread_count: ctxResult.stats.unread_count,
+          dropped: ctxResult.stats.dropped_msgs,
+          pair_count: pairCount,
+          summon_seq: summonSeq,
+          warn: ctxResult.stats.warn,
+        });
+      } catch (e) {
+        // 组装失败降级：不带增量上下文继续（不阻塞转交）
+        incrementalContext = '';
+        console.error(`[Execution] 增量上下文组装失败（${agentName}）:`, e.message);
+      }
+    }
 
     // 并行分发时不能修改共享 task.instruction（会互相覆盖），用浅拷贝隔离。
     // 执行许可提示由 runtime 统一注入（delta/full 两种模式都能生效）。
     const taskForAgent = Object.assign({}, task, { instruction });
+    if (incrementalContext) taskForAgent.incremental_context = incrementalContext;
+
     let result;
     try {
       result = await this._streamedExecute(taskForAgent, taskId, agentName, []);
@@ -495,12 +621,19 @@ module.exports = {
       return { ok: false, error: `${agentName}: ${(result.error && result.error.message) || '执行失败'}` };
     }
 
+    // 投递成功：推进该 agent 的投递游标（失败/阻断不推进）
+    if (incrementalContext && deliveredUpTo > 0) {
+      try { cursorStore.advanceDeliveryCursor(taskId, agentName, deliveredUpTo); } catch (e) { /* 游标失败不影响主流程 */ }
+    }
+
     const content = result.content || '';
     // 落库时记录 agent，游标才能“排除自身输出”
     // reasoning 单独传入，只进 conversation.md（前端折叠展示），不进 messageLog
     this._appendConversation(taskId, 'assistant', `**${agentName}**\n\n${content}`, {
       agent: agentName,
       reasoning: result.reasoning || '',
+      turn_id: turn.turnId,
+      from_agent: fromAgent || undefined,
     });
 
     // 解析模型输出中的行首 @（最多 2 个，不能 @ 自己，必须带任务描述）
@@ -510,17 +643,23 @@ module.exports = {
       return { ok: true, content };
     }
 
-    // 并行扇出到被 @ 的 agent（每个分支独立 visited，共享 budget 防爆炸）
+    // 并行扇出到被 @ 的 agent（共享 budget / 乒乓计数防爆炸；无 visited 限制）
     const targets = (parsed && parsed.mentions) || [];
+    const nextChain = (Array.isArray(chain) && chain.length ? chain : ['用户'])
+      .filter(n => n !== agentName)
+      .concat(agentName);
     const branches = targets
-      .filter(m => hop < maxHops && !visited.has(m.agent) && budget.left > 0)
+      .filter(m => hop < maxHops && budget.left > 0)
       .map(m => {
-        const branchVisited = new Set(visited);
-        branchVisited.add(m.agent);
         this._appendConversation(taskId, 'system', `[转交] ${agentName} → ${m.agent}`);
         return this._runAgentWithHandoff(
           task, taskId, m.agent, m.description || '请基于以上对话继续处理。',
-          hop + 1, branchVisited, budget, maxHops
+          hop + 1, budget, maxHops, turn, {
+            fromAgent: agentName,
+            triggerContent: content,
+            mentionDesc: m.description || '',
+            chain: nextChain,
+          }
         );
       });
 
@@ -530,6 +669,53 @@ module.exports = {
       .filter(Boolean);
 
     return { ok: true, content: content + (childContents.length ? '\n\n' + childContents.join('\n\n') : '') };
+  },
+
+  /** 队友花名册快照（动态上下文导航用） */
+  _buildRosterSnapshot() {
+    try {
+      const agents = enabledAgents();
+      return agents.map(a => {
+        const st = agentRuntime.getAgentState ? agentRuntime.getAgentState(a.name) : null;
+        return {
+          name: a.name,
+          model_cli: a.model_cli,
+          strengths: a.strengths || [],
+          busy: !!(st && st.busy),
+          online: st ? !!st.online : true,
+        };
+      });
+    } catch (e) { return []; }
+  },
+
+  /** 活跃任务快照（导航头用：调度器中未完成的协作 trace） */
+  _buildActiveTasksSnapshot() {
+    try {
+      const scheduler = require('../engine/scheduler');
+      const pending = (scheduler && scheduler._pending) ? Array.from(scheduler._pending.keys()) : [];
+      return pending.slice(0, 5).map(tid => `协作 trace ${tid}`);
+    } catch (e) { return []; }
+  },
+
+  /** 最近修改文件（每轮只采样一次 git status） */
+  _getRecentFiles(turn) {
+    if (turn && Array.isArray(turn.recentFiles)) return turn.recentFiles;
+    let files = [];
+    try {
+      const { execSync } = require('child_process');
+      const out = execSync('git status --short', { cwd: ROOT, timeout: 2000, encoding: 'utf8' });
+      files = String(out).split('\n').map(l => l.trim()).filter(Boolean).slice(0, 10);
+    } catch (e) { files = []; }
+    if (turn) turn.recentFiles = files;
+    return files;
+  },
+
+  /** agent → 模型展示名（来源标识用） */
+  _agentModelLabel(agentName) {
+    try {
+      const profile = renderer.agentProfile(agentName);
+      return renderer.modelLabel(profile.model_cli || '');
+    } catch (e) { return ''; }
   }
 ,
   /**

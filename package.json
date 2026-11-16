@@ -10,6 +10,8 @@
     "test": "node tests/verification.js",
     "test:prompt": "node tests/prompt-context.test.js",
     "test:template": "node tests/prompt-template.test.js",
+    "test:logs": "node tests/log-store.test.js",
+    "test:context": "node tests/context-assembler.test.js",
     "test:planning": "node tests/task-planning.test.js",
     "test:routing": "node tests/event-driven-routing.test.js",
     "test:cancel": "node tests/cancel-turn.test.js",

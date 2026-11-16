@@ -327,8 +327,9 @@ class Scheduler {
     }
     // 规划期间被用户停止：不再写 DAG / 不派发子任务
     if (this._isTraceCancelled(traceId)) return;
-    // 协作日志：记录 DAG 规划（来源 + 子任务 + 依赖）
-    CollabLogger.logPlan(traceId, planSource, dag, userQuery);
+    // 协作日志：记录 DAG 规划（来源 + 子任务 + 依赖），按会话文件收录
+    const externalTaskId = blackboard.hget(mainKey, 'task_id') || traceId;
+    CollabLogger.logPlan(traceId, planSource, dag, userQuery, externalTaskId);
 
     // 批量写入子任务（Hash），顶层记录 DAG
     this._taskSeq.set(traceId, dag.length);
@@ -358,7 +359,6 @@ class Scheduler {
     }
 
     // 推送任务拆解结果（供 orchestrator 写入对话，展示「先拆解」过程）
-    const externalTaskId = blackboard.hget(mainKey, 'task_id') || traceId;
     this.eventBus.emit('collab:planned', {
       task_id: externalTaskId,
       trace_id: traceId,
@@ -463,18 +463,19 @@ class Scheduler {
 
     const retryCount = (sub.retry_count || 0) + 1;
     const maxRetry = sub.max_retry || 3;
+    const externalTaskId = blackboard.hget(`blackboard:task:${traceId}:main`, 'task_id') || traceId;
     if (retryCount > 3) {
       // 超时3次直接失败（方案 §5.1.2 兜底）
       blackboard.hset(subKey, 'status', SUB_STATUS.FAILED);
       blackboard.hset(subKey, 'error_msg', '任务超时，重试3次仍失败');
       blackboard.hset(subKey, 'end_time', Date.now());
-      CollabLogger.logTimeout(traceId, subId, retryCount, 'fail', '任务超时，重试3次仍失败');
+      CollabLogger.logTimeout(traceId, subId, retryCount, 'fail', '任务超时，重试3次仍失败', externalTaskId);
       this._emitSubUpdate(traceId, sub, SUB_STATUS.FAILED, null);
     } else {
       blackboard.hset(subKey, 'status', SUB_STATUS.TIMEOUT);
       blackboard.hset(subKey, 'retry_count', retryCount);
       blackboard.hset(subKey, 'error_msg', '任务执行超时');
-      CollabLogger.logTimeout(traceId, subId, retryCount, 'retry', '任务执行超时');
+      CollabLogger.logTimeout(traceId, subId, retryCount, 'retry', '任务执行超时', externalTaskId);
       this._emitSubUpdate(traceId, sub, SUB_STATUS.TIMEOUT, null);
       // 重新调度（换 Agent 重试）
       setTimeout(() => {
@@ -491,6 +492,7 @@ class Scheduler {
     const mainKey = `blackboard:task:${traceId}:main`;
     const overall = blackboard.hget(mainKey, 'overall_status');
     if (overall === TASK_STATUS.SUCCESS || overall === TASK_STATUS.FAILED || overall === TASK_STATUS.CANCELLED) return;
+    const externalTaskId = blackboard.hget(mainKey, 'task_id') || traceId;
 
     // 汇总：取 SUMMARY 或最后一个 SUCCESS 子任务输出
     const succeeded = subs.filter(s => s.status === SUB_STATUS.SUCCESS);
@@ -504,7 +506,7 @@ class Scheduler {
       blackboard.hset(mainKey, 'overall_status', TASK_STATUS.FAILED);
       blackboard.hset(mainKey, 'fail_reason', failReason);
       blackboard.hset(mainKey, 'update_time', Date.now());
-      CollabLogger.logAllFinish(traceId, TASK_STATUS.FAILED, '', failReason);
+      CollabLogger.logAllFinish(traceId, TASK_STATUS.FAILED, '', failReason, externalTaskId);
 
       const finalMsg = buildMessage({
         traceId,
@@ -527,7 +529,7 @@ class Scheduler {
     blackboard.hset(mainKey, 'overall_status', TASK_STATUS.SUCCESS);
     blackboard.hset(mainKey, 'final_result', finalResult);
     blackboard.hset(mainKey, 'update_time', Date.now());
-    CollabLogger.logAllFinish(traceId, TASK_STATUS.SUCCESS, finalResult, '');
+    CollabLogger.logAllFinish(traceId, TASK_STATUS.SUCCESS, finalResult, '', externalTaskId);
 
     const finishMsg = buildMessage({
       traceId,

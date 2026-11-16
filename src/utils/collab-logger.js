@@ -1,43 +1,4 @@
-const fs = require('fs');
-const path = require('path');
-
-/**
- * 日志根目录候选列表
- * 优先 /Volumes（Write 工具可达），回退项目根目录（VM 可达）
- */
-function getLogRoots() {
-  const candidates = [
-    '/Volumes/data/we-work/multi-agent-platform',
-    path.resolve(__dirname, '..', '..'),
-  ];
-  const roots = [];
-  const seen = new Set();
-  for (const root of candidates) {
-    if (!seen.has(root)) {
-      seen.add(root);
-      roots.push(root);
-    }
-  }
-  if (roots.length === 0) {
-    roots.push(path.resolve(__dirname, '..', '..'));
-  }
-  return roots;
-}
-
-const LOG_ROOTS = getLogRoots();
-
-/**
- * 按小时生成日志文件名，如 2026-08-24_19.log
- */
-function hourFileName(date) {
-  const pad = (n) => String(n).padStart(2, '0');
-  return (
-    date.getFullYear() + '-' +
-    pad(date.getMonth() + 1) + '-' +
-    pad(date.getDate()) + '_' +
-    pad(date.getHours()) + '.log'
-  );
-}
+const LogStore = require('./log-store');
 
 /**
  * 内容截断（防日志文件爆炸）
@@ -46,14 +7,15 @@ function truncate(content, max = 8000) {
   if (content === null || content === undefined) return '';
   const s = String(content);
   if (s.length <= max) return s;
-  return s.slice(0, max) + `\n…（已截断，共 ${s.length} 字符，完整内容见黑板/logs/agent）`;
+  return s.slice(0, max) + `\n…（已截断，共 ${s.length} 字符，完整内容见黑板/会话日志）`;
 }
 
 /**
  * 协作链路日志（模型间消息传递追踪）
  *
- * 日志位置：logs/collab/ 目录
- * 文件命名：YYYY-MM-DD_HH.log（按小时滚动，JSONL）
+ * 日志位置：logs/YYYY-MM-DD/<session_id>.log（按天文件夹、按会话文件，JSONL）
+ *   —— 与模型请求/响应日志共用同一会话文件，用 log_type="collab" 区分；
+ *      无会话归属时写入 logs/YYYY-MM-DD/_system.log。
  *
  * 记录事件驱动协作的完整消息流：
  *   plan        规划阶段：DAG 生成（来源 + 子任务列表 + 依赖关系）
@@ -67,6 +29,8 @@ function truncate(content, max = 8000) {
  * 条目格式（每行一条 JSON）：
  * {
  *   "timestamp": "2026-08-24T11:50:11.066Z",
+ *   "log_type": "collab",
+ *   "session_id": "conv_xxx",   // 会话 ID（对话级 task_id）
  *   "event": "dispatch",
  *   "trace_id": "...",
  *   "sub_task_id": "...",
@@ -74,27 +38,18 @@ function truncate(content, max = 8000) {
  * }
  */
 class CollabLogger {
+  /**
+   * 追加一条协作日志
+   *
+   * @param {string} event 事件名
+   * @param {Object} [data] 事件数据；会话归属取 data.session_id / external_task_id / task_id
+   */
   static log(event, data = {}) {
-    const now = new Date();
-    const entry = {
-      timestamp: now.toISOString(),
-      event,
-      ...data,
-    };
-    const line = JSON.stringify(entry) + '\n';
-
-    for (const root of LOG_ROOTS) {
-      try {
-        const logDir = path.join(root, 'logs', 'collab');
-        if (!fs.existsSync(logDir)) {
-          fs.mkdirSync(logDir, { recursive: true });
-        }
-        const logFile = path.join(logDir, hourFileName(now));
-        fs.appendFileSync(logFile, line);
-      } catch (e) {
-        // 某些路径不可写，静默跳过
-      }
-    }
+    const sessionId = data.session_id || data.external_task_id || data.task_id || '';
+    const entry = Object.assign({ log_type: 'collab', event }, data, {
+      session_id: sessionId,
+    });
+    LogStore.append(sessionId, entry);
   }
 
   /**
@@ -103,9 +58,11 @@ class CollabLogger {
    * @param {string} source  'default' | 'llm' | 'llm_fallback'
    * @param {Array}  dag     子任务列表
    * @param {string} userQuery
+   * @param {string} [sessionId] 会话 ID（对话级 task_id）
    */
-  static logPlan(traceId, source, dag, userQuery) {
+  static logPlan(traceId, source, dag, userQuery, sessionId) {
     this.log('plan', {
+      session_id: sessionId || '',
       trace_id: traceId,
       source,
       user_query: truncate(userQuery, 2000),
@@ -125,9 +82,11 @@ class CollabLogger {
    * @param {object} sub       黑板子任务
    * @param {Array}  agentNames 被分配的模型中文名列表
    * @param {Array}  upstream   注入的上游输出摘要 [{ dep_id, agents, chars, preview }]
+   * @param {string} [sessionId] 会话 ID（对话级 task_id）
    */
-  static logDispatch(traceId, sub, agentNames, upstream = []) {
+  static logDispatch(traceId, sub, agentNames, upstream = [], sessionId) {
     this.log('dispatch', {
+      session_id: sessionId || '',
       trace_id: traceId,
       sub_task_id: sub.sub_task_id,
       type: sub.type || '',
@@ -146,10 +105,12 @@ class CollabLogger {
 
   /**
    * 单个模型执行结果
+   * @param {string} [sessionId] 会话 ID（对话级 task_id）
    */
-  static logAgentResult(traceId, subTaskId, agent, ok, contentOrError, durationMs) {
+  static logAgentResult(traceId, subTaskId, agent, ok, contentOrError, durationMs, sessionId) {
     if (ok) {
       this.log('agent_result', {
+        session_id: sessionId || '',
         trace_id: traceId,
         sub_task_id: subTaskId,
         agent,
@@ -159,6 +120,7 @@ class CollabLogger {
       });
     } else {
       this.log('agent_result', {
+        session_id: sessionId || '',
         trace_id: traceId,
         sub_task_id: subTaskId,
         agent,
@@ -171,9 +133,11 @@ class CollabLogger {
 
   /**
    * 重试
+   * @param {string} [sessionId] 会话 ID（对话级 task_id）
    */
-  static logRetry(traceId, subTaskId, retryCount, maxRetry, backoffMs, errorMsg) {
+  static logRetry(traceId, subTaskId, retryCount, maxRetry, backoffMs, errorMsg, sessionId) {
     this.log('retry', {
+      session_id: sessionId || '',
       trace_id: traceId,
       sub_task_id: subTaskId,
       retry_count: retryCount,
@@ -185,9 +149,11 @@ class CollabLogger {
 
   /**
    * 超时处理
+   * @param {string} [sessionId] 会话 ID（对话级 task_id）
    */
-  static logTimeout(traceId, subTaskId, retryCount, action, errorMsg) {
+  static logTimeout(traceId, subTaskId, retryCount, action, errorMsg, sessionId) {
     this.log('timeout', {
+      session_id: sessionId || '',
       trace_id: traceId,
       sub_task_id: subTaskId,
       retry_count: retryCount,
@@ -198,9 +164,11 @@ class CollabLogger {
 
   /**
    * 子任务最终失败
+   * @param {string} [sessionId] 会话 ID（对话级 task_id）
    */
-  static logSubFail(traceId, subTaskId, errorMsg) {
+  static logSubFail(traceId, subTaskId, errorMsg, sessionId) {
     this.log('sub_fail', {
+      session_id: sessionId || '',
       trace_id: traceId,
       sub_task_id: subTaskId,
       error: truncate(errorMsg, 2000),
@@ -209,9 +177,11 @@ class CollabLogger {
 
   /**
    * 顶层任务完结
+   * @param {string} [sessionId] 会话 ID（对话级 task_id）
    */
-  static logAllFinish(traceId, status, finalResult, failReason) {
+  static logAllFinish(traceId, status, finalResult, failReason, sessionId) {
     this.log('all_finish', {
+      session_id: sessionId || '',
       trace_id: traceId,
       status,
       final_result: truncate(finalResult, 8000),

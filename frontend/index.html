@@ -59,13 +59,13 @@
     .message-body::-webkit-scrollbar { width: 5px; }
     .message-body::-webkit-scrollbar-track { background: transparent; }
     .message-body::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 3px; }
-    /* 思考过程折叠块（默认收起，点击展开，灰字小号，与答案正文区分） */
-    .thinking-block { margin-bottom: 8px; border: 1px solid #e5e7eb; border-radius: 8px; background: #f9fafb; }
-    .thinking-summary { cursor: pointer; padding: 6px 10px; font-size: 12px; color: #6b7280; user-select: none; list-style: none; }
+    /* 思考过程折叠块（默认收起，点击展开，灰字小号，无边框只显示文字） */
+    .thinking-block { margin-bottom: 8px; }
+    .thinking-summary { cursor: pointer; font-size: 12px; color: #6b7280; user-select: none; list-style: none; }
     .thinking-summary::-webkit-details-marker { display: none; }
     .thinking-summary::before { content: '▸ '; }
     .thinking-block[open] .thinking-summary::before { content: '▾ '; }
-    .thinking-body { padding: 8px 10px; font-size: 12px; color: #9ca3af; line-height: 1.6; white-space: pre-wrap; max-height: calc(1.6em * 12); overflow-y: auto; border-top: 1px solid #f1f5f9; }
+    .thinking-body { padding-top: 4px; font-size: 12px; color: #9ca3af; line-height: 1.6; white-space: pre-wrap; max-height: calc(1.6em * 12); overflow-y: auto; }
     /* @mention dropdown */
     .mention-dropdown { position: absolute; bottom: 100%; left: 0; margin-bottom: 4px; background: white; border: 1px solid #e2e8f0; border-radius: 12px; box-shadow: 0 10px 25px rgba(0,0,0,0.1); max-height: 200px; overflow-y: auto; min-width: 200px; z-index: 50; }
     .mention-item { padding: 8px 12px; cursor: pointer; display: flex; align-items: center; gap: 8px; transition: background 0.1s; }
@@ -276,6 +276,18 @@
       var onSelect = props.onSelect, onNew = props.onNew, onDelete = props.onDelete;
       var collapsed = props.collapsed, onToggle = props.onToggle;
       var agents = props.agents || [];
+      // 批量管理：勾选删除多个对话（含对应保存的对话文件）
+      var selectionMode = props.selectionMode;
+      var selectedIds = props.selectedIds || {};
+      var onToggleSelectionMode = props.onToggleSelectionMode;
+      var onToggleSelected = props.onToggleSelected;
+      var onDeleteSelected = props.onDeleteSelected;
+      var onToggleSelectAll = props.onToggleSelectAll;
+      var selCount = Object.keys(selectedIds).length;
+      // 全选状态（部分选中时显示为半选样式）
+      var selectableIds = conversations.filter(function(c) { return !!c.task_id; }).map(function(c) { return c.task_id; });
+      var allSelected = selectableIds.length > 0 && selectableIds.every(function(id) { return !!selectedIds[id]; });
+      var someSelected = selectableIds.some(function(id) { return !!selectedIds[id]; });
 
       if (collapsed) {
         return h('div', { className: 'w-12 flex-shrink-0 bg-gray-50 border-r border-gray-200 flex flex-col items-center py-3 gap-3' },
@@ -309,44 +321,115 @@
                 h('path', { strokeLinecap:'round', strokeLinejoin:'round', strokeWidth:2, d:'M15 19l-7-7 7-7' })
               )
             ),
-            h('h2', { className: 'font-semibold text-gray-800 text-sm' }, '对话记录'),
+            h('h2', { className: 'font-semibold text-gray-800 text-sm' }, selectionMode ? ('已选 ' + selCount + ' 个') : '对话记录'),
           ),
-          h('button', { onClick: onNew, className: 'p-1.5 bg-blue-600 text-white rounded-lg hover:bg-blue-700', title: '新对话' },
-            h('svg', { className: 'w-4 h-4', fill:'none', stroke:'currentColor', viewBox:'0 0 24 24' },
-              h('path', { strokeLinecap:'round', strokeLinejoin:'round', strokeWidth:2, d:'M12 4v16m8-8H4' })
-            )
-          )
+          selectionMode
+            ? h('div', { className: 'flex items-center gap-1' },
+                h('button', {
+                  onClick: onDeleteSelected,
+                  disabled: selCount === 0,
+                  className: 'px-2 py-1 rounded-lg text-xs font-medium text-white ' + (selCount > 0 ? 'bg-red-600 hover:bg-red-700' : 'bg-gray-300 cursor-not-allowed'),
+                  title: '删除选中对话'
+                }, '删除' + (selCount > 0 ? '(' + selCount + ')' : '')),
+                h('button', {
+                  onClick: onToggleSelectionMode,
+                  className: 'px-2 py-1 rounded-lg text-xs text-gray-500 hover:bg-gray-200',
+                  title: '退出批量管理'
+                }, '取消')
+              )
+            : h('div', { className: 'flex items-center gap-1' },
+                h('button', { onClick: onToggleSelectionMode, className: 'p-1.5 hover:bg-gray-200 rounded-lg', title: '批量管理（勾选删除对话）' },
+                  h('svg', { className: 'w-4 h-4 text-gray-500', fill:'none', stroke:'currentColor', viewBox:'0 0 24 24' },
+                    h('path', { strokeLinecap:'round', strokeLinejoin:'round', strokeWidth:2, d:'M9 11l3 3L22 4M21 12v7a2 2 0 01-2 2H5a2 2 0 01-2-2V5a2 2 0 012-2h11' })
+                  )
+                ),
+                h('button', { onClick: onNew, className: 'p-1.5 bg-blue-600 text-white rounded-lg hover:bg-blue-700', title: '新对话' },
+                  h('svg', { className: 'w-4 h-4', fill:'none', stroke:'currentColor', viewBox:'0 0 24 24' },
+                    h('path', { strokeLinecap:'round', strokeLinejoin:'round', strokeWidth:2, d:'M12 4v16m8-8H4' })
+                  )
+                )
+              )
         ),
 
         // Conversation items
         h('div', { className: 'flex-1 overflow-y-auto scrollbar-thin py-1' },
+          // 批量模式：全选 / 取消全选（部分选中显示半选）
+          (selectionMode && conversations.length > 0)
+            ? h('div', {
+                role: 'button',
+                tabIndex: 0,
+                onClick: onToggleSelectAll,
+                onKeyDown: function(e) {
+                  if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onToggleSelectAll(); }
+                },
+                className: 'px-3 py-2 mx-2 my-0.5 rounded-lg flex items-center gap-2 cursor-pointer select-none hover:bg-gray-100 border border-transparent transition-colors',
+                title: allSelected ? '取消全选' : '全选',
+              },
+                h('span', { className: 'w-4 h-4 flex items-center justify-center rounded border flex-shrink-0 ' + ((allSelected || someSelected) ? 'bg-blue-600 border-blue-600' : 'border-gray-300 bg-white') },
+                  allSelected
+                    ? h('svg', { className: 'w-3 h-3 text-white', fill:'none', stroke:'currentColor', viewBox:'0 0 24 24' },
+                        h('path', { strokeLinecap:'round', strokeLinejoin:'round', strokeWidth:3, d:'M5 13l4 4L19 7' })
+                      )
+                    : (someSelected
+                        ? h('svg', { className: 'w-3 h-3 text-white', fill:'none', stroke:'currentColor', viewBox:'0 0 24 24' },
+                            h('path', { strokeLinecap:'round', strokeLinejoin:'round', strokeWidth:3, d:'M5 12h14' })
+                          )
+                        : null)
+                ),
+                h('span', { className: 'text-xs font-medium text-gray-600' }, allSelected ? '取消全选' : '全选'),
+                h('span', { className: 'text-xs text-gray-400' }, '（' + selectableIds.length + ' 个对话）')
+              )
+            : null,
           conversations.length === 0
             ? h('div', { className: 'px-4 py-8 text-center text-sm text-gray-400' }, '暂无对话，\n开始你的第一次对话吧')
             : conversations.map(function(c) {
                 var isActive = c.task_id === activeId;
                 var lastMsg = c._lastMessage || '';
                 var statusColor = statusColorMap;
-                // 选择对话：onMouseDown 立即响应（防止点击期间列表刷新导致 click 丢失），
-                // onClick 兜底（键盘 / 触屏 / 辅助技术）
-                var select = function(e) {
-                  if (e && e.button !== undefined && e.button !== 0) return;
-                  if (c.task_id) onSelect(c.task_id);
+                var selected = !!(selectedIds[c.task_id]);
+                // 统一激活：批量管理模式下点击行 = 勾选/取消勾选，不切换当前对话；
+                // 正常模式下 = 切换对话。
+                var activate = function() {
+                  if (!c.task_id) return;
+                  if (selectionMode) onToggleSelected(c.task_id);
+                  else onSelect(c.task_id);
                 };
+                // 选择对话：onMouseDown 立即响应（防止点击期间列表刷新导致 click 丢失）。
+                // 批量模式下同一物理点击会先后触发 mousedown 和 click，
+                // 两次都切换会互相抵消（勾选后立即取消），因此 click 在批量模式下直接忽略。
+                var onRowMouseDown = function(e) {
+                  if (e && e.button !== undefined && e.button !== 0) return;
+                  activate();
+                };
+                var onRowClick = function(e) {
+                  if (e && e.button !== undefined && e.button !== 0) return;
+                  if (selectionMode) return;
+                  activate();
+                };
+                var rowClass = selectionMode
+                  ? (selected ? 'bg-blue-50 border border-blue-300' : 'hover:bg-gray-100 border border-transparent')
+                  : (isActive ? 'bg-blue-100 border border-blue-200' : 'hover:bg-gray-100 border border-transparent');
                 return h('div', {
                   key: c.task_id,
                   role: 'button',
                   tabIndex: 0,
-                  onMouseDown: select,
-                  onClick: select,
+                  onMouseDown: onRowMouseDown,
+                  onClick: onRowClick,
                   onKeyDown: function(e) {
-                    if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); select(); }
+                    if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); activate(); }
                   },
-                  className: 'px-3 py-2.5 mx-2 my-0.5 rounded-lg cursor-pointer transition-colors group select-none ' + (isActive ? 'bg-blue-100 border border-blue-200' : 'hover:bg-gray-100 border border-transparent'),
+                  className: 'px-3 py-2.5 mx-2 my-0.5 rounded-lg cursor-pointer transition-colors group select-none ' + rowClass,
                 },
                   h('div', { className: 'flex items-center gap-2' },
-                    h('span', { className: 'w-2 h-2 rounded-full flex-shrink-0 ' + (statusColor[c.status] || 'bg-gray-400') }),
-                    h('span', { className: 'text-sm font-medium truncate flex-1 ' + (isActive ? 'text-blue-800' : 'text-gray-700') }, c.name || '未命名对话'),
-                    h('button', {
+                    selectionMode
+                      ? h('span', { className: 'w-4 h-4 flex items-center justify-center rounded border flex-shrink-0 ' + (selected ? 'bg-blue-600 border-blue-600' : 'border-gray-300 bg-white') },
+                          selected && h('svg', { className: 'w-3 h-3 text-white', fill:'none', stroke:'currentColor', viewBox:'0 0 24 24' },
+                            h('path', { strokeLinecap:'round', strokeLinejoin:'round', strokeWidth:3, d:'M5 13l4 4L19 7' })
+                          )
+                        )
+                      : h('span', { className: 'w-2 h-2 rounded-full flex-shrink-0 ' + (statusColor[c.status] || 'bg-gray-400') }),
+                    h('span', { className: 'text-sm font-medium truncate flex-1 ' + ((isActive && !selectionMode) ? 'text-blue-800' : 'text-gray-700') }, c.name || '未命名对话'),
+                    !selectionMode && h('button', {
                       onMouseDown: function(e) { e.stopPropagation(); },
                       onClick: function(e) { e.stopPropagation(); onDelete(c.task_id); },
                       className: 'opacity-0 group-hover:opacity-100 p-0.5 hover:bg-red-100 rounded transition-all',
@@ -672,7 +755,7 @@
               ? (directionLabel || msgSenderLabel || agentLabel(task ? task.executor_agent : 'claude'))
               : null;
             return h('div', { key: i, className: 'flex ' + (isModelToModel ? 'justify-start' : (msg.role === 'user' ? 'justify-end' : 'justify-start')) + ' slide-up' },
-              h('div', { className: 'max-w-[80%] w-full' },
+              h('div', { className: 'max-w-[80%]' },
                 senderLine && h('div', { className: 'text-xs font-medium text-gray-400 mb-1.5' }, senderLine),
                 (isAssistant && sp.thinking)
                   ? h('details', { className: 'thinking-block' },
@@ -680,7 +763,7 @@
                       h('div', { className: 'thinking-body' }, sp.thinking)
                     )
                   : null,
-                h('div', { className: 'rounded-2xl px-4 py-3 ' + (
+                h('div', { className: 'w-fit max-w-full rounded-2xl px-4 py-3 ' + (
                   isUserBubble ? 'bg-blue-600 text-white' :
                   msg.role === 'system' ? 'bg-gray-100 text-gray-600 text-sm' :
                   'bg-white border border-gray-200 shadow-sm'
@@ -706,7 +789,7 @@
             if (!st || !task || st.task_id !== task.task_id) return null;
             if (!st.text && !st.agent) return null;
             return h('div', { key: 'stream-' + sid, className: 'flex justify-start slide-up' },
-              h('div', { className: 'max-w-[80%] w-full' },
+              h('div', { className: 'max-w-[80%]' },
                 h('div', { className: 'text-xs font-medium text-gray-400 mb-1.5 flex items-center gap-2' },
                   agentLabel(st.agent),
                   st.done
@@ -722,7 +805,7 @@
                   h('summary', { className: 'thinking-summary' }, '💭 思考过程'),
                   h('div', { className: 'thinking-body' }, st.reasoning)
                 ) : null,
-                h('div', { className: 'max-w-full rounded-2xl px-4 py-3 bg-white border border-gray-200 shadow-sm' },
+                h('div', { className: 'w-fit max-w-full rounded-2xl px-4 py-3 bg-white border border-gray-200 shadow-sm' },
                   h('div', {
                     className: 'text-sm whitespace-pre-wrap stream-cursor message-body',
                     ref: function(el) {
@@ -860,6 +943,11 @@
     function App() {
       var conversationsState = useState([]);
       var conversations = conversationsState[0], setConversations = conversationsState[1];
+      // 对话批量管理：勾选删除（含对应保存的对话文件）
+      var selModeState = useState(false);
+      var selectionMode = selModeState[0], setSelectionMode = selModeState[1];
+      var selIdsState = useState({});
+      var selectedIds = selIdsState[0], setSelectedIds = selIdsState[1];
       var activeIdState = useState(null);
       var activeId = activeIdState[0], setActiveId = activeIdState[1];
       var activeTaskState = useState(null);
@@ -1317,6 +1405,61 @@
         } catch(e) { alert('删除失败: ' + e.message); }
       }
 
+      // ===== 批量管理 =====
+      function handleToggleSelectionMode() {
+        if (selectionMode) setSelectedIds({}); // 退出批量模式时清空勾选
+        setSelectionMode(!selectionMode);
+      }
+
+      function handleToggleSelected(taskId) {
+        if (!taskId) return;
+        setSelectedIds(function(prev) {
+          var n = Object.assign({}, prev);
+          if (n[taskId]) delete n[taskId]; else n[taskId] = true;
+          return n;
+        });
+      }
+
+      // 全选 / 取消全选（已全选时再点 = 清空）
+      function handleToggleSelectAll() {
+        var ids = conversations.filter(function(c) { return !!c.task_id; }).map(function(c) { return c.task_id; });
+        var allSelected = ids.length > 0 && ids.every(function(id) { return !!selectedIds[id]; });
+        if (allSelected) {
+          setSelectedIds({});
+        } else {
+          var next = {};
+          ids.forEach(function(id) { next[id] = true; });
+          setSelectedIds(next);
+        }
+      }
+
+      async function handleDeleteSelected() {
+        var ids = Object.keys(selectedIds);
+        if (ids.length === 0) return;
+        if (!confirm('确定删除选中的 ' + ids.length + ' 个对话吗？\n对话记录及对应保存的对话文件将一并删除，此操作不可恢复。')) return;
+        try {
+          var res = await api('/tasks/batch/delete', { method: 'POST', body: JSON.stringify({ task_ids: ids }) });
+          var result = await res.json();
+          var deletedIds = (result.deleted || []).map(function(d) { return d.task_id; });
+          // 当前打开的对话被删除 → 清空对话视图
+          if (activeId && deletedIds.indexOf(activeId) >= 0) {
+            setActiveId(null);
+            activeIdRef.current = null;
+            setActiveTask(null);
+            setConversation('');
+            convLenRef.current = 0;
+          }
+          if (result.failed && result.failed.length > 0) {
+            alert('部分对话删除失败：\n' + result.failed.map(function(f) {
+              return (f.name || f.task_id) + '：' + f.reason;
+            }).join('\n'));
+          }
+          setSelectedIds({});
+          setSelectionMode(false);
+          fetchConversations();
+        } catch(e) { alert('批量删除失败: ' + e.message); }
+      }
+
       return h('div', { className: 'h-screen flex flex-col' },
         // Top bar
         h('div', { className: 'px-4 py-1.5 bg-white border-b border-gray-200 flex items-center justify-between text-xs' },
@@ -1338,6 +1481,12 @@
             onSelect: handleSelectConversation,
             onNew: handleNewConversation,
             onDelete: handleDeleteConversation,
+            selectionMode: selectionMode,
+            selectedIds: selectedIds,
+            onToggleSelectionMode: handleToggleSelectionMode,
+            onToggleSelected: handleToggleSelected,
+            onDeleteSelected: handleDeleteSelected,
+            onToggleSelectAll: handleToggleSelectAll,
             collapsed: sidebarCollapsed,
             onToggle: function() { setSidebarCollapsed(!sidebarCollapsed); },
             agents: agents,

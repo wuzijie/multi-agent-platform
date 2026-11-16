@@ -50,6 +50,9 @@ function parseLines(raw) {
           agent: o.agent || null,
           kind: o.kind || 'chat',
           content: o.content,
+          visible_to: Array.isArray(o.visible_to) ? o.visible_to : null,
+          turn_id: o.turn_id || null,
+          from_agent: o.from_agent || null,
         };
       } catch (e) { return null; }
     })
@@ -82,9 +85,17 @@ function nextSeq(taskId) {
 
 /**
  * 追加一条消息
+ * @param {Object} msg
+ * @param {string} msg.role
+ * @param {string|null} [msg.agent]
+ * @param {string} [msg.kind]  chat | briefing | whisper | display | backfill
+ * @param {string[]|null} [msg.visible_to] whisper 的可见名单（null=所有人不可见？默认仅名单内可见）
+ * @param {string} [msg.turn_id] 本轮 ID（用户消息开启的轮次）
+ * @param {string|null} [msg.from_agent] 转交链发送者（A @ B 时 B 收到的消息里记录 A）
+ * @param {string} msg.content
  * @returns {number} 分配的 seq
  */
-function append(taskId, { role, agent = null, kind = 'chat', content }) {
+function append(taskId, { role, agent = null, kind = 'chat', content, visible_to = null, turn_id = null, from_agent = null }) {
   if (!taskId || typeof content !== 'string' || !content.trim()) return 0;
   ensureDir(taskId);
   const seq = nextSeq(taskId);
@@ -96,6 +107,9 @@ function append(taskId, { role, agent = null, kind = 'chat', content }) {
     kind,
     content,
   };
+  if (visible_to) entry.visible_to = visible_to;
+  if (turn_id) entry.turn_id = turn_id;
+  if (from_agent) entry.from_agent = from_agent;
   fs.appendFileSync(filePath(taskId), JSON.stringify(entry) + '\n');
   return seq;
 }
@@ -113,6 +127,36 @@ function since(taskId, cursorSeq = 0, opts = {}) {
     if (m.seq <= cursorSeq) return false;
     if (excludeSystem && m.role === 'system') return false;
     if (excludeAgent && m.role === 'assistant' && m.agent === excludeAgent) return false;
+    return true;
+  });
+}
+
+/**
+ * 取某 agent 的「未读投递消息」（delivery cursor 语义，区别于 resume 的 since）
+ *
+ * 过滤规则（动态上下文管理的投递口径）：
+ *   - seq <= cursorSeq                     已读，跳过
+ *   - role === 'system'                    系统展示消息，跳过
+ *   - kind === 'display' | 'briefing'      展示/简报消息，跳过
+ *   - kind === 'whisper' 且 visible_to 不含该 agent → 跳过（无名单的 whisper 一律不投递）
+ *   - role === 'assistant' 且 agent === 自己 → 跳过自己的输出
+ *
+ * @param {string} taskId
+ * @param {{cursorSeq?: number, agent?: string|null}} [opts]
+ * @returns {Array<Object>}
+ */
+function unread(taskId, opts = {}) {
+  const cursorSeq = Number(opts.cursorSeq) || 0;
+  const agent = opts.agent || null;
+  return loadAll(taskId).filter(m => {
+    if (m.seq <= cursorSeq) return false;
+    if (m.role === 'system') return false;
+    if (m.kind === 'display' || m.kind === 'briefing') return false;
+    if (m.kind === 'whisper') {
+      if (!Array.isArray(m.visible_to)) return false;
+      if (agent && m.visible_to.indexOf(agent) < 0) return false;
+    }
+    if (agent && m.role === 'assistant' && m.agent === agent) return false;
     return true;
   });
 }
@@ -188,6 +232,7 @@ module.exports = {
   loadAll,
   append,
   since,
+  unread,
   maxSeq,
   latestAssistantAgent,
   backfillFromConversation,

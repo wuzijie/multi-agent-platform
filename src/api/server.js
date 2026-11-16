@@ -15,6 +15,7 @@ const scheduler = require('../engine/scheduler');
 const { AGENT_NAMES } = require('../engine/events');
 const blackboard = require('../blackboard/blackboard');
 const sessionManager = require('../session/manager');
+const LogStore = require('../utils/log-store');
 
 const ROOT = path.resolve(__dirname, '..', '..');
 
@@ -72,13 +73,14 @@ class ApiServer {
     api.post('/analytics/log', (req, res) => {
       try {
         const { type, ...data } = req.body;
-        const analyticsDir = path.join(ROOT, 'logs', 'analytics');
-        if (!fs.existsSync(analyticsDir)) fs.mkdirSync(analyticsDir, { recursive: true });
-
-        const filename = type ? `${type}.jsonl` : 'general.jsonl';
-        const filePath = path.join(analyticsDir, filename);
-        const entry = JSON.stringify({ ...data, type, server_time: new Date().toISOString() }) + '\n';
-        fs.appendFileSync(filePath, entry);
+        // 按会话收录：有 task_id/session_id 时写入该会话文件，否则写 _system.log
+        const sessionId = data.task_id || data.session_id || '';
+        LogStore.append(sessionId, {
+          log_type: 'analytics',
+          type,
+          ...data,
+          server_time: new Date().toISOString(),
+        });
         res.json({ ok: true });
       } catch (e) {
         res.status(500).json({ error: e.message });

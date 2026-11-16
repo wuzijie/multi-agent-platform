@@ -413,6 +413,13 @@ class AgentRuntime {
       : '[执行许可] 用户尚未授权：本轮只做分析与方案，禁止修改/创建文件、禁止执行有副作用的命令。';
     currentInstruction = `${permissionNotice}\n\n${currentInstruction}`;
 
+    // 动态上下文：agent 间 @ 转交时，由 execution 层组装的增量上下文（六段式）
+    // 替换默认的"历史 + 本轮"拼接——增量上下文已包含触发原文、未读历史与系统提示，
+    // 附执行许可后直接作为本轮指令发送。
+    if (chatMode && task.incremental_context && String(task.incremental_context).trim()) {
+      currentInstruction = `${permissionNotice}\n\n${String(task.incremental_context).trim()}`;
+    }
+
     // delta 模式下稳定上下文已在 CLI session 内，不再重复注入
     const effectiveContext = deltaMode ? '' : baseContext;
 
