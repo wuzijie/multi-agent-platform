@@ -16,6 +16,8 @@ mention:
   pingpong:
     warn_threshold: 2   # ≥2 次：在 prompt 注入乒乓警告，要求收敛
     block_threshold: 4  # ≥4 次：阻断该 @ 边，不再拉起模型
+  # 交接失败处理策略：notify（写 [转交失败] 并继续）| redecide（回给调用者决策一次）| none
+  failure_policy: notify
   # 模型名别名（除中文名外，允许 @claude / @kimi / @deepseek / @qwen）
   aliases:
     克劳德: ["claude"]

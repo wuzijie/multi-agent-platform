@@ -102,6 +102,69 @@ function stubAgent(responses) {
     assert.ok(conv.includes('[召唤上限]'), '应触发单 agent 召唤上限兜底');
   });
 
+  await test('失败通知（notify）：写 [转交失败] 并继续', async () => {
+    const tid = await newTask('失败通知');
+    const calls = [];
+    orchestrator._streamedExecute = async (task, taskId, agentName) => {
+      calls.push(agentName);
+      if (agentName === '迪普斯克') {
+        return { task_id: taskId, status: 'failed', content: '', error: { message: '后端 502' }, output_files: [], duration_ms: 1 };
+      }
+      return { task_id: taskId, status: 'success', content: '回答完成。\n\n@迪普斯克\n帮我复核', output_files: [], duration_ms: 1 };
+    };
+    const task = orchestrator.getTask(tid);
+    await orchestrator._executeTurnWithAgents(task, tid, '@克劳德 分析', '分析', ['克劳德']);
+    const conv = orchestrator.getConversation(tid);
+    assert.ok(conv.includes('[转交失败]'), '应记录转交失败');
+    assert.ok(conv.includes('后端 502'), '应包含失败原因');
+  });
+
+  await test('中断：已输出的部分文本仍然持久化', async () => {
+    const tid = await newTask('中断保留');
+    orchestrator._streamedExecute = async (task, taskId, agentName) => ({
+      task_id: taskId, status: 'cancelled', content: '已经写完半段分析', output_files: [], duration_ms: 1,
+    });
+    const task = orchestrator.getTask(tid);
+    await orchestrator._executeTurnWithAgents(task, tid, '@克劳德 分析', '分析', ['克劳德']);
+    const conv = orchestrator.getConversation(tid);
+    assert.ok(conv.includes('[中断]'), '应标记中断');
+    assert.ok(conv.includes('已经写完半段分析'), '部分文本应持久化');
+  });
+
+  await test('失败回传（redecide）：调用者决策重试并成功', async () => {
+    const tid = await newTask('失败回传');
+    const cfg = config.mention || {};
+    const oldPolicy = cfg.failure_policy;
+    cfg.failure_policy = 'redecide';
+    const calls = [];
+    try {
+      orchestrator._streamedExecute = async (task, taskId, agentName) => {
+        calls.push({ agent: agentName, instruction: task.instruction });
+        // 第 1 次 克劳德：转交迪普斯克；第 2 次 迪普斯克：失败；
+        // 第 3 次 克劳德：失败补救决策；第 4 次 迪普斯克：重试成功
+        if (agentName === '克劳德' && calls.filter(c => c.agent === '克劳德').length === 1) {
+          return { task_id: taskId, status: 'success', content: '先看看。\n\n@迪普斯克\n帮我复核', output_files: [], duration_ms: 1 };
+        }
+        if (agentName === '克劳德') {
+          return { task_id: taskId, status: 'success', content: '@迪普斯克\n重试并加上超时', output_files: [], duration_ms: 1 };
+        }
+        if (calls.filter(c => c.agent === '迪普斯克').length === 1) {
+          return { task_id: taskId, status: 'failed', content: '', error: { message: '临时故障' }, output_files: [], duration_ms: 1 };
+        }
+        return { task_id: taskId, status: 'success', content: '迪普斯克重试成功', output_files: [], duration_ms: 1 };
+      };
+      const task = orchestrator.getTask(tid);
+      await orchestrator._executeTurnWithAgents(task, tid, '@克劳德 分析', '分析', ['克劳德']);
+      assert.strictEqual(calls.length, 4, `应有 4 次调用（实际 ${calls.length}）`);
+      assert.ok(calls[2].instruction.includes('交接失败'), '决策调用应包含失败信息');
+      const conv = orchestrator.getConversation(tid);
+      assert.ok(conv.includes('失败补救决策'), '应记录补救决策');
+      assert.ok(conv.includes('迪普斯克重试成功'), '重试结果应写入会话');
+    } finally {
+      cfg.failure_policy = oldPolicy;
+    }
+  });
+
   for (const id of created) {
     try { fs.rmSync(path.join(ROOT, 'tasks', id), { recursive: true, force: true }); } catch (e) {}
   }

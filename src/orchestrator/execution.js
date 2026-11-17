@@ -167,9 +167,10 @@ module.exports = {
     };
     const fromAgent = (meta && meta.fromAgent) || null;
     const pairKey = fromAgent ? [fromAgent, agentName].sort().join('|') : null;
+    const skipPingpong = !!(meta && meta.skipPingpong); // 失败回传的重试不计入乒乓
 
     // ===== 乒乓治理：同一对 agent 的往返计数（仅 agent → agent 转交计入）=====
-    if (pairKey) {
+    if (pairKey && !skipPingpong) {
       const nextPair = (turn.pingpong[pairKey] || 0) + 1;
       if (nextPair >= turn.blockThreshold) {
         turn.pingpong[pairKey] = nextPair;
@@ -280,10 +281,32 @@ module.exports = {
       result = { status: 'failed', error: { message: e.message } };
     }
 
-    if (this._isCancelled(taskId)) return { ok: false, stopped: true };
-    if (!result || result.status === 'cancelled') return { ok: false, stopped: true };
+    if (this._isCancelled(taskId) || !result || result.status === 'cancelled') {
+      // 中断（P2）：不继续 A2A 链；已输出的部分文本仍然持久化，刷新后仍可见
+      const partial = (result && result.content) || '';
+      if (String(partial).trim()) {
+        this._appendConversation(taskId, 'assistant',
+          `**${agentName}**（[中断] 已停止，以下为已输出部分）\n\n${partial}`, {
+            agent: agentName,
+            turn_id: turn.turnId,
+            from_agent: fromAgent || undefined,
+          });
+      }
+      CollabLogger.log('handoff_interrupted', {
+        task_id: taskId, trace_id: task.trace_id || '', agent: agentName,
+        partial_chars: String(partial).length,
+      });
+      return { ok: false, stopped: true };
+    }
     if (result.status !== 'success') {
-      return { ok: false, error: `${agentName}: ${(result.error && result.error.message) || '执行失败'}` };
+      const errMsg = (result.error && result.error.message) || '执行失败';
+      // 失败（P2）：通知调用者（每个失败边一条系统消息）；redecide 由上层统一触发
+      const policy = String((config.mention && config.mention.failure_policy) || 'notify');
+      if (policy !== 'none') {
+        this._appendConversation(taskId, 'system',
+          `[转交失败] ${fromAgent ? fromAgent + ' → ' : ''}${agentName}：${errMsg}`);
+      }
+      return { ok: false, error: `${agentName}: ${errMsg}`, failed: true, failAgent: agentName, failReason: errMsg };
     }
 
     // 投递成功：推进该 agent 的投递游标（失败/阻断不推进）
@@ -349,27 +372,121 @@ module.exports = {
     const nextChain = (Array.isArray(chain) && chain.length ? chain : ['用户'])
       .filter(n => n !== agentName)
       .concat(agentName);
-    const branches = targets
-      .filter(m => hop < maxHops && budget.left > 0)
-      .map(m => {
-        this._appendConversation(taskId, 'system', `[转交] ${agentName} → ${m.agent}`);
-        return this._runAgentWithHandoff(
-          task, taskId, m.agent, m.description || '请基于以上对话继续处理。',
-          hop + 1, budget, maxHops, turn, {
-            fromAgent: agentName,
-            triggerContent: content,
-            mentionDesc: m.description || '',
-            chain: nextChain,
-          }
-        );
-      });
+    const runnable = targets.filter(m => hop < maxHops && budget.left > 0);
+    const branchResults = await Promise.allSettled(runnable.map(m => {
+      this._appendConversation(taskId, 'system', `[转交] ${agentName} → ${m.agent}`);
+      return this._runAgentWithHandoff(
+        task, taskId, m.agent, m.description || '请基于以上对话继续处理。',
+        hop + 1, budget, maxHops, turn, {
+          fromAgent: agentName,
+          triggerContent: content,
+          mentionDesc: m.description || '',
+          chain: nextChain,
+        }
+      );
+    }));
 
-    const settled = await Promise.allSettled(branches);
-    const childContents = settled
-      .map(r => (r.status === 'fulfilled' && r.value && r.value.ok) ? r.value.content : '')
-      .filter(Boolean);
+    const childContents = [];
+    const failures = [];
+    branchResults.forEach((r, idx) => {
+      const target = runnable[idx];
+      const v = (r.status === 'fulfilled')
+        ? r.value
+        : { ok: false, error: (r.reason && r.reason.message) || '执行失败' };
+      if (v && v.ok) {
+        if (v.content) childContents.push(v.content);
+        return;
+      }
+      if (v && (v.blocked || v.stopped)) return; // 阻断/停止已各自写系统消息
+      failures.push({ agent: target.agent, error: (v && v.error) || '执行失败' });
+    });
+
+    // 失败回传（P2）：redecide 时让调用者决策一次（重试 / 换人 / 升级），不计入乒乓
+    const failurePolicy = String((config.mention && config.mention.failure_policy) || 'notify');
+    if (failures.length > 0 && failurePolicy === 'redecide' && budget.left > 0) {
+      const redecideKey = agentName + '|' + failures.map(f => f.agent).sort().join(',');
+      turn.redecided = turn.redecided || {};
+      if (!turn.redecided[redecideKey]) {
+        turn.redecided[redecideKey] = true;
+        try {
+          await this._redecideAfterFailure({
+            task, taskId, agentName, turn, budget, maxHops, hop, chain, failures,
+          });
+        } catch (e) {
+          console.error('[Execution] 失败回传决策执行异常:', e.message);
+        }
+      }
+    }
 
     return { ok: true, content: content + (childContents.length ? '\n\n' + childContents.join('\n\n') : '') };
+  },
+
+  /**
+   * 失败回传决策（P2，mention.failure_policy=redecide）：
+   * 把子调用失败信息回给上一棒 agent，让它决定 重试 / 换人 / 升级。
+   * 每个「调用者+失败目标」组合本轮最多一次；重试调用标记 skipPingpong，不计入乒乓。
+   */
+  async _redecideAfterFailure({ task, taskId, agentName, turn, budget, maxHops, hop, chain, failures }) {
+    const failLines = failures.map(f => `- ${f.agent}：${f.error}`).join('\n');
+    const instruction = [
+      '[交接失败] 你刚才把任务交给了下列智能体，但执行失败：',
+      failLines,
+      '',
+      '请立刻做出决策，只输出一种行动：',
+      '1) 重试：行首 @ 同一个智能体，并在描述里写明需要调整什么；',
+      '2) 换人：行首 @ 另一位智能体；',
+      '3) 升级：行首 @用户，说明需要用户做什么。',
+    ].join('\n');
+
+    const decisionTask = Object.assign({}, task, {
+      instruction,
+      trigger_from: agentName, // 由自己触发，避免被当作新的用户消息
+      trigger_content: instruction,
+    });
+    const result = await this._streamedExecute(decisionTask, taskId, agentName, []);
+    if (!result || result.status !== 'success' || !String(result.content || '').trim()) {
+      this._appendConversation(taskId, 'system', `[交接失败] ${agentName} 的补救决策调用也失败了`);
+      return;
+    }
+    const content = String(result.content || '');
+    this._appendConversation(taskId, 'assistant', `**${agentName}**（失败补救决策）\n\n${content}`, {
+      agent: agentName, turn_id: turn.turnId,
+    });
+
+    const parsed = this._extractMentionsFromReply(content, agentName);
+    if (!parsed || parsed.error) {
+      if (parsed && parsed.error) {
+        this._appendConversation(taskId, 'system', `[违规转交] ${parsed.error.message}（已忽略本次补救）`);
+      }
+      return;
+    }
+    if (parsed.terminal) {
+      this._appendConversation(taskId, 'system',
+        `[交还用户] ${agentName} 请求你处理：${parsed.terminal.description}`);
+      return;
+    }
+    if (parsed.hold) {
+      this._appendConversation(taskId, 'system',
+        `[持球] ${agentName} 正在等待：${parsed.hold.reason || '等待外部条件'}`, { kind: 'hold' });
+      return;
+    }
+
+    const nextChain = (Array.isArray(chain) && chain.length ? chain : ['用户'])
+      .filter(n => n !== agentName).concat(agentName);
+    for (const m of (parsed.mentions || [])) {
+      if (hop + 1 >= maxHops || budget.left <= 0) break;
+      this._appendConversation(taskId, 'system', `[补救] ${agentName} → ${m.agent}`);
+      await this._runAgentWithHandoff(
+        task, taskId, m.agent, m.description || '请重试刚才失败的任务。',
+        hop + 1, budget, maxHops, turn, {
+          fromAgent: agentName,
+          triggerContent: content,
+          mentionDesc: m.description || '',
+          chain: nextChain,
+          skipPingpong: true, // 失败回传不计入乒乓
+        }
+      );
+    }
   },
 
   /**
