@@ -507,7 +507,12 @@ class AgentRuntime {
       transcript.appendSegments(task.task_id, [turnSegment]);
     }
 
+    // 工具调用轮次计数：供上层判断"实质工作"（乒乓计数重置用）
+    let roundsUsed = 0;
+
     const finalize = (result) => {
+      // 实质工作标记：调用过工具（round>0）也算实质工作
+      if (result && typeof result === 'object') result.tool_rounds = roundsUsed;
       if (chatMode && task.record_transcript && task.task_id) {
         const ok = result && result.status !== 'failed' && result.status !== 'cancelled';
         if (ok && result.content && String(result.content).trim()) {
@@ -529,6 +534,7 @@ class AgentRuntime {
 
     try {
       for (let round = 0; round <= MAX_TOOL_ROUNDS; round++) {
+        roundsUsed = round;
         // 每轮调用前检查：用户已停止本轮 → 立即返回 cancelled，不再发起新调用
         if (sessionManager.isCancelled(externalTaskId)) {
           return this._cancelledOutput(task.task_id);

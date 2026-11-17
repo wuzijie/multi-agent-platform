@@ -17,7 +17,8 @@
     "test:messaging": "node tests/message-log.test.js",
     "test:resume": "node tests/resume-runtime.test.js",
     "test:turn": "node tests/turn-routing.test.js",
-    "probe:cli": "node scripts/probe-cli.js"
+    "probe:cli": "node scripts/probe-cli.js",
+    "test:handoff": "node tests/handoff.test.js"
   },
   "dependencies": {
     "express": "^4.21.0",

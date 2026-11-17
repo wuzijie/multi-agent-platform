@@ -131,5 +131,57 @@ test('表格/引用/列表行内的 @ 不识别（非行首）', () => {
   assert.deepStrictEqual(r.mentions, []);
 });
 
+console.log('\n【交接三选一：@用户 / [持球]】');
+
+test('@用户 → terminal（交还用户），不产生 agent 提及', () => {
+  const r = parseMentions('@用户\n需要你确认是否 force push', { max: 2, agents, aliases, currentAgent: '克劳德' });
+  assert.strictEqual(r.error, null);
+  assert.deepStrictEqual(r.mentions, []);
+  assert.ok(r.terminal);
+  assert.strictEqual(r.terminal.description, '需要你确认是否 force push');
+  assert.strictEqual(r.hold, null);
+});
+
+test('@用户 与 @agent 混用 → MIXED_HANDOFF', () => {
+  const r = parseMentions('@克劳德\n做A\n\n@用户\n确认B', { max: 2, agents, aliases });
+  assert.strictEqual(r.error && r.error.code, 'MIXED_HANDOFF');
+});
+
+test('[持球:原因] → hold，正文保留', () => {
+  const r = parseMentions('分析完成，等 CI 结果。\n\n[持球:等待 CI]', { max: 2, agents, aliases });
+  assert.strictEqual(r.error, null);
+  assert.deepStrictEqual(r.mentions, []);
+  assert.ok(r.hold);
+  assert.strictEqual(r.hold.reason, '等待 CI');
+  assert.strictEqual(r.body, '分析完成，等 CI 结果。');
+});
+
+test('[持球] 无原因也可用', () => {
+  const r = parseMentions('[持球]', { max: 2, agents, aliases });
+  assert.strictEqual(r.error, null);
+  assert.strictEqual(r.hold.reason, '');
+});
+
+test('[持球] 与 @ 混用 → HOLD_CONFLICT', () => {
+  const r = parseMentions('@克劳德\n做A\n\n[持球:等 CI]', { max: 2, agents, aliases });
+  assert.strictEqual(r.error && r.error.code, 'HOLD_CONFLICT');
+});
+
+test('[持球] 夹在正文中间 → MIDDLE_PLACEMENT', () => {
+  const r = parseMentions('开头文字\n[持球:等 CI]\n结尾文字', { max: 2, agents, aliases });
+  assert.strictEqual(r.error && r.error.code, 'MIDDLE_PLACEMENT');
+});
+
+test('@用户 缺说明 → MISSING_DESCRIPTION', () => {
+  const r = parseMentions('@用户', { max: 2, agents, aliases });
+  assert.strictEqual(r.error && r.error.code, 'MISSING_DESCRIPTION');
+});
+
+test('代码块里的 [持球] 不识别', () => {
+  const r = parseMentions('看代码\n```\n[持球:等 CI]\n```', { max: 2, agents, aliases });
+  assert.strictEqual(r.error, null);
+  assert.strictEqual(r.hold, null);
+});
+
 console.log(`\n通过 ${passed} / ${passed + failed}`);
 process.exit(failed ? 1 : 0);

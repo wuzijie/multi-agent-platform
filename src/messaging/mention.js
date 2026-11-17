@@ -1,5 +1,5 @@
 /**
- * 行首 @ 解析（多行）
+ * 行首 @ 解析（多行）+ 交接控制标记
  *
  * 规则（与产品定稿一致）：
  * - 只识别「行首」的 @：一行的首个非空白字符是 @ 才算提及。
@@ -10,8 +10,16 @@
  * - 代码块（``` / ~~~ 围栏、4+ 空格缩进、行首反引号）等非纯文本内容中的 @ 一律不识别；
  *   表格、引用、列表、HTML、表情符等因其不是行首 @，天然不触发。
  * - 每个 @ 必须带任务描述，缺描述返回 error。
+ *
+ * 交接三选一（2026-11-17）：
+ *   ① @agent   转给另一位 agent（原行为）
+ *   ② @用户    交还用户（terminal，不 spawn 任何 agent；不计入 agent 上限）
+ *   ③ [持球:原因] 持球等待外部条件（hold，不进转交链，本轮结束）
+ *   —— 三者互斥：同一回复里既有 @ 又有持球标记 → HOLD_CONFLICT；
+ *      @用户 与 @agent 同时出现 → MIXED_HANDOFF。
  */
 
+const HOLD_RE = /^\s*\[持球(?:[:：]\s*(.*?))?\]\s*$/;
 function buildAliasMap(agents, aliases) {
   const map = new Map(); // lower name -> canonical name
   for (const a of agents || []) {
@@ -59,9 +67,10 @@ function splitLinesWithCode(text) {
 }
 
 /**
- * 解析一行行首连续的 @token。
- * @returns {{tokens:string[], unknown:string[], inlineRest:string, consumed:boolean}}
- *   tokens     已识别的智能体规范名（去重，保序）
+ * 解析一行行首连续的 @token（含 @用户 特殊句柄）。
+ * @returns {{tokens:string[], userMention:boolean, unknown:string[], inlineRest:string, consumed:boolean}}
+ *   tokens     已识别的 agent 规范名（去重，保序；不含 @用户）
+ *   userMention 是否出现 @用户（交还用户的终端句柄）
  *   unknown    第一个无法识别的 token（其后不再继续）
  *   inlineRest @token 之后同一行的剩余文本（trim 后）
  *   consumed   是否解析到至少一个 @token
@@ -69,6 +78,7 @@ function splitLinesWithCode(text) {
 function parseLineMentions(trimmedLine, aliasMap) {
   const tokens = [];
   const unknown = [];
+  let userMention = false;
   let cursor = 0;
   let consumed = false;
 
@@ -77,6 +87,12 @@ function parseLineMentions(trimmedLine, aliasMap) {
     const m = trimmedLine.slice(cursor).match(tokenRe);
     if (!m) break;
     const token = m[1];
+    if (token === '用户') {
+      userMention = true;
+      consumed = true;
+      cursor += m[0].length;
+      continue;
+    }
     const canonical = aliasMap.get(token.toLowerCase());
     if (canonical) {
       if (!tokens.includes(canonical)) tokens.push(canonical);
@@ -92,17 +108,23 @@ function parseLineMentions(trimmedLine, aliasMap) {
   }
 
   const inlineRest = trimmedLine.slice(cursor).trim();
-  return { tokens, unknown, inlineRest, consumed };
+  return { tokens, userMention, unknown, inlineRest, consumed };
 }
 
 /**
  * @param {string} text
  * @param {object} opts
- * @param {number} opts.max              允许的最大 @ 数（去重、排除自己之后）
+ * @param {number} opts.max              允许的最大 @ 数（去重、排除自己之后；@用户 不计入）
  * @param {Array} opts.agents            允许的 agent 列表 [{name, model_cli}]
  * @param {object} [opts.aliases]        额外别名 { 中文名: ['claude'] }
  * @param {string} [opts.currentAgent]   当前发言的 agent（模型输出时排除自己）
- * @returns {{mentions:Array<{agent:string,description:string}>, body:string, error?:{code:string,message:string}}}
+ * @returns {{
+ *   mentions:Array<{agent:string,description:string}>,
+ *   terminal: {description:string}|null,   // @用户
+ *   hold: {reason:string}|null,            // [持球:原因]
+ *   body:string,
+ *   error?:{code:string,message:string}
+ * }}
  */
 function parseMentions(text, opts = {}) {
   const raw = String(text == null ? '' : text);
@@ -113,44 +135,67 @@ function parseMentions(text, opts = {}) {
 
   const lines = splitLinesWithCode(raw);
 
-  // 找出所有 mention 行
-  const mentionRows = [];
+  // 持球标记：行首独占一行 [持球] / [持球:原因]
+  const holdRows = [];
+  for (let i = 0; i < lines.length; i++) {
+    if (lines[i].kind !== 'text') continue;
+    const m = lines[i].text.match(HOLD_RE);
+    if (m) holdRows.push({ lineIdx: i, reason: String(m[1] || '').trim() });
+  }
+
+  // @ 行（agent 与 @用户 都算）
+  const rows = [];
   for (let i = 0; i < lines.length; i++) {
     if (lines[i].kind !== 'text') continue;
     const trimmed = lines[i].text.replace(/^\s+/, '');
     if (!trimmed.startsWith('@')) continue;
     const p = parseLineMentions(trimmed, aliasMap);
     if (!p.consumed) continue;
-    mentionRows.push({ lineIdx: i, ...p });
+    rows.push({ lineIdx: i, ...p });
   }
 
-  if (mentionRows.length === 0) {
-    return { mentions: [], body: raw.trim(), error: null };
+  if (rows.length === 0 && holdRows.length === 0) {
+    return { mentions: [], terminal: null, hold: null, body: raw.trim(), error: null };
   }
+
+  const err = (code, message) => ({
+    mentions: [], terminal: null, hold: null, body: raw.trim(),
+    error: { code, message },
+  });
 
   // 未知 agent：整条拒绝（沿用旧语义）
-  const firstUnknown = mentionRows.find(r => r.unknown.length > 0);
+  const firstUnknown = rows.find(r => r.unknown.length > 0);
   if (firstUnknown) {
     const available = agents.map(a => a.name).join('、') || '无';
-    return {
-      mentions: [], body: raw.trim(),
-      error: {
-        code: 'UNKNOWN_AGENT',
-        message: `无法识别的智能体：@${firstUnknown.unknown[0]}。可用：${available}`,
-      },
-    };
+    return err('UNKNOWN_AGENT', `无法识别的智能体：@${firstUnknown.unknown[0]}。可用：${available}`);
   }
 
-  // 计算每个 mention 的描述范围
-  for (let k = 0; k < mentionRows.length; k++) {
-    const row = mentionRows[k];
+  // 持球标记：最多一个，且与 @ 互斥
+  if (holdRows.length > 1) {
+    return err('HOLD_DUPLICATE', '一次只能有一个 [持球] 标记');
+  }
+  if (holdRows.length === 1 && rows.length > 0) {
+    return err('HOLD_CONFLICT', '[持球] 与 @ 不能同时使用：持球表示等待外部条件，本轮不转交');
+  }
+
+  const terminalRow = rows.find(r => r.userMention) || null;
+  const agentRows = rows.filter(r => r.tokens.length > 0);
+
+  // @用户 与 @agent 互斥（交接三选一）
+  if (terminalRow && agentRows.length > 0) {
+    return err('MIXED_HANDOFF', '同一轮只能选择一种交接方式：@agent 或 @用户');
+  }
+
+  // 计算每个 @ 行的描述范围
+  for (let k = 0; k < rows.length; k++) {
+    const row = rows[k];
     if (row.inlineRest) {
       row.description = row.inlineRest;
       row.descEndIdx = row.lineIdx; // 只占该行
       continue;
     }
     // 块描述：从 mention 行之后到下一个 mention 行 / 空行 / 结尾
-    const nextMentionLine = (k + 1 < mentionRows.length) ? mentionRows[k + 1].lineIdx : lines.length;
+    const nextMentionLine = (k + 1 < rows.length) ? rows[k + 1].lineIdx : lines.length;
     const descLines = [];
     let j = row.lineIdx + 1;
     let lastConsumed = row.lineIdx;
@@ -158,6 +203,7 @@ function parseMentions(text, opts = {}) {
       const l = lines[j];
       if (l.kind === 'code') { j++; continue; } // 跳过代码行
       if (l.text.trim() === '') break;           // 空行结束描述
+      if (HOLD_RE.test(l.text)) break;           // 持球标记不并入描述
       descLines.push(l.text);
       lastConsumed = j;
       j++;
@@ -167,32 +213,36 @@ function parseMentions(text, opts = {}) {
   }
 
   // 「front or end」约束：@ 块不能夹在正文中间
-  const firstIdx = mentionRows[0].lineIdx;
-  const lastDescEnd = Math.max(...mentionRows.map(r => r.descEndIdx));
-
-  const leadingBody = [];
-  for (let i = 0; i < firstIdx; i++) {
-    if (lines[i].kind === 'text' && lines[i].text.trim() !== '') leadingBody.push(lines[i].text);
+  if (rows.length > 0) {
+    const firstIdx = rows[0].lineIdx;
+    const lastDescEnd = Math.max(...rows.map(r => r.descEndIdx));
+    const leadingBody = [];
+    for (let i = 0; i < firstIdx; i++) {
+      if (lines[i].kind === 'text' && lines[i].text.trim() !== '' && !HOLD_RE.test(lines[i].text)) leadingBody.push(lines[i].text);
+    }
+    const trailingBody = [];
+    for (let i = lastDescEnd + 1; i < lines.length; i++) {
+      if (lines[i].kind === 'text' && lines[i].text.trim() !== '' && !HOLD_RE.test(lines[i].text)) trailingBody.push(lines[i].text);
+    }
+    if (leadingBody.length > 0 && trailingBody.length > 0) {
+      return err('MIDDLE_PLACEMENT', '@ 提及只能出现在消息最前端或最末端，不能夹在正文中间');
+    }
   }
-  const trailingBody = [];
-  for (let i = lastDescEnd + 1; i < lines.length; i++) {
-    if (lines[i].kind === 'text' && lines[i].text.trim() !== '') trailingBody.push(lines[i].text);
-  }
 
-  if (leadingBody.length > 0 && trailingBody.length > 0) {
-    return {
-      mentions: [], body: raw.trim(),
-      error: {
-        code: 'MIDDLE_PLACEMENT',
-        message: '@ 提及只能出现在消息最前端或最末端，不能夹在正文中间',
-      },
-    };
+  // 持球标记位置：不能夹在正文中间
+  if (holdRows.length === 1) {
+    const h = holdRows[0];
+    const before = lines.slice(0, h.lineIdx).some(l => l.kind === 'text' && l.text.trim() !== '');
+    const after = lines.slice(h.lineIdx + 1).some(l => l.kind === 'text' && l.text.trim() !== '');
+    if (before && after) {
+      return err('MIDDLE_PLACEMENT', '[持球] 只能放在消息最前端或最末端');
+    }
   }
 
   // 组装 mentions：去重、排除自己
   const seen = new Set();
   const mentions = [];
-  for (const row of mentionRows) {
+  for (const row of agentRows) {
     for (const token of row.tokens) {
       if (currentAgent && token === currentAgent) continue; // 不能 @ 自己
       if (seen.has(token)) continue;
@@ -201,31 +251,42 @@ function parseMentions(text, opts = {}) {
     }
   }
 
-  // 每个 @ 必须带任务描述
+  // 每个 @ 必须带任务描述（含 @用户）
   const missing = mentions.find(m => !m.description);
   if (missing) {
-    return {
-      mentions: [], body: raw.trim(),
-      error: {
-        code: 'MISSING_DESCRIPTION',
-        message: `@${missing.agent} 缺少任务描述（任务描述应写在 @ 的下一行）`,
-      },
-    };
+    return err('MISSING_DESCRIPTION', `@${missing.agent} 缺少任务描述（任务描述应写在 @ 的下一行）`);
+  }
+  if (terminalRow && !terminalRow.description) {
+    return err('MISSING_DESCRIPTION', '@用户 缺少说明（说明应写在 @ 的下一行）');
   }
 
-  // 最多 @ max 个（排除自己、去重之后）
+  // 最多 @ max 个（排除自己、去重之后；@用户 不计入）
   if (mentions.length > max) {
-    return {
-      mentions: [], body: raw.trim(),
-      error: {
-        code: 'TOO_MANY_MENTIONS',
-        message: `一次最多 @ ${max} 个智能体，当前 @ 了 ${mentions.length} 个`,
-      },
-    };
+    return err('TOO_MANY_MENTIONS', `一次最多 @ ${max} 个智能体，当前 @ 了 ${mentions.length} 个`);
   }
 
-  const body = [...leadingBody, ...trailingBody].join('\n').trim();
-  return { mentions, body, error: null };
+  // 正文：去掉 @ 行及其描述、持球标记行后剩余的非空文本
+  const excluded = new Set();
+  for (const row of rows) {
+    for (let i = row.lineIdx; i <= row.descEndIdx; i++) excluded.add(i);
+  }
+  for (const h of holdRows) excluded.add(h.lineIdx);
+  const bodyLines = [];
+  for (let i = 0; i < lines.length; i++) {
+    if (lines[i].kind !== 'text') continue;
+    if (excluded.has(i)) continue;
+    if (lines[i].text.trim() === '') continue;
+    bodyLines.push(lines[i].text);
+  }
+  const body = bodyLines.join('\n').trim();
+
+  return {
+    mentions,
+    terminal: terminalRow ? { description: terminalRow.description || '' } : null,
+    hold: holdRows.length ? { reason: holdRows[0].reason } : null,
+    body,
+    error: null,
+  };
 }
 
 module.exports = { parseMentions, buildAliasMap };

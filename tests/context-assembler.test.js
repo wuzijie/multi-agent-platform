@@ -79,7 +79,7 @@ test('六段结构与顺序：来源/模式/导航/触发原文/未读历史/系
   assert.ok(r.prompt.includes('你是本轮第 2 只被召唤的 agent CLI'), '模式声明序号');
   assert.ok(r.prompt.includes('接力棒：克劳德 → 你'), '导航头接力棒');
   assert.ok(r.prompt.includes('> 请评审技术风险'), '触发原文含任务描述');
-  assert.ok(r.prompt.includes('传球决策树') || r.prompt.includes('先判断'), '系统提示-决策树');
+  assert.ok(r.prompt.includes('传球决策树') || r.prompt.includes('三选一'), '系统提示-传球三选一决策树');
   assert.ok(r.prompt.includes('接力棒在你手里'), '系统提示-球权检查');
 });
 

@@ -4,12 +4,12 @@ mention:
   user_max: 2
   # 模型输出最多允许的 @ 数量（每个 agent 最多 @ 2 个其他 agent，不能 @ 自己）
   model_max: 2
-  # 两个 @ 的执行方式：parallel（并行回答同一问题）| serial
+  # 两个 @ 的执行方式：parallel（并行，独立作答，本轮 @ 无路由语义）| serial（串行接力）
   mode: parallel
-  # 转交链最大跳数（硬上限兜底；宽于乒乓阈值，允许同一对 agent 来回若干次）
-  max_hops: 6
-  # 单轮最多 spawn 的 CLI 次数（防爆炸）
-  max_spawns_per_turn: 6
+  # 转交链最大深度（A2A 深度，原文 15）；max_hops 为旧字段，保留兼容
+  max_a2a_depth: 15
+  # 单轮最多 spawn 的 CLI 次数（防爆炸；深度 15 时需相应放宽）
+  max_spawns_per_turn: 16
   # 同一 agent 单轮最多被召唤次数（超过则阻断，与乒乓计数互补）
   summon_max_per_agent: 4
   # 乒乓治理：同一对 agent 本轮来回次数达到阈值时警告/阻断

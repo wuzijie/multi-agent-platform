@@ -74,8 +74,10 @@ module.exports = {
    */
   async _executeTurnWithJobs(task, taskId, displayMessage, jobs) {
     const cfg = config.mention || {};
-    const maxSpawns = Number(cfg.max_spawns_per_turn) || 6;
-    const maxHops = Number(cfg.max_hops) || 6;
+    const maxSpawns = Number(cfg.max_spawns_per_turn) || 16;
+    // A2A 链深度上限（原文 15）；兼容旧配置 max_hops
+    const maxDepth = Number(cfg.max_a2a_depth) || Number(cfg.max_hops) || 15;
+    const roundMode = String(cfg.mode || 'parallel');
     const ppCfg = cfg.pingpong || {};
 
     // 本轮上下文：召唤序号 / 每个 agent 的召唤次数 / 乒乓计数（pairKey → 往返次数）
@@ -88,6 +90,9 @@ module.exports = {
       blockThreshold: Number(ppCfg.block_threshold) || 4,
       summonMaxPerAgent: Number(cfg.summon_max_per_agent) || 4,
       recentFiles: null, // 每轮只采样一次
+      // 并行轮：多个 agent 独立作答同一问题，@ 无路由语义（只对本轮生效）
+      parallelRound: roundMode === 'parallel' && jobs.length >= 2,
+      parallelNotified: false,
     };
 
     this._appendConversation(taskId, 'user', displayMessage, {
@@ -98,7 +103,7 @@ module.exports = {
     const budget = { left: maxSpawns };
     // 不再使用 visited 集合：同一 agent 可被多次召唤，由乒乓计数 + 召唤上限治理
     const runOne = (job, hop) => this._runAgentWithHandoff(
-      task, taskId, job.agent, job.instruction, hop, budget, maxHops, turnCtx, null
+      task, taskId, job.agent, job.instruction, hop, budget, maxDepth, turnCtx, null
     );
 
     const settled = await Promise.allSettled(jobs.map(j => runOne(j, 0)));
@@ -158,6 +163,7 @@ module.exports = {
     const turn = turnCtx || {
       turnId: 'turn_adhoc', summonSeq: 0, summonCount: {}, pingpong: {},
       warnThreshold: 2, blockThreshold: 4, summonMaxPerAgent: 4, recentFiles: null,
+      parallelRound: false, parallelNotified: false,
     };
     const fromAgent = (meta && meta.fromAgent) || null;
     const pairKey = fromAgent ? [fromAgent, agentName].sort().join('|') : null;
@@ -286,6 +292,11 @@ module.exports = {
     }
 
     const content = result.content || '';
+    // 实质工作重置乒乓：输出 >200 字或调用过工具 → 这对 agent 的往返计数归零；
+    // 纯路由动作（@ / 持球）不重置；用户新消息天然重置整轮计数（turnCtx 每轮新建）
+    if (pairKey && (String(content).length > 200 || Number(result.tool_rounds) > 0)) {
+      turn.pingpong[pairKey] = 0;
+    }
     // 落库时记录 agent，游标才能“排除自身输出”
     // reasoning 单独传入，只进 conversation.md（前端折叠展示），不进 messageLog
     this._appendConversation(taskId, 'assistant', `**${agentName}**\n\n${content}`, {
@@ -295,11 +306,42 @@ module.exports = {
       from_agent: fromAgent || undefined,
     });
 
-    // 解析模型输出中的行首 @（最多 2 个，不能 @ 自己，必须带任务描述）
+    // 解析模型输出中的行首 @ / @用户 / [持球]（三选一交接）
     const parsed = this._extractMentionsFromReply(content, agentName);
     if (parsed && parsed.error) {
       this._appendConversation(taskId, 'system', `[违规转交] ${parsed.error.message}（已忽略本次转交）`);
       return { ok: true, content };
+    }
+
+    // ===== 交接三选一（P1）=====
+    // ① 并行轮：多个 agent 独立作答，@ 无路由语义（只提示一次，避免刷屏）
+    if (turn.parallelRound && parsed && (parsed.mentions.length || parsed.terminal || parsed.hold)) {
+      if (!turn.parallelNotified) {
+        turn.parallelNotified = true;
+        this._appendConversation(taskId, 'system',
+          '[并行模式] 本轮多个 agent 独立作答，@ 无路由语义，已忽略本次交接');
+      }
+      return { ok: true, content };
+    }
+    // ② 交还用户：终端目标，链终止（不再 spawn 任何 agent）
+    if (parsed && parsed.terminal) {
+      this._appendConversation(taskId, 'system',
+        `[交还用户] ${agentName} 请求你处理：${parsed.terminal.description}`);
+      return { ok: true, content, terminal: true };
+    }
+    // ③ 持球等待：不进转交链，本轮结束（不自动轮询，等下一条新消息解锁）
+    if (parsed && parsed.hold) {
+      const holdReason = parsed.hold.reason || '等待外部条件';
+      this._appendConversation(taskId, 'system', `[持球] ${agentName} 正在等待：${holdReason}`, { kind: 'hold' });
+      CollabLogger.log('hold_ball', {
+        task_id: taskId, trace_id: task.trace_id || '', agent: agentName, reason: holdReason,
+      });
+      return { ok: true, content, holding: true };
+    }
+    // 球权死锁提示：收了球却让别人等，且没有任何交接动作（不阻断，只提示）
+    if (parsed && parsed.mentions.length === 0 && this._looksLikeBallDeadlock(content)) {
+      this._appendConversation(taskId, 'system',
+        `[提示] ${agentName} 本轮未交接（球权未转移）：做不了请退回上一位，或 @用户 升级`);
     }
 
     // 并行扇出到被 @ 的 agent（共享 budget / 乒乓计数防爆炸；无 visited 限制）
@@ -380,5 +422,14 @@ module.exports = {
       eventBus.emit('agent:stream:end', { task_id: taskId, agent: agentName, stream_id: streamId, error: e.message });
       throw e;
     }
+  },
+
+  /**
+   * 球权死锁启发式：收了球却让别人等、且没有任何交接动作。
+   * 只在措辞明确时提示（诊断≠解决），不阻断。
+   */
+  _looksLikeBallDeadlock(content) {
+    const s = String(content || '');
+    return /你(先)?等着|你稍等|稍等(一下)?我|稍后(再)?处理|等我(稍后|一下|处理)|我先记下/.test(s);
   }
 };
