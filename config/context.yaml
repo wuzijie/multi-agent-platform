@@ -39,3 +39,14 @@ context:
     # 触发消息原文超长时头尾截断（字符数）
     trigger_head_chars: 4000
     trigger_tail_chars: 2000
+
+  # ===== Session 封存 / 恢复（P4）=====
+  # 触发：模型输出 [SESSION_HANDOFF]，或 prompt 估算接近模型上限；
+  # 产物：tasks/<id>/handoff/ 下的五段式交接笔记 + continuity capsule。
+  # 新 session 首轮自动注入最近一份笔记（bootstrap）。
+  handoff:
+    enabled: true
+    # prompt 估算字符数 ≥ 模型上限 × 该比例 时自动封存
+    threshold_ratio: 0.8
+    # 首轮注入交接笔记的最大字符数
+    note_max_chars: 4000

@@ -14,6 +14,7 @@ const { historyConfig } = require('../prompt/config');
 const messageLog = require('../messaging/message-log');
 const cursorStore = require('../messaging/cursor-store');
 const { buildIncrementalContext } = require('../prompt/incremental');
+const handoffStore = require('../utils/handoff-store');
 const capabilities = require('../adapters/contract/capabilities');
 const { STATUS, ERROR_CODE } = require('../adapters/contract/enums');
 const { newSessionId } = require('../adapters/contract/session');
@@ -402,6 +403,21 @@ class AgentRuntime {
     const isFirstCall = !(cursorState && cursorState.session_id);
     const resumeActive = resumeSupported && !isFirstCall && !task.__forceFull;
 
+    // ===== Session 恢复（P4）：新 session 首轮注入最近一份交接笔记 =====
+    // 触发场景：上次因上下文将满 / [SESSION_HANDOFF] / resume 失效而封存；
+    // 笔记以 ZONE A 稳定上下文形式注入（一次性），并打印恢复日志。
+    let handoffNoteText = '';
+    if (isFirstCall && task.task_id && !task.skip_incremental_context) {
+      try {
+        const note = handoffStore.latestNote(task.task_id);
+        if (note && note.content) {
+          const maxChars = Number((config.context && config.context.handoff && config.context.handoff.note_max_chars)) || 4000;
+          handoffNoteText = `## 交接笔记（来自上一次会话${note.agent ? '：' + note.agent : ''}）\n${truncate(note.content, maxChars)}`;
+          console.log(`[AgentRuntime] 已从交接笔记恢复（${agentName}）`);
+        }
+      } catch (e) { /* 恢复失败不阻塞主流程 */ }
+    }
+
     // ===== 动态上下文（通用）：所有场景默认注入增量上下文 =====
     // · resume 生效（第 2 次调用起）：CLI session 已保存前轮上下文（固定规则/系统提示等），
     //   只发「未读历史 + 本轮指令 + 乒乓警告」的增量内容；
@@ -499,8 +515,11 @@ class AgentRuntime {
       currentInstruction = `${permissionNotice}\n\n${incrementalPrompt}`;
     }
 
-    // delta 模式下稳定上下文已在 CLI session 内，不再重复注入
-    const effectiveContext = deltaMode ? '' : baseContext;
+    // delta 模式下稳定上下文已在 CLI session 内，不再重复注入；
+    // 新 session 首轮额外注入交接笔记（P4 bootstrap）
+    const effectiveContext = deltaMode
+      ? ''
+      : [handoffNoteText, baseContext].filter(Boolean).join('\n\n');
 
     // 当前轮用户片段先落转录：即使后续调用失败，下一轮仍能拼出严格前缀
     if (chatMode && task.record_transcript && task.task_id) {
@@ -528,6 +547,40 @@ class AgentRuntime {
       // 投递游标（通用增量上下文）：仅成功时推进，失败/取消下次重发未读
       if (result && result.status === STATUS.SUCCESS && autoIncremental && autoIncremental.deliveredUpTo > 0) {
         try { cursorStore.advanceDeliveryCursor(autoIncremental.ctxTaskId, agentName, autoIncremental.deliveredUpTo); } catch (e) { /* 游标失败不影响主流程 */ }
+      }
+
+      // ===== Session 封存（P4）=====
+      // 触发：① 模型输出 [SESSION_HANDOFF]（主动请求）；② prompt 估算接近模型上限
+      if (result && result.status === STATUS.SUCCESS && chatMode && task.task_id) {
+        const hCfg = (config.context && config.context.handoff) || {};
+        if (hCfg.enabled !== false) {
+          const raw = String(result.content || '');
+          const wantsHandoff = raw.includes('[SESSION_HANDOFF]');
+          if (wantsHandoff) {
+            result.content = raw.replace(/\[SESSION_HANDOFF\]\s*/g, '').trim();
+          }
+          const dCfg = (config.context && config.context.delivery) || {};
+          const capChars = (Number(dCfg.model_cap_default) || 128000) * (Number(dCfg.chars_per_token) || 2);
+          const estChars = String(effectiveContext || '').length + String(currentInstruction || '').length;
+          const ratio = Number(hCfg.threshold_ratio) || 0.8;
+          const overLimit = capChars > 0 && estChars >= capChars * ratio;
+          if (wantsHandoff || overLimit) {
+            const reason = wantsHandoff ? 'model_request' : 'context_full';
+            try {
+              handoffStore.seal(task.task_id, agentName, {
+                reason,
+                task,
+                currentContent: result.content,
+                cursors: { delivery_cursor: cursorStore.get(task.task_id, agentName).delivery_cursor || 0 },
+              });
+              cursorStore.clearSession(task.task_id, agentName, reason);
+              result.session_sealed = reason;
+              console.log(`[AgentRuntime] 已封存 session（${agentName}，${reason}）`);
+            } catch (e) {
+              console.warn(`[AgentRuntime] Session 封存失败: ${e.message}`);
+            }
+          }
+        }
       }
       return result;
     };
@@ -568,6 +621,14 @@ class AgentRuntime {
         // 会话失效（resume 失败）：清空 session，用全量模式重试一次
         if (result && result.error && result.error.code === ERROR_CODE.SESSION_NOT_FOUND && !task.__forceFull) {
           cursorStore.clearSession(task.task_id, agentName, 'session_not_found');
+          // Session 失效：封存一份交接笔记，下一次全量重试时自动注入（P4）
+          try {
+            handoffStore.seal(task.task_id, agentName, {
+              reason: 'session_lost',
+              task,
+              cursors: { delivery_cursor: cursorStore.get(task.task_id, agentName).delivery_cursor || 0 },
+            });
+          } catch (e) { /* 封存失败不阻塞重试 */ }
           return this.executeTaskWithAgent(
             Object.assign({}, task, { __forceFull: true }),
             history, agentName, onChunk, onReasoning
